@@ -25,9 +25,9 @@ const PACKAGE_VERSION = (() => {
 	try {
 		const raw = fs.readFileSync(new URL("../package.json", import.meta.url), "utf8");
 		const parsed = JSON.parse(raw) as { version?: unknown };
-		return typeof parsed.version === "string" && parsed.version.trim() ? parsed.version.trim() : "2.1.0";
+		return typeof parsed.version === "string" && parsed.version.trim() ? parsed.version.trim() : "2.3.0";
 	} catch {
-		return "2.1.0";
+		return "2.3.0";
 	}
 })();
 

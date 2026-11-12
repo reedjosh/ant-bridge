@@ -19,7 +19,7 @@ import { frameCarriesUsage } from "./events.js";
 import type { AgyUsage } from "../driver-types.js";
 import { redactText } from "../redact.js";
 import { JsonRpcResponseError, JsonRpcSession } from "./jsonrpc.js";
-import { removeStagedAcpHome, stageAcpHome } from "./home.js";
+import { stageAcpHome, type StageAcpHomeOptions } from "./home.js";
 
 export interface AcpMcpServer {
 	name: string;
@@ -49,7 +49,7 @@ export interface AcpConnectionOptions {
 	bin: string;
 	binArgs?: string[];
 	/** Native agy only: filter per-pid bridges out of inherited global MCP. */
-	isolateHome?: boolean | { geminiHome?: string; parentDir?: string };
+	isolateHome?: boolean | StageAcpHomeOptions;
 	extraEnv?: Record<string, string>;
 	log: (msg: string, data?: unknown) => void;
 	/** Verified `session/update` payloads (post-suppression). */
@@ -550,7 +550,7 @@ export class AcpConnection {
 	}
 
 	#releaseHome(): void {
-		if (this.#stagedHome) removeStagedAcpHome(this.#stagedHome);
+		// Persistent acp-home survives teardown so artifact/transcript file:// links stay valid.
 		this.#stagedHome = undefined;
 	}
 }

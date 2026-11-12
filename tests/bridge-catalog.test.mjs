@@ -19,10 +19,8 @@ const ALL_TOOLS = [
   { name: "read_mcp_resource", sourceInfo: { path: "builtin:mcp", source: "builtin" } },
   { name: "pr_work", sourceInfo: { path: "/ext/pr-tracker/index.ts", source: "local" } },
   { name: "subagent", sourceInfo: { path: "/ext/pi-subagents/index.ts", source: "npm:pi-subagents" } },
-  {
-    name: "AskAntigravity",
-    sourceInfo: { path: "/ext/agy/index.ts", source: "npm:@estebanforge/pi-antigravity-bridge" },
-  },
+  { name: "bridge_poll_result", sourceInfo: { path: "/ext/ant-bridge/index.ts", source: "local" } },
+  { name: "activate_skill", sourceInfo: { path: "/ext/ant-bridge/index.ts", source: "local" } },
 ];
 
 const ACTIVE = ALL_TOOLS.map((t) => t.name);

@@ -119,10 +119,7 @@ export interface DriverSnapshot {
 	stats: {
 		spawns: number;
 		turns: number;
-		reused: number;
 		recycles: number;
-		lastRecycleReason?: string;
-		recycleReasons: Record<string, number>;
 	};
 	lifecycle: string[];
 	engine?: "acp";
@@ -137,6 +134,7 @@ export interface DriverSnapshot {
 		agentName?: string;
 		agentTitle?: string;
 		usageSeen: boolean;
+		exactUsageSeen: boolean;
 	};
 }
 

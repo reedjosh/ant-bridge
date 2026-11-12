@@ -15,7 +15,7 @@ const CORE_BUILTIN_TOOLS = new Set(["read", "bash", "powershell", "edit", "write
 const CORE_BUILTIN_PATHS = new Set([...CORE_BUILTIN_TOOLS].map((name) => `builtin:${name}`));
 
 /** Bridge-local pseudo-tools registered on the MCP endpoint itself (never Pi round-trips). */
-const SELF_TOOLS = new Set(["bridge_poll_result", "activate_skill", "AskAntigravity"]);
+const SELF_TOOLS = new Set(["bridge_poll_result", "activate_skill"]);
 
 function isCoreBuiltin(tool: BridgeToolInfo): boolean {
 	if (tool.sourceInfo?.source !== "builtin") return false;

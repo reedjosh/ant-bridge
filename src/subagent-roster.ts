@@ -2,13 +2,12 @@
 //
 // agy has no read-only subcommand for live subagent state, so the only
 // zero-token source is the turn stream: subagent spawns arrive as ordinary
-// tool steps (invoke_subagent, run_subagent, define_subagent,
+// tool calls (invoke_subagent, run_subagent, define_subagent,
 // browser_subagent), send_message addresses a spawned agent, and
 // manage_subagents carries lifecycle actions. The roster folds
-// DriverActivity — the engine-agnostic contract both turn engines emit — so
-// stream-json (stepId-keyed) and ACP (toolCallId-keyed) feed one roster.
+// DriverActivity events emitted by the ACP turn driver (keyed by toolCallId).
 //
-// Accepted heuristic limits (telemetry only, never persisted — agy's own
+// Accepted heuristic limits (telemetry only, never persisted - agy's own
 // conversation database remains the durable record):
 // - send_message routes to the FIRST entry with the matching agent name
 //   regardless of status, so a message after a name is reused may credit a
@@ -34,7 +33,7 @@ const ACTION_ARG_KEYS = /^(action|command|operation|op)$/i;
 const DETAIL_MAX = 120;
 
 export interface SubagentEntry {
-	/** Stable fold key: `s:<stepId>` on stream-json, `n:<seq>` on ACP. */
+	/** Stable fold key: `t:<toolCallId>` when present, otherwise `n:<seq>`. */
 	key: string;
 	name: string;
 	status: "running" | "done" | "error" | "killed";
@@ -42,13 +41,13 @@ export interface SubagentEntry {
 	lastActivityMs: number;
 	/** send_message count since spawn. */
 	messages: number;
-	/** First non-name string arg, truncated — usually the task text. */
+	/** First non-name string arg, truncated - usually the task text. */
 	detail: string;
 	error?: string;
 }
 
 function truncate(value: string): string {
-	return value.length > DETAIL_MAX ? `${value.slice(0, DETAIL_MAX)}…` : value;
+	return value.length > DETAIL_MAX ? `${value.slice(0, DETAIL_MAX)}...` : value;
 }
 
 /** First string arg whose key plausibly names the agent. */
@@ -59,7 +58,7 @@ function subagentNameFromArgs(args: Record<string, unknown>): string {
 	return "subagent";
 }
 
-/** First string arg that is not the name — the task text, when agy passes one. */
+/** First string arg that is not the name - the task text, when agy passes one. */
 function detailFromArgs(args: Record<string, unknown>): string {
 	for (const [k, v] of Object.entries(args)) {
 		if (!NAME_ARG_KEYS.test(k) && typeof v === "string" && v.trim()) return truncate(v.trim());
@@ -111,23 +110,17 @@ export class SubagentRoster {
 	#entries = new Map<string, SubagentEntry>();
 	#acpSeq = 0;
 
-	/** Fold key precedence: ACP toolCallId (stable protocol id), stream-json
-	 *  numeric stepId, then a process-local sequence for hypothetical engines
-	 *  with neither. */
+	/** Fold key precedence: ACP toolCallId (stable protocol id), then a
+	 *  process-local sequence fallback when toolCallId is omitted. */
 	#keyFor(activity: Extract<DriverActivity, { type: "tool_start" }>): string {
-		if (activity.toolCallId !== undefined) return `t:${activity.toolCallId}`;
-		if (activity.stepId !== undefined) return `s:${activity.stepId}`;
-		return `n:${this.#acpSeq++}`;
+		return activity.toolCallId !== undefined ? `t:${activity.toolCallId}` : `n:${this.#acpSeq++}`;
 	}
 
-	#entriesFor(activity: Extract<DriverActivity, { type: "tool_done" | "tool_error" }>): SubagentEntry[] {
-		const baseKey =
-			activity.toolCallId !== undefined
-				? `t:${activity.toolCallId}`
-				: activity.stepId !== undefined
-					? `s:${activity.stepId}`
-					: undefined;
-		if (baseKey !== undefined) {
+	#entriesFor(
+		activity: Extract<DriverActivity, { type: "tool_done" | "tool_error" }>,
+	): SubagentEntry[] {
+		if (activity.toolCallId !== undefined) {
+			const baseKey = `t:${activity.toolCallId}`;
 			const matched: SubagentEntry[] = [];
 			for (const [k, v] of this.#entries) {
 				if (k === baseKey || k.startsWith(`${baseKey}:`)) matched.push(v);
@@ -234,12 +227,12 @@ export function formatSubagentRoster(entries: SubagentEntry[]): string {
 		const secs = Math.max(0, Math.round((Date.now() - entry.spawnedAtMs) / 1000));
 		const dur = secs >= 60 ? `${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, "0")}s` : `${secs}s`;
 		const parts = [
-			`${entry.name} · ${entry.status} · ${dur}`,
+			`${entry.name} - ${entry.status} - ${dur}`,
 			entry.messages > 0 ? `${entry.messages} msg` : undefined,
 			entry.detail || undefined,
 			entry.error ? `error: ${entry.error}` : undefined,
 		].filter((p): p is string => p !== undefined);
-		lines.push(`- ${parts.join(" · ")}`);
+		lines.push(`- ${parts.join(" - ")}`);
 	}
 	return lines.join("\n");
 }

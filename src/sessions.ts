@@ -9,16 +9,12 @@
 // ~/.pi/agent/antigravity-bridge/sessions.json with atomic rename.
 
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { bridgeStateDir } from "./agy-paths.js";
 
-const STORE_PATH = path.join(
-	os.homedir(),
-	".pi",
-	"agent",
-	"antigravity-bridge",
-	"sessions.json",
-);
+function defaultStorePath(): string {
+	return path.join(bridgeStateDir(), "sessions.json");
+}
 
 export interface AgySession {
 	conversationId: string;
@@ -71,7 +67,7 @@ export class SessionStore {
 	private readonly removed = new Set<string>();
 	private writeChain: Promise<void> = Promise.resolve();
 
-	constructor(storePath: string = STORE_PATH) {
+	constructor(storePath: string = defaultStorePath()) {
 		this.path = storePath;
 		this.load();
 	}

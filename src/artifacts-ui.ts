@@ -9,7 +9,7 @@
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
-import { dialogBlocked } from "@estebanforge/pi-tui-dialogs";
+import { dialogBlocked } from "./ui-helpers.js";
 import type { AgyArtifact } from "./artifacts.js";
 
 export type ArtifactsBrowserAction =

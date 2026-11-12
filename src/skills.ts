@@ -67,8 +67,12 @@ const MAX_DEPTH = 16; // symlink-loop insurance; real catalogs nest 1-2 levels
 /** Ordered skill locations for a session: pi global dirs, then project dirs
  *  (project `.agents/skills` walks cwd ancestors up to the git root). */
 export function skillLocations(projectDir?: string, home: string = os.homedir()): SkillLocation[] {
+	const agentDir =
+		home === os.homedir() && process.env.PI_CODING_AGENT_DIR?.trim()
+			? process.env.PI_CODING_AGENT_DIR.trim()
+			: path.join(home, ".pi", "agent");
 	const out: SkillLocation[] = [
-		{ dir: path.join(home, ".pi", "agent", "skills"), style: "pi" },
+		{ dir: path.join(agentDir, "skills"), style: "pi" },
 		{ dir: path.join(home, ".agents", "skills"), style: "agents" },
 	];
 	if (!projectDir) return out;

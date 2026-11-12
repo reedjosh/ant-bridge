@@ -12,10 +12,35 @@
 // is a watch, not a fact), "idle" otherwise; when lsof is missing,
 // liveness is unknown and the dashboard says so instead of guessing.
 
-import { readdir, stat } from "node:fs/promises";
+import { open, readdir, stat } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
-import { readTranscriptTail } from "./parked-turn.js";
+
+async function readFileTail(filePath: string, maxBytes: number): Promise<string> {
+	let handle;
+	try {
+		handle = await open(filePath, "r");
+	} catch {
+		return "";
+	}
+	try {
+		const { size } = await handle.stat();
+		const start = Math.max(0, size - maxBytes);
+		const length = size - start;
+		const buffer = Buffer.alloc(length);
+		let read = 0;
+		while (read < length) {
+			const { bytesRead } = await handle.read(buffer, read, length - read, start + read);
+			if (bytesRead === 0) break;
+			read += bytesRead;
+		}
+		return buffer.subarray(0, read).toString("utf8");
+	} catch {
+		return "";
+	} finally {
+		await handle.close().catch(() => {});
+	}
+}
 
 const TASK_LOG_RE = /^task-(\d+)\.log$/;
 const MAX_TASKS = 128;
@@ -172,7 +197,7 @@ export async function listAgyTasks(
 /** Last bytes of a task log for the tail command. Empty string on any
  *  error - tails are best-effort views, not facts. */
 export async function tailAgyTaskLog(logPath: string): Promise<string> {
-	return readTranscriptTail(logPath, TASK_TAIL_BYTES);
+	return readFileTail(logPath, TASK_TAIL_BYTES);
 }
 
 /** Task IDs whose completion agy already injected in-turn via a SYSTEM_MESSAGE
@@ -182,7 +207,7 @@ export async function readDeliveredTaskIds(conversationDir: string): Promise<Set
 	const delivered = new Set<number>();
 	let text: string;
 	try {
-		text = await readTranscriptTail(transcriptPath, TRANSCRIPT_CAP_BYTES);
+		text = await readFileTail(transcriptPath, TRANSCRIPT_CAP_BYTES);
 	} catch {
 		return delivered;
 	}

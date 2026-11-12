@@ -14,6 +14,9 @@ export interface BridgeToolInfo {
 const CORE_BUILTIN_TOOLS = new Set(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]);
 const CORE_BUILTIN_PATHS = new Set([...CORE_BUILTIN_TOOLS].map((name) => `builtin:${name}`));
 
+/** Bridge-local pseudo-tools registered on the MCP endpoint itself (never Pi round-trips). */
+const SELF_TOOLS = new Set(["bridge_poll_result", "activate_skill", "AskAntigravity"]);
+
 function isCoreBuiltin(tool: BridgeToolInfo): boolean {
 	if (tool.sourceInfo?.source !== "builtin") return false;
 	const p = tool.sourceInfo.path;
@@ -31,21 +34,20 @@ function isMcpBridgeTool(tool: BridgeToolInfo): boolean {
 	);
 }
 
-/** The bridge has one live HTTP endpoint. Catalog and dispatch must both use
- * the CURRENT Pi active set: /mcp and pi.setActiveTools() can change it mid-session.
- * A stale tools/call must not bypass a disabled Pi tool. */
+/** Filter Pi's live active tool catalog for exposure over the MCP bridge. */
 export function bridgedPiTools(
-	all: BridgeToolInfo[], active: readonly string[], mode: BridgeTools, hidden: ReadonlySet<string>,
+	all: BridgeToolInfo[],
+	active: readonly string[],
+	mode: BridgeTools,
+	hidden: ReadonlySet<string>,
 ): BridgeToolInfo[] {
 	if (mode === "none") return [];
 	const enabled = new Set(active);
-	return all.filter((tool) =>
-		enabled.has(tool.name) && !hidden.has(tool.name) &&
-		// Never bridge the bridge's own tools. agy has native web tools, so
-		// our quota-burning one-shot wrappers must not tempt it through MCP.
-		tool.name !== "AskAntigravity" && tool.name !== "antigravity" &&
-		tool.name !== "agy_web_search" && tool.name !== "agy_read_url" &&
-		tool.name !== "bridge_poll_result" && tool.name !== "activate_skill" &&
-		(mode === "mcp" ? isMcpBridgeTool(tool) : !isCoreBuiltin(tool)),
+	return all.filter(
+		(tool) =>
+			enabled.has(tool.name) &&
+			!hidden.has(tool.name) &&
+			!SELF_TOOLS.has(tool.name) &&
+			(mode === "mcp" ? isMcpBridgeTool(tool) : !isCoreBuiltin(tool)),
 	);
 }

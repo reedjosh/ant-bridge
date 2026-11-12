@@ -20,9 +20,9 @@
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import type { Api, Model, ThinkingLevel, ThinkingLevelMap } from "@earendil-works/pi-ai";
+import { bridgeStateDir } from "./agy-paths.js";
 
 const DISCOVERY_TIMEOUT_MS = 8_000;
 
@@ -199,13 +199,9 @@ export async function spawnAgyModelsRaw(binary: string): Promise<string> {
 
 export const MODELS_CACHE_TTL_MS = 5 * 60_000;
 
-const MODELS_CACHE_PATH = path.join(
-	os.homedir(),
-	".pi",
-	"agent",
-	"antigravity-bridge",
-	"models-cache.json",
-);
+function defaultModelsCachePath(): string {
+	return path.join(bridgeStateDir(), "models-cache.json");
+}
 
 interface ModelsCache {
 	raw: string;
@@ -213,7 +209,7 @@ interface ModelsCache {
 }
 
 /** Read and validate the models cache. Returns null when missing or corrupt. */
-function readModelsCache(cachePath: string = MODELS_CACHE_PATH): ModelsCache | null {
+function readModelsCache(cachePath: string = defaultModelsCachePath()): ModelsCache | null {
 	try {
 		const parsed = JSON.parse(fs.readFileSync(cachePath, "utf8")) as unknown;
 		if (
@@ -233,7 +229,7 @@ function readModelsCache(cachePath: string = MODELS_CACHE_PATH): ModelsCache | n
 
 /** Atomically persist the raw catalog text (temp + rename, mode 0o600).
  *  Best-effort: a write failure just means the next load re-spawns. */
-function writeModelsCache(raw: string, cachePath: string = MODELS_CACHE_PATH): void {
+function writeModelsCache(raw: string, cachePath: string = defaultModelsCachePath()): void {
 	fs.mkdirSync(path.dirname(cachePath), { recursive: true });
 	const tmp = `${cachePath}.${process.pid}.tmp`;
 	try {
@@ -254,7 +250,7 @@ function writeModelsCache(raw: string, cachePath: string = MODELS_CACHE_PATH): v
  *  the next load sees fresh data without this one having to wait on agy. */
 export function refreshModelsInBackground(
 	binary: string,
-	cachePath: string = MODELS_CACHE_PATH,
+	cachePath: string = defaultModelsCachePath(),
 ): void {
 	void spawnAgyModelsRaw(binary)
 		.then((raw) => {
@@ -277,7 +273,7 @@ export function refreshModelsInBackground(
  *  Gemini entries (agy missing/auth-failed). */
 export async function loadModelCatalogRaw(
 	binary: string,
-	cachePath: string = MODELS_CACHE_PATH,
+	cachePath: string = defaultModelsCachePath(),
 ): Promise<string> {
 	const cache = readModelsCache(cachePath);
 	if (cache) {
@@ -395,8 +391,10 @@ export function toPiModel(entry: AgyModelEntry, input: Array<"text" | "image"> =
  *  can still select a model and get a clear runtime error instead of an empty
  *  list. Update these when agy ships new Gemini versions. */
 export const FALLBACK_MODELS: AgyModelEntry[] = [
+	{ full: "gemini-4-carbon", id: "gemini-4-carbon", efforts: ["low", "medium", "high"] },
+	{ full: "gemini-4-argon", id: "gemini-4-argon", efforts: ["low", "medium", "high"] },
 	{ full: "gemini-3.8-flash", id: "gemini-3-8-flash", efforts: ["low", "medium", "high"] },
-	{ full: "gemini-3.1-pro", id: "gemini-3-1-pro", efforts: ["low", "high"] },
+	{ full: "claude-opus-5-5", id: "claude-opus-5-5", efforts: ["low", "medium", "high"] },
 	{ full: "claude-sonnet-5-5", id: "claude-sonnet-5-5", efforts: ["low", "medium", "high"] },
 ];
 

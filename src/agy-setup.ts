@@ -41,13 +41,13 @@ export function createAgySetupOffer(opts: {
 				const command = [spec.command, ...spec.args].join(" ");
 				const approved = await opts.ui.confirm(
 					"Antigravity CLI required",
-					`Both engines require the agy CLI. Run Google's official installer now?\n\n${command}`,
+					`The Antigravity provider requires the agy CLI. Run Google's official installer now?\n\n${command}`,
 				);
 				if (!approved) {
 					notify(opts.missingMessage(), "warning");
 					return;
 				}
-				opts.ui.setStatus("agy-install", "Installing Antigravity CLI…");
+				opts.ui.setStatus("agy-install", "Installing Antigravity CLI...");
 				const result = await install();
 				if (!result.ok) {
 					opts.log("agy-install", { error: result.error }, "warn");

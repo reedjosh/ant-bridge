@@ -1,27 +1,49 @@
 {
-  "name": "pi-antigravity-bridge-local",
-  "private": true,
-  "version": "1.10.4-local.1",
-  "description": "Locally owned Antigravity provider and Pi MCP/tool bridge for Pi (forked from @estebanforge/pi-antigravity-bridge@1.10.4).",
+  "name": "ant-bridge",
+  "version": "2.0.0",
+  "description": "ACP model provider and MCP/skill bridge for Pi.",
   "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/reedjosh/ant-bridge.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "pi": {
     "extensions": [
-      "./extensions"
-    ],
-    "changelogPath": ""
+      "./extensions/index.ts"
+    ]
   },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.5.1"
-  },
-  "peerDependenciesMeta": {
-    "@earendil-works/pi-coding-agent": {
-      "optional": true
-    }
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "@estebanforge/pi-ask-shared": "^0.1.4",
-    "@estebanforge/pi-tui-dialogs": "^0.1.3",
     "@modelcontextprotocol/sdk": "^1.31.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-agent-core": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
   }
 }

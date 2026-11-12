@@ -27,7 +27,13 @@ import {
 	type AcpPermissionRequest,
 } from "./connection.js";
 import type { AcpPermissionHandler } from "./connection.js";
-import { mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
+import {
+	mapStopReason,
+	mapUpdate,
+	TextAccumulator,
+	type AcpEditDiff,
+	type AcpToolLocation,
+} from "./events.js";
 import { estimateTokens, synthesizeUsage } from "./usage-estimate.js";
 import type {
 	AgyUsage,
@@ -128,9 +134,18 @@ interface ActiveTurn {
 	overallRemainingMs: number | null;
 	overallTimer?: ReturnType<typeof setTimeout>;
 	idleTimer?: ReturnType<typeof setTimeout>;
-	/** toolCallId → tool name + args + optional native diff (diff rides on
-	 *  the pending tool_call frame; updates don't repeat it). */
-	toolCalls: Map<string, { name: string; args: Record<string, unknown>; diff?: AcpEditDiff; mcpServer?: string }>;
+	/** toolCallId -> tool name + args + optional location/diff (carried on
+	 *  the pending tool_call frame; completed updates may omit them). */
+	toolCalls: Map<
+		string,
+		{
+			name: string;
+			args: Record<string, unknown>;
+			location?: AcpToolLocation;
+			diff?: AcpEditDiff;
+			mcpServer?: string;
+		}
+	>;
 }
 
 /** Map our config knobs onto ACP session modes. skipPermissions=false also
@@ -553,9 +568,30 @@ export class AcpDriver implements TurnDriver {
 					turn.toolBatches += 1;
 					turn.toolBatchOpen = true;
 				}
-				const entry = { name: mapped.name, args: mapped.args, diff: mapped.diff, mcpServer: mapped.mcpServer };
+				const entry = {
+					name: mapped.name,
+					args: mapped.args,
+					location: mapped.location,
+					diff: mapped.diff,
+					mcpServer: mapped.mcpServer,
+				};
 				turn.toolCalls.set(mapped.toolCallId, entry);
-				this.#emit(turn, { type: "tool_start", name: mapped.name, args: mapped.args, mcpServer: mapped.mcpServer, toolCallId: mapped.toolCallId });
+				this.#emit(turn, {
+					type: "tool_start",
+					name: mapped.name,
+					args: mapped.args,
+					...(mapped.location ? { location: mapped.location } : {}),
+					mcpServer: mapped.mcpServer,
+					toolCallId: mapped.toolCallId,
+				});
+				return;
+			}
+			case "tool_update": {
+				const entry = turn.toolCalls.get(mapped.toolCallId);
+				if (entry) {
+					if (mapped.args) entry.args = { ...entry.args, ...mapped.args };
+					if (mapped.location) entry.location = mapped.location;
+				}
 				return;
 			}
 			case "tool_done": {
@@ -571,10 +607,22 @@ export class AcpDriver implements TurnDriver {
 				}
 				turn.toolCalls.delete(mapped.toolCallId);
 				const name = entry?.name ?? "tool";
-				const args = entry?.args ?? {};
+				const args = mapped.args
+					? { ...(entry?.args ?? {}), ...mapped.args }
+					: (entry?.args ?? {});
+				const location = mapped.location ?? entry?.location;
 				// Native diff from the stored tool_call frame; the update's own
 				// diff (future builds) wins when present.
-				this.#emit(turn, { type: "tool_done", name, args, output: mapped.output, diff: mapped.diff ?? entry?.diff, mcpServer: mapped.mcpServer ?? entry?.mcpServer, toolCallId: mapped.toolCallId });
+				this.#emit(turn, {
+					type: "tool_done",
+					name,
+					args,
+					...(location ? { location } : {}),
+					output: mapped.output,
+					diff: mapped.diff ?? entry?.diff,
+					mcpServer: mapped.mcpServer ?? entry?.mcpServer,
+					toolCallId: mapped.toolCallId,
+				});
 				if (turn.steered && !turn.steerCancelSent && turn.promptStarted && turn.toolCalls.size === 0) {
 					this.#sendSteerCancel(turn);
 				}
@@ -584,7 +632,19 @@ export class AcpDriver implements TurnDriver {
 				const entry = turn.toolCalls.get(mapped.toolCallId);
 				turn.toolCalls.delete(mapped.toolCallId);
 				const name = entry?.name ?? "tool";
-				this.#emit(turn, { type: "tool_error", name, message: mapped.message, mcpServer: mapped.mcpServer ?? entry?.mcpServer, toolCallId: mapped.toolCallId });
+				const args = mapped.args
+					? { ...(entry?.args ?? {}), ...mapped.args }
+					: entry?.args;
+				const location = mapped.location ?? entry?.location;
+				this.#emit(turn, {
+					type: "tool_error",
+					name,
+					message: mapped.message,
+					...(args ? { args } : {}),
+					...(location ? { location } : {}),
+					mcpServer: mapped.mcpServer ?? entry?.mcpServer,
+					toolCallId: mapped.toolCallId,
+				});
 				if (turn.steered && !turn.steerCancelSent && turn.promptStarted && turn.toolCalls.size === 0) {
 					this.#sendSteerCancel(turn);
 				}

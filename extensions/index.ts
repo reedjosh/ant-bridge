@@ -1,7 +1,6 @@
 // ant-bridge - focused ACP model provider and Pi MCP/skill bridge.
 
 import { spawn } from "node:child_process";
-import path from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -57,6 +56,10 @@ import {
 	toPiModel,
 	type AgyModelEntry,
 } from "../src/models.js";
+import {
+	capNativeOutput,
+	createNativeEventEntryRenderer,
+} from "../src/native-event-render.js";
 import { PollRunFolder, type PollRunData } from "../src/poll-fold.js";
 import {
 	createStreamSimple,
@@ -225,36 +228,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	pi.registerEntryRenderer<NativeDisplayEvent>(
 		"agy-native-event",
-		(entry, { expanded }, theme) => {
-			const event = entry.data;
-			const firstLine = (value: string | undefined): string | undefined =>
-				value?.split(/\r?\n/, 1)[0].trim() || undefined;
-			const detail = event?.path
-				? path.basename(event.path)
-				: (firstLine(event?.command) ?? firstLine(event?.output));
-			const status =
-				event?.status === "failed" ? theme.fg("error", "x") : theme.fg("success", "ok");
-			const lines = [
-				`${status} ${theme.fg("toolTitle", event?.name ?? "Antigravity")}${detail ? ` ${theme.fg("muted", detail.slice(0, 160))}` : ""}`,
-			];
-			if (expanded) {
-				if (event?.path) lines.push(theme.fg("dim", event.path));
-				if (event?.diff) {
-					for (const line of event.diff.split("\n")) {
-						const color = line.startsWith("+")
-							? "toolDiffAdded"
-							: line.startsWith("-")
-								? "toolDiffRemoved"
-								: "toolDiffContext";
-						lines.push(theme.fg(color, line));
-					}
-				}
-				if (event?.output && (!event.diff || event.status === "failed")) {
-					lines.push(theme.fg("toolOutput", event.output));
-				}
-			}
-			return new Text(lines.join("\n"), 0, 0);
-		},
+		createNativeEventEntryRenderer(),
 	);
 
 	pi.registerEntryRenderer<PollRunData>("agy-poll-run", (entry, { expanded }, theme) => {
@@ -314,7 +288,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		if (pendingNativeTools === 0) activeUi?.setStatus("agy-native", undefined);
 		pi.appendEntry<NativeDisplayEvent>("agy-native-event", {
 			...event,
-			output: event.output?.slice(0, 4000),
+			output: capNativeOutput(event.output),
 			diff: event.diff?.slice(0, 12000),
 			command: event.command?.slice(0, 500),
 		});

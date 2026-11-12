@@ -1,4 +1,4 @@
-// ACP `session/update` payload → DriverActivity mapping + stopReason mapping.
+// ACP `session/update` payload -> DriverActivity mapping + stopReason mapping.
 //
 // Pure functions, no I/O: unit-tested against the captured probe transcripts
 // (probe-logs/acp-traffic-run5.jsonl, run6-restart-load-tools.jsonl).
@@ -9,11 +9,12 @@
 //   - agent_thought_chunk  { content: { type: "text", text } }          (thought TEXT)
 //   - user_message_chunk   { content: { type: "text", text } }          (load replay only)
 //   - tool_call            { toolCallId, title, kind, status, content?, locations?, rawInput? }
-//   - tool_call_update     { toolCallId, status: completed|failed, rawOutput? }
+//   - tool_call_update     { toolCallId, status: completed|failed, rawOutput?, locations?, rawInput? }
 //   - plan                 { entries: [...] }
 //   - available_commands_update { availableCommands: [...] }
 // Exact turn usage is read from PromptResponse by the connection.
 
+import { fileURLToPath } from "node:url";
 import { StreamSanitizer, sanitizeSystemMessage } from "../stream-sanitizer.js";
 
 export { StreamSanitizer, sanitizeSystemMessage };
@@ -24,20 +25,54 @@ export { StreamSanitizer, sanitizeSystemMessage };
  *  live text). */
 /** Native edit diff carried in tool_call content[] (run 6: edits arrive AS
  *  DIFFS: {type:"diff", path, newText, optional oldText}). The provider
- *  formats it in memory — no git subprocess needed on the ACP engine. */
+ *  formats it in memory - no git subprocess needed on the ACP engine. */
 export interface AcpEditDiff {
 	path: string;
 	oldText?: string;
 	newText: string;
 }
 
+export interface AcpToolLocation {
+	path: string;
+	line?: number;
+}
+
 export type MappedUpdate =
 	| { kind: "text"; delta: string }
 	| { kind: "thought"; delta: string }
 	| { kind: "usage"; used: number }
-	| { kind: "tool_start"; toolCallId: string; name: string; args: Record<string, unknown>; diff?: AcpEditDiff; mcpServer?: string }
-	| { kind: "tool_done"; toolCallId: string; output?: string; diff?: AcpEditDiff; mcpServer?: string }
-	| { kind: "tool_error"; toolCallId: string; message: string; mcpServer?: string }
+	| {
+			kind: "tool_start";
+			toolCallId: string;
+			name: string;
+			args: Record<string, unknown>;
+			location?: AcpToolLocation;
+			diff?: AcpEditDiff;
+			mcpServer?: string;
+	  }
+	| {
+			kind: "tool_update";
+			toolCallId: string;
+			args?: Record<string, unknown>;
+			location?: AcpToolLocation;
+	  }
+	| {
+			kind: "tool_done";
+			toolCallId: string;
+			output?: string;
+			args?: Record<string, unknown>;
+			location?: AcpToolLocation;
+			diff?: AcpEditDiff;
+			mcpServer?: string;
+	  }
+	| {
+			kind: "tool_error";
+			toolCallId: string;
+			message: string;
+			args?: Record<string, unknown>;
+			location?: AcpToolLocation;
+			mcpServer?: string;
+	  }
 	| { kind: "replay_user" }
 	| null;
 
@@ -65,14 +100,21 @@ export function mapUpdate(update: unknown): MappedUpdate {
 			const id = stringField(u.toolCallId);
 			if (!id) return null;
 			const nativeMcp = nativeMcpTool(u);
+			const location = firstLocation(u.locations) ?? titleLocation(u.title);
 			return {
 				kind: "tool_start",
 				toolCallId: id,
-				name: metaToolName(u._meta) ?? nativeMcp?.name ?? stringField(u.name) ?? toolName(u.title, u.kind),
+				name:
+					metaToolName(u._meta) ??
+					nativeMcp?.name ??
+					stringField(u.name) ??
+					toolName(u.title, u.kind),
 				args: rawArguments(u.rawInput),
-				mcpServer: stringField(recordField(recordField(u._meta).mcp).server) ?? nativeMcp?.server,
+				...(location ? { location } : {}),
+				mcpServer:
+					stringField(recordField(recordField(u._meta).mcp).server) ?? nativeMcp?.server,
 				// Edits carry their native diff HERE, on the pending tool_call
-				// frame (run 6:10) — the completed update carries only display
+				// frame (run 6:10) - the completed update carries only display
 				// text. contentDiff on the update stays as a future-build
 				// fallback.
 				diff: contentDiff(u.content),
@@ -81,6 +123,8 @@ export function mapUpdate(update: unknown): MappedUpdate {
 		case "tool_call_update": {
 			const id = stringField(u.toolCallId);
 			if (!id) return null;
+			const location = firstLocation(u.locations) ?? titleLocation(u.title);
+			const args = nonEmptyRecord(rawArguments(u.rawInput));
 			if (u.status === "failed") {
 				// Legacy approved-echo: after an allow, the APPROVED call
 				// id reports failed with this sentinel while the real work runs
@@ -89,21 +133,42 @@ export function mapUpdate(update: unknown): MappedUpdate {
 				// failure next to a successful edit.
 				const raw = stringField(u.rawOutput);
 				if (raw?.includes("approved but never executed")) return null;
-				const mcpServer = stringField(recordField(recordField(u._meta).mcp).server) ?? nativeMcpTool(u)?.server;
-				return { kind: "tool_error", toolCallId: id, message: raw ?? "tool failed", ...(mcpServer ? { mcpServer } : {}) };
+				const mcpServer =
+					stringField(recordField(recordField(u._meta).mcp).server) ??
+					nativeMcpTool(u)?.server;
+				return {
+					kind: "tool_error",
+					toolCallId: id,
+					message: raw ?? "tool failed",
+					...(args ? { args } : {}),
+					...(location ? { location } : {}),
+					...(mcpServer ? { mcpServer } : {}),
+				};
 			}
 			if (u.status === "completed") {
 				// content[] first (edits carry their diff there); rawOutput alone is
 				// often just the server's display title, not the result (probe
 				// 2026-09-03: completed MCP call, rawOutput "Call bridge_echo").
 				const diff = contentDiff(u.content);
-				const mcpServer = stringField(recordField(recordField(u._meta).mcp).server) ?? nativeMcpTool(u)?.server;
+				const mcpServer =
+					stringField(recordField(recordField(u._meta).mcp).server) ??
+					nativeMcpTool(u)?.server;
 				return {
 					kind: "tool_done",
 					toolCallId: id,
 					output: contentText(u.content) ?? stringField(u.rawOutput),
+					...(args ? { args } : {}),
+					...(location ? { location } : {}),
 					...(mcpServer ? { mcpServer } : {}),
 					...(diff ? { diff } : {}),
+				};
+			}
+			if (args || location) {
+				return {
+					kind: "tool_update",
+					toolCallId: id,
+					...(args ? { args } : {}),
+					...(location ? { location } : {}),
 				};
 			}
 			return null; // in_progress or unknown status: nothing to render yet
@@ -176,6 +241,68 @@ function chunkText(content: unknown): string {
 		if (typeof c.text === "string") return c.text;
 	}
 	return "";
+}
+
+function nonEmptyRecord(rec: Record<string, unknown>): Record<string, unknown> | undefined {
+	return Object.keys(rec).length > 0 ? rec : undefined;
+}
+
+function positiveInt(v: unknown): number | undefined {
+	return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
+}
+
+function stripFileUri(rawPath: string): string {
+	const trimmed = rawPath.trim();
+	if (!trimmed.startsWith("file://")) return trimmed;
+	try {
+		return fileURLToPath(trimmed);
+	} catch {
+		return trimmed.replace(/^file:\/\//, "");
+	}
+}
+
+/** First file/directory location carried in ACP tool_call / tool_call_update locations[]. */
+function firstLocation(locations: unknown): AcpToolLocation | undefined {
+	if (!Array.isArray(locations)) return undefined;
+	for (const item of locations) {
+		const loc = recordField(item);
+		const rawPath = stringField(loc.path) ?? stringField(loc.uri);
+		if (!rawPath) continue;
+		const cleanPath = stripFileUri(rawPath);
+		if (!cleanPath) continue;
+		const line = positiveInt(loc.line);
+		return line !== undefined ? { path: cleanPath, line } : { path: cleanPath };
+	}
+	return undefined;
+}
+
+/** Fallback path extraction from ACP tool_call title when rawInput and locations lack it. */
+function titleLocation(title: unknown): AcpToolLocation | undefined {
+	if (typeof title !== "string") return undefined;
+	const trimmed = title.trim();
+	if (!trimmed || /^(?:Run|Running|Call|Calling)\s+[A-Za-z_][\w.]*\??$/i.test(trimmed)) {
+		return undefined;
+	}
+	const backtick = /`([^`\s]+)`/.exec(trimmed)?.[1];
+	const verbPattern = new RegExp(
+		"^(?:Read|Reading|View|Viewing|Open|Opening|Edit|Editing|Write|Writing|Create|Creating|List|Listing)" +
+			"\\s+(?:file\\s+|directory\\s+)?([^\\s`]+?)[?.!]*$",
+		"i",
+	);
+	const verbArg = verbPattern.exec(trimmed)?.[1];
+	const candidate = backtick ?? verbArg;
+	if (!candidate || /^https?:\/\//i.test(candidate)) return undefined;
+	const unwrapped = stripFileUri(candidate);
+	const rangeMatch = /^(.+?):(\d+)(?:-\d+)?$/.exec(unwrapped);
+	const pathPart = rangeMatch ? rangeMatch[1]! : unwrapped;
+	const line = rangeMatch ? positiveInt(Number(rangeMatch[2])) : undefined;
+	const looksLikePath =
+		pathPart.includes("/") ||
+		pathPart.includes("\\") ||
+		pathPart.startsWith(".") ||
+		/\.[A-Za-z0-9]{1,10}$/.test(pathPart);
+	if (!looksLikePath) return undefined;
+	return line !== undefined ? { path: pathPart, line } : { path: pathPart };
 }
 
 function stringField(v: unknown): string | undefined {

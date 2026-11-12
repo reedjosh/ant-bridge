@@ -52,6 +52,11 @@ export function toPiUsage(
 	piUsage.totalTokens = u.total_tokens ?? piUsage.input + piUsage.output;
 }
 
+export interface DriverToolLocation {
+	path: string;
+	line?: number;
+}
+
 export type DriverActivity =
 	| { type: "text"; delta: string }
 	| { type: "thought"; tokens?: number; delta?: string }
@@ -59,6 +64,7 @@ export type DriverActivity =
 			type: "tool_start";
 			name: string;
 			args: Record<string, unknown>;
+			location?: DriverToolLocation;
 			mcpServer?: string;
 			toolCallId?: string;
 	  }
@@ -66,6 +72,7 @@ export type DriverActivity =
 			type: "tool_done";
 			name: string;
 			args: Record<string, unknown>;
+			location?: DriverToolLocation;
 			mcpServer?: string;
 			toolCallId?: string;
 			output?: string;
@@ -76,6 +83,8 @@ export type DriverActivity =
 			type: "tool_error";
 			name: string;
 			message: string;
+			args?: Record<string, unknown>;
+			location?: DriverToolLocation;
 			mcpServer?: string;
 			toolCallId?: string;
 	  }

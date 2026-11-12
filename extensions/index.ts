@@ -75,10 +75,15 @@ import { spawn } from "node:child_process";
 import { fetchAgyQuota, formatAgyQuotaReport } from "../src/usage.js";
 import { artifactOpenCommand, listAgyArtifacts } from "../src/artifacts.js";
 import { showArtifactsBrowser } from "../src/artifacts-ui.js";
-import { listAgyTasks, tailAgyTaskLog } from "../src/tasks.js";
+import { listAgyTasks, readDeliveredTaskIds, tailAgyTaskLog } from "../src/tasks.js";
 import { showTasksBrowser } from "../src/tasks-ui.js";
 import { agyConversationDir } from "../src/agy-paths.js";
-import { armBackgroundWatch, rearmPlansFromEntries, type BackgroundWatchEntry, type BackgroundWatchHandle } from "../src/background-watch.js";
+import {
+	armBackgroundWatch,
+	partitionRearmPlans,
+	type BackgroundWatchEntry,
+	type BackgroundWatchHandle,
+} from "../src/background-watch.js";
 import { redactText } from "../src/redact.js";
 import { createDailyLogger, type DailyLogger } from "../src/daily-log.js";
 import { registerAskAntigravityTool, toolModelsFromRaw } from "../src/ask-tool.js";
@@ -469,8 +474,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// task logs and wakes the model when they go quiet. One watcher per
 	// conversation; armed/settled pi entries survive /resume so a reload
 	// mid-watch re-arms instead of losing the completion notice.
-	const backgroundWatchers = new Map<string, BackgroundWatchHandle>();
+	const backgroundWatchers = new Map<string, { handle: BackgroundWatchHandle; armedAt: number; settled: boolean }>();
 	let backgroundWatchDisposed = false;
+	const appendWatchSettled = (conversationId: string, armedAt: number, taskIds: number[]): void => {
+		try {
+			pi.appendEntry<BackgroundWatchEntry>("agy-background-watch", {
+				kind: "settled",
+				conversationId,
+				armedAt,
+				settledAt: Date.now(),
+				taskIds,
+			});
+		} catch { /* best-effort */ }
+	};
 	const sendTaskWake = (content: string): void => {
 		if (backgroundWatchDisposed) return;
 		try {
@@ -483,33 +499,44 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	};
 	const armConversationWatcher = (conversationId: string, turnStartMs: number, opts?: { armedAt?: number; recordArmed?: boolean }): void => {
 		const conversationDir = agyConversationDir(engine, conversationId);
-		backgroundWatchers.get(conversationId)?.stop();
+		const prev = backgroundWatchers.get(conversationId);
+		if (prev) {
+			prev.handle.stop();
+			if (!prev.settled) {
+				prev.settled = true;
+				appendWatchSettled(conversationId, prev.armedAt, []);
+			}
+		}
 		const armedAt = opts?.armedAt ?? Date.now();
 		if (opts?.recordArmed !== false) {
 			try {
 				pi.appendEntry<BackgroundWatchEntry>("agy-background-watch", { kind: "armed", conversationId, turnStartMs, armedAt });
 			} catch { /* persistence is best-effort; the in-memory watch still works */ }
 		}
-		const handle = armBackgroundWatch({
+		const slot = { handle: undefined as unknown as BackgroundWatchHandle, armedAt, settled: false };
+		slot.handle = armBackgroundWatch({
 			conversationId,
 			conversationDir,
 			turnStartMs,
+			armedAt,
 			listTasks: listAgyTasks,
+			deliveredTaskIds: readDeliveredTaskIds,
 			tail: tailAgyTaskLog,
 			onSettle: (result) => {
-				try {
-					pi.appendEntry<BackgroundWatchEntry>("agy-background-watch", { kind: "settled", conversationId, armedAt, settledAt: Date.now(), taskIds: result.taskIds });
-				} catch { /* best-effort */ }
+				if (slot.settled) return;
+				slot.settled = true;
+				appendWatchSettled(conversationId, armedAt, result.taskIds);
 			},
 			sendWake: sendTaskWake,
 			log: fileLog.log.bind(fileLog),
 		});
-		backgroundWatchers.set(conversationId, handle);
+		backgroundWatchers.set(conversationId, slot);
 	};
 	// Reload resume: pi wipes extension module state on /new, /resume, /fork
 	// and /reload while the agy-side task keeps running. Armed records without
-	// a settled twin re-arm; the settled record prevents any double wake.
-	pi.on("session_start", (event, ctx) => {
+	// a settled twin re-arm; superseded records settle silently so historical
+	// entries never accumulate or re-wake.
+	pi.on("session_start", (_event, ctx) => {
 		try {
 			const records: Array<{ customType: string; data: unknown }> = [];
 			for (const e of ctx.sessionManager.getEntries()) {
@@ -517,7 +544,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					records.push({ customType: e.customType, data: (e as { data?: unknown }).data });
 				}
 			}
-			for (const plan of rearmPlansFromEntries(records)) {
+			const { active, superseded } = partitionRearmPlans(records);
+			for (const old of superseded) {
+				appendWatchSettled(old.conversationId, old.armedAt, []);
+			}
+			for (const plan of active) {
 				if (!backgroundWatchers.has(plan.conversationId)) {
 					armConversationWatcher(plan.conversationId, plan.turnStartMs, { armedAt: plan.armedAt, recordArmed: false });
 					fileLog.log("background-watch-rearm", { conversation: plan.conversationId, armedAt: plan.armedAt }, "info");
@@ -529,7 +560,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 	pi.on("session_shutdown", () => {
 		backgroundWatchDisposed = true;
-		for (const handle of backgroundWatchers.values()) handle.stop();
+		for (const slot of backgroundWatchers.values()) slot.handle.stop();
 		backgroundWatchers.clear();
 	});
 	const streamSimple = createStreamSimple({

@@ -21,6 +21,8 @@ const TASK_LOG_RE = /^task-(\d+)\.log$/;
 const MAX_TASKS = 128;
 const LSOFT_TIMEOUT_MS = 5_000;
 const LSOFT_CAP_BYTES = 1024 * 1024;
+const TRANSCRIPT_CAP_BYTES = 16 * 1024 * 1024;
+const DELIVERED_TASK_RE = /sender=[^\s"\\]+\/task-(\d+)\b/g;
 export const TASK_TAIL_BYTES = 2 * 1024;
 
 export interface AgyTask {
@@ -168,7 +170,30 @@ export async function listAgyTasks(
 }
 
 /** Last bytes of a task log for the tail command. Empty string on any
- *  error — tails are best-effort views, not facts. */
+ *  error - tails are best-effort views, not facts. */
 export async function tailAgyTaskLog(logPath: string): Promise<string> {
 	return readTranscriptTail(logPath, TASK_TAIL_BYTES);
+}
+
+/** Task IDs whose completion agy already injected in-turn via a SYSTEM_MESSAGE
+ *  step in transcript.jsonl. Empty set when the transcript is absent or unreadable. */
+export async function readDeliveredTaskIds(conversationDir: string): Promise<Set<number>> {
+	const transcriptPath = path.join(conversationDir, ".system_generated", "logs", "transcript.jsonl");
+	const delivered = new Set<number>();
+	let text: string;
+	try {
+		text = await readTranscriptTail(transcriptPath, TRANSCRIPT_CAP_BYTES);
+	} catch {
+		return delivered;
+	}
+	for (const line of text.split("\n")) {
+		if (!line.includes('"SYSTEM_MESSAGE"')) continue;
+		DELIVERED_TASK_RE.lastIndex = 0;
+		let match: RegExpExecArray | null;
+		while ((match = DELIVERED_TASK_RE.exec(line)) !== null) {
+			const id = Number(match[1]);
+			if (Number.isInteger(id) && id >= 0) delivered.add(id);
+		}
+	}
+	return delivered;
 }

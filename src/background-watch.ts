@@ -27,7 +27,13 @@ export interface BackgroundWatchOptions {
 	/** Task logs older than the turn start are other turns' work and are
 	 *  never tracked (the task dir is cumulative per conversation). */
 	turnStartMs: number;
+	/** Timestamp when the turn ended and armed the watch. Idle tasks whose log
+	 *  stopped changing before armedAt already finished inside the turn and must
+	 *  not fire a post-turn wake. */
+	armedAt?: number;
 	listTasks: (conversationDir: string) => Promise<AgyTask[]>;
+	/** Optional reader for task IDs agy already delivered in-turn via transcript.jsonl. */
+	deliveredTaskIds?: (conversationDir: string) => Promise<Set<number>>;
 	tail: (logPath: string) => Promise<string>;
 	sendWake: (content: string) => void;
 	/** Structured settle report (outcome + task ids), fired before sendWake;
@@ -112,7 +118,21 @@ export function armBackgroundWatch(opts: BackgroundWatchOptions): BackgroundWatc
 				opts.log?.("background-watch-scan-error", { conversationId: opts.conversationId, error: err instanceof Error ? err.message : String(err) }, "warn");
 				tasks = [];
 			}
-			const current = tasks.filter((t) => t.modifiedMs >= opts.turnStartMs);
+			const candidates = tasks.filter(
+				(t) =>
+					tracked.has(t.id) ||
+					t.active ||
+					(t.modifiedMs >= opts.turnStartMs && (opts.armedAt === undefined || t.modifiedMs >= opts.armedAt)),
+			);
+			let delivered = new Set<number>();
+			if (candidates.length > 0 && opts.deliveredTaskIds) {
+				try {
+					delivered = await opts.deliveredTaskIds(opts.conversationDir);
+				} catch {
+					delivered = new Set<number>();
+				}
+			}
+			const current = delivered.size > 0 ? candidates.filter((t) => !delivered.has(t.id)) : candidates;
 			if (current.length > 0) everSeen = true;
 			const seen = new Set<number>();
 			for (const t of current) {
@@ -129,8 +149,10 @@ export function armBackgroundWatch(opts: BackgroundWatchOptions): BackgroundWatc
 			}
 			if (!everSeen) {
 				if (now() - startedAt >= quietMs) {
-					// Spurious arm: the flagged call left no task log (foreground or
-					// instant completion). Silent stop, no wake.
+					// Spurious arm: the flagged call left no post-turn task log (foreground
+					// or already completed inside the turn). Persist settled so reloads do
+					// not re-arm stale watches, and stop silently without waking.
+					opts.onSettle?.({ outcome: "settled", taskIds: [] });
 					opts.log?.("background-watch-spurious", { conversationId: opts.conversationId }, "info");
 					stopped = true;
 					return;
@@ -203,13 +225,16 @@ export interface RearmPlan {
 	armedAt: number;
 }
 
-/** Plans re-arm for armed records whose settled twin (same conversationId +
- *  armedAt) never landed — module death between arm and settle (issue: pi
- *  wipes extension module state on /new, /resume, /fork, /reload while the
- *  agy-side task keeps running). */
-export function rearmPlansFromEntries(entries: BackgroundWatchEntryView[]): RearmPlan[] {
+/** Partition unsettled armed records into the latest active watch per
+ *  conversation and any older watches superseded by a later arm on the same
+ *  conversation. */
+export function partitionRearmPlans(entries: BackgroundWatchEntryView[]): {
+	active: RearmPlan[];
+	superseded: RearmPlan[];
+} {
 	const armed = new Map<string, RearmPlan>();
 	const settled = new Set<string>();
+	const latestArmedAt = new Map<string, number>();
 	for (const entry of entries) {
 		if (entry.customType !== "agy-background-watch") continue;
 		const d = entry.data as Partial<BackgroundWatchEntry> | undefined;
@@ -217,9 +242,30 @@ export function rearmPlansFromEntries(entries: BackgroundWatchEntryView[]): Rear
 		const key = `${d.conversationId}:${d.armedAt}`;
 		if (d.kind === "armed" && typeof d.armedAt === "number") {
 			armed.set(key, { conversationId: d.conversationId, turnStartMs: d.turnStartMs ?? 0, armedAt: d.armedAt });
+			const prevMax = latestArmedAt.get(d.conversationId);
+			if (prevMax === undefined || d.armedAt > prevMax) latestArmedAt.set(d.conversationId, d.armedAt);
 		} else if (d.kind === "settled" && typeof d.armedAt === "number") {
 			settled.add(key);
 		}
 	}
-	return [...armed.entries()].filter(([key]) => !settled.has(key)).map(([, plan]) => plan);
+	const active: RearmPlan[] = [];
+	const superseded: RearmPlan[] = [];
+	for (const [key, plan] of armed.entries()) {
+		if (settled.has(key)) continue;
+		const maxArmed = latestArmedAt.get(plan.conversationId) ?? plan.armedAt;
+		if (plan.armedAt < maxArmed) {
+			superseded.push(plan);
+		} else {
+			active.push(plan);
+		}
+	}
+	return { active, superseded };
+}
+
+/** Plans re-arm for the latest armed record per conversation whose settled twin
+ *  (same conversationId + armedAt) never landed - module death between arm and
+ *  settle (pi wipes extension module state on /new, /resume, /fork, /reload
+ *  while the agy-side task keeps running). */
+export function rearmPlansFromEntries(entries: BackgroundWatchEntryView[]): RearmPlan[] {
+	return partitionRearmPlans(entries).active;
 }

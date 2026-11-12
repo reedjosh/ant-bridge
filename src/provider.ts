@@ -98,33 +98,69 @@ function zeroUsage(): Usage {
 	};
 }
 
-/** Extract the latest user message as a flat prompt string. agy maintains its
- *  own conversation history via --conversation, so we collapse pi's structured
- *  message to text. Returns null if the last message isn't a user message. */
-function extractUserPrompt(context: TranscriptContext): string | null {
-	const last = context.messages[context.messages.length - 1];
-	if (!last || last.role !== "user") return null;
-	const content = last.content;
-	if (typeof content === "string") return content;
-	// Flatten text blocks; images ride separately via extractImages (native
-	// blocks on ACP, staged files on stream-json via prompt-images.ts).
-	return content
-		.filter((b): b is { type: "text"; text: string } => b.type === "text")
-		.map((b) => b.text)
-		.join("\n")
-		.trim() || null;
+/** Find the start index of the current turn's contiguous trailing user-role
+ *  messages (excluding compaction and branch summaries, and never crossing an
+ *  already-delivered watermark). Extensions such as pr-tracker inject trailing
+ *  custom_message entries (converted to role="user" by Pi's convertToLlm)
+ *  after the user's message; reading only messages[length - 1] would shadow
+ *  the real user prompt and push it into the continuity-only digest. */
+export function trailingUserTurnStart(messages: Message[], watermark = 0): number {
+	const floor = watermark > 0 && watermark < messages.length ? Math.floor(watermark) : 0;
+	let start = messages.length;
+	for (let i = messages.length - 1; i >= floor; i--) {
+		const m = messages[i];
+		if (!m || m.role !== "user") break;
+		const t = blocksToText(m.content);
+		if (t.includes(COMPACTION_MARKER) || t.includes(BRANCH_SUMMARY_MARKER)) break;
+		start = i;
+	}
+	return start;
 }
 
-/** Image blocks of the latest user message (pi-ai ImageContent: base64 data
- *  + mimeType). On the ACP engine they ride session/prompt as native
- *  content blocks; on stream-json they are staged to temp files and the
- *  prompt names the paths (see prompt-images.ts). */
-function extractImages(context: TranscriptContext): Array<{ data: string; mimeType: string }> {
-	const last = context.messages[context.messages.length - 1];
-	if (!last || last.role !== "user" || typeof last.content === "string") return [];
-	return last.content
-		.filter((b): b is { type: "image"; data: string; mimeType: string } => b.type === "image")
-		.map((b) => ({ data: b.data, mimeType: b.mimeType }));
+/** Extract the current turn's user message(s) as a flat prompt string. agy
+ *  maintains its own conversation history via --conversation, so we collapse
+ *  pi's structured messages to text. Returns null if there is no trailing
+ *  non-summary user text. */
+export function extractUserPrompt(context: TranscriptContext, watermark = 0): string | null {
+	const start = trailingUserTurnStart(context.messages, watermark);
+	if (start >= context.messages.length) return null;
+	const parts: string[] = [];
+	for (let i = start; i < context.messages.length; i++) {
+		const content = context.messages[i].content;
+		const text =
+			typeof content === "string"
+				? content.trim()
+				: content
+						.filter((b): b is { type: "text"; text: string } => b.type === "text")
+						.map((b) => b.text)
+						.join("\n")
+						.trim();
+		if (text) parts.push(text);
+	}
+	return parts.length > 0 ? parts.join("\n\n") : null;
+}
+
+/** Image blocks across the current turn's trailing user message(s) (pi-ai
+ *  ImageContent: base64 data + mimeType). On the ACP engine they ride
+ *  session/prompt as native content blocks; on stream-json they are staged to
+ *  temp files and the prompt names the paths (see prompt-images.ts). */
+export function extractImages(
+	context: TranscriptContext,
+	watermark = 0,
+): Array<{ data: string; mimeType: string }> {
+	const start = trailingUserTurnStart(context.messages, watermark);
+	if (start >= context.messages.length) return [];
+	const images: Array<{ data: string; mimeType: string }> = [];
+	for (let i = start; i < context.messages.length; i++) {
+		const content = context.messages[i].content;
+		if (typeof content === "string") continue;
+		for (const b of content) {
+			if (b.type === "image") {
+				images.push({ data: b.data, mimeType: b.mimeType });
+			}
+		}
+	}
+	return images;
 }
 
 // --- G1: pi-side context digest --------------------------------------------------
@@ -138,6 +174,7 @@ function extractImages(context: TranscriptContext): Array<{ data: string; mimeTy
 // No pi patch, no new MCP tool. See docs/PI-BRIDGE-GAPS.md (G1).
 
 const COMPACTION_MARKER = "compacted into the following summary";
+const BRANCH_SUMMARY_MARKER = "summary of a branch that this conversation came back from";
 
 /** Synthetic prompt for a resume turn (issue #8): pi's retry dropped the
  *  failed attempt from the projected context (_omitRecoveryAttempt), leaving
@@ -271,10 +308,14 @@ export function buildContextDigest(
 	}
 
 	// 2. Delta since the watermark, excluding the trailing current prompt.
-	//    Clamp start to just after the compaction summary when one is present.
-	let start = Math.max(0, Math.floor(watermark));
+	//    Clamp start to just after the compaction summary when one is present;
+	//    if the transcript shrank past watermark (compaction or tree rewind),
+	//    reset the watermark floor to 0.
+	const effectiveWatermark = watermark > messages.length ? 0 : Math.max(0, Math.floor(watermark));
+	let start = effectiveWatermark;
 	if (lastCompactionIdx >= 0) start = Math.max(start, lastCompactionIdx + 1);
-	const end = Math.max(0, messages.length - 1);
+	const trailingStart = trailingUserTurnStart(messages, effectiveWatermark);
+	const end = trailingStart < messages.length ? trailingStart : Math.max(0, messages.length - 1);
 	for (let i = start; i < end; i++) {
 		const m = messages[i];
 		if (m.role === "assistant") {
@@ -1138,6 +1179,11 @@ function nextRtId(kind: "nat" | "wrap"): string {
 	return `${kind}-${++RT_SEQ}`;
 }
 
+/** Preserves background-watch latch state across MCP toolUse parks within one
+ *  agy turn so a native background call launched before a parked bridge tool
+ *  call keeps its original turnStartMs and nativeBackgroundSeen flag. */
+const parkedTurnBgState = new Map<string, { turnStartMs: number; nativeBackgroundSeen: boolean }>();
+
 /** Emit a complete toolCall block and end the pi call with toolUse.
  *  pi 0.86 restricts ToolCall.arguments to JSON-compatible values. */
 function emitToolUse(
@@ -1475,8 +1521,9 @@ async function runTurnDriver(
 			return;
 		}
 		// Fresh pass, or a stranded escalated result being re-delivered.
-		const userPrompt = extractUserPrompt(context);
-		const images = extractImages(context);
+		const watermark = existing?.lastMessageCount ?? 0;
+		const userPrompt = extractUserPrompt(context, watermark);
+		const images = extractImages(context, watermark);
 		// Resume pass (issue #8): pi's retry dropped the failed attempt from the
 		// projected context, so the transcript ends in a toolResult or assistant
 		// message and there is no user prompt, no pending park, and nothing
@@ -1504,7 +1551,6 @@ async function runTurnDriver(
 			finalize(stream, blocks, "error", "No user message to send to agy.");
 			return;
 		}
-		const watermark = existing?.lastMessageCount ?? 0;
 		// Late and resume turns re-open the conversation with a synthetic
 		// prompt; the digest would re-send context agy already holds (against a
 		// stale watermark: a failed pass never advances it), so skip it.
@@ -1602,9 +1648,12 @@ async function runTurnDriver(
 	const diffCtx = new TurnDiffContext(createExecGitOps());
 	// Background latch: one WaitMsBeforeAsync-shaped native call this turn is
 	// enough; the watcher arms at the settled end, filtered by turnStartMs so
-	// the cumulative task dir never re-reports older turns' logs.
-	const turnStartMs = Date.now();
-	let nativeBackgroundSeen = false;
+	// the cumulative task dir never re-reports older turns' logs. Preserve both
+	// fields across MCP toolUse parks within the same agy turn.
+	const priorBg = active ? parkedTurnBgState.get(key) : undefined;
+	if (!active) parkedTurnBgState.delete(key);
+	const turnStartMs = priorBg?.turnStartMs ?? Date.now();
+	let nativeBackgroundSeen = priorBg?.nativeBackgroundSeen ?? false;
 	const feats: ActivityFeatures = {
 		replay: deps.replay,
 		nativeActive: deps.nativeActive,
@@ -1626,6 +1675,7 @@ async function runTurnDriver(
 		}
 	};
 	if ((await drainTurn(handle)) === "parked") {
+		parkedTurnBgState.set(key, { turnStartMs, nativeBackgroundSeen });
 		// A park proves agy got the prompt and is working in this conversation.
 		// Persist a first-turn binding now: otherwise a first-ever turn that
 		// parks and then dies (failed continuation, process restart) leaves no
@@ -1643,6 +1693,7 @@ async function runTurnDriver(
 		}
 		return;
 	}
+	parkedTurnBgState.delete(key);
 
 	let outcome = await handle.outcome;
 	// Issue #2 recovery paths. agy's stream-json prompt path silently drops an
@@ -1719,7 +1770,10 @@ async function runTurnDriver(
 					agent: config.agent ?? (conv ? stagedAgentByConversation.get(conv) : undefined),
 					signal: options?.signal,
 				});
-				if ((await drainTurn(lateHandle)) === "parked") return;
+				if ((await drainTurn(lateHandle)) === "parked") {
+					parkedTurnBgState.set(key, { turnStartMs, nativeBackgroundSeen });
+					return;
+				}
 				outcome = await lateHandle.outcome;
 			} catch (err) {
 				// Release the claims so the next pass can retry the delivery.

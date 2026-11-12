@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.3.0 - 2026-11-12
+
+- **Live Pi skill catalog and multi-line frontmatter:** Populate `activate_skill` from `pi.getCommands()` so skills
+  installed via Pi packages and `settings.json` appear alongside filesystem scans, and parse YAML block scalars (`>`,
+  `|`) and quoted strings cleanly in skill descriptions.
+- **Persistent ACP home and stale directory sweeps:** Reuse a stable `~/.pi/agent/antigravity-bridge/acp-home/` across
+  sessions with atomic config refresh so `file://` artifact and brain links remain valid after reloads, while sweeping
+  orphaned `acp-homes/*` and legacy `1.x` `agy-mcp-*` directories.
+- **Hardened `SessionStore` and config writes:** Serialize writes per path with unique `.tmp` filenames, unlink failed
+  writes, sweep dead-PID temp files, flush pending `SessionStore` writes during `session_shutdown`, and start the MCP
+  bridge immediately when `/agy bridge` switches out of `none`.
+- **Usage footer and `/agy` UX polish:** Suppress `0 in / 0 out` footer flicker before token updates arrive, distinguish
+  native exact usage (`+N cached`) from estimates, open task log tails on `Enter` in `/agy tasks`, complete task IDs and
+  artifact names on tab, and show the active Pi session's bound conversation in `/agy` and `/agy doctor`.
+- **1.x `stream-json` cleanup:** Remove dead `lastStepIdx` session fields, `AskAntigravity` bridge catalog exclusions,
+  unused diff-input and version constants, and stale `stepId` references, and stub `GitOps` during standalone compaction
+  turns.
+
 ## 2.2.0 - 2026-11-12
 
 - **Accurate per-turn usage and compaction isolation:** Normalize multi-inference `PromptResponse.usage` (`input_tokens`

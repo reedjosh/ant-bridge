@@ -1,8 +1,8 @@
-// Persisted map: pi session key -> agy conversation id + last streamed step.
+// Persisted map: pi session key -> agy conversation id + message watermark.
 //
 // agy holds its own conversation history in the DB keyed by conversation id.
 // To resume a multi-turn pi conversation, we thread the same agy id across
-// streamSimple calls and skip steps we already streamed last turn.
+// streamSimple calls and track the pi-side message count watermark.
 //
 // The key is options.sessionId when pi provides it, else the cwd (single-
 // conversation-per-process fallback). Stored at
@@ -11,14 +11,27 @@
 import fs from "node:fs";
 import path from "node:path";
 import { bridgeStateDir } from "./agy-paths.js";
+import { isPidAlive } from "./mcp-server.js";
+
+let tmpSeq = 0;
+const pathChains = new Map<string, Promise<void>>();
 
 function defaultStorePath(): string {
 	return path.join(bridgeStateDir(), "sessions.json");
 }
 
+function deepestExistingAncestor(dirPath: string): string {
+	let cur = path.resolve(dirPath);
+	while (!fs.existsSync(cur)) {
+		const parent = path.dirname(cur);
+		if (parent === cur) break;
+		cur = parent;
+	}
+	return cur;
+}
+
 export interface AgySession {
 	conversationId: string;
-	lastStepIdx: number;
 	/** pi context.messages length captured at the start of the last agy turn.
 	 *  Used by the provider to compute a delta digest of pi-side context agy
 	 *  was not spawned for (compaction summaries, other-provider turns). 0 on a
@@ -37,9 +50,9 @@ type StoreMap = Record<string, AgySession>;
 /** Narrow untrusted parsed JSON into a clean StoreMap, validating each entry's
  *  shape instead of trusting the whole structure (the cast previously let a
  *  hand-edited or corrupt file plant wrong-typed fields into the cache).
- *  Drops any entry whose `conversationId` isn't a string; falls back to -1 when
- *  `lastStepIdx` is missing or not a finite number. Returns {} for non-object
- *  input. */
+ *  Drops any entry whose `conversationId` isn't a string; falls back to 0 when
+ *  `lastMessageCount` is missing or not a finite number; ignores legacy keys
+ *  such as `lastStepIdx`. Returns {} for non-object input. */
 function narrowStoreMap(parsed: unknown): StoreMap {
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
 	const clean: StoreMap = {};
@@ -47,12 +60,10 @@ function narrowStoreMap(parsed: unknown): StoreMap {
 		if (!value || typeof value !== "object") continue;
 		const conversationId = (value as { conversationId?: unknown }).conversationId;
 		if (typeof conversationId !== "string") continue;
-		const idx = (value as { lastStepIdx?: unknown }).lastStepIdx;
 		const mc = (value as { lastMessageCount?: unknown }).lastMessageCount;
 		const ch = (value as { compactionHash?: unknown }).compactionHash;
 		clean[key] = {
 			conversationId,
-			lastStepIdx: typeof idx === "number" && Number.isFinite(idx) ? idx : -1,
 			lastMessageCount: typeof mc === "number" && Number.isFinite(mc) ? mc : 0,
 			...(typeof ch === "string" && ch.length > 0 ? { compactionHash: ch } : {}),
 		};
@@ -61,12 +72,12 @@ function narrowStoreMap(parsed: unknown): StoreMap {
 }
 
 /** Atomic-write JSON session store. Writes are serialized through a promise
- *  chain so two concurrent turns can't interleave renames.
+ *  chain so concurrent turns or same-process instances can't interleave renames.
  *
  *  Multi-process safety: persist() re-reads the file fresh and overlays only
  *  the keys this instance has dirtied since load, so two pi processes editing
  *  different sessions never clobber each other. (Whole-file overwrite from a
- *  stale in-memory snapshot was the previous behavior  -  last writer won.) */
+ *  stale in-memory snapshot was the previous behavior - last writer won.) */
 export class SessionStore {
 	private readonly path: string;
 	private cache: StoreMap = {};
@@ -79,14 +90,59 @@ export class SessionStore {
 		this.load();
 	}
 
+	private sweepStaleTemps(): void {
+		const dir = path.dirname(this.path);
+		const prefix = `${path.basename(this.path)}.`;
+		let entries: string[];
+		try {
+			entries = fs.readdirSync(dir);
+		} catch {
+			return;
+		}
+		for (const name of entries) {
+			if (!name.startsWith(prefix)) continue;
+			const match = /^(\d+)(?:\.\d+)?\.tmp$/.exec(name.slice(prefix.length));
+			if (!match) continue;
+			const pid = Number(match[1]);
+			if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+			if (pid === process.pid || isPidAlive(pid)) continue;
+			try {
+				fs.unlinkSync(path.join(dir, name));
+			} catch {
+				// Ignore concurrent sweep or permission errors.
+			}
+		}
+	}
+
 	private load(): void {
+		this.sweepStaleTemps();
 		try {
 			const raw = fs.readFileSync(this.path, "utf8");
 			this.cache = narrowStoreMap(JSON.parse(raw));
 		} catch {
-			// missing or corrupt  -  start empty. The first set() will create it.
+			// missing or corrupt - start empty. The first set() will create it.
 			this.cache = {};
 		}
+	}
+
+	private enqueue(task: (anchor: string, dirExisted: boolean) => Promise<void>): void {
+		const resolvedDir = path.resolve(path.dirname(this.path));
+		const anchor = deepestExistingAncestor(resolvedDir);
+		const dirExisted = anchor === resolvedDir;
+		const key = path.resolve(this.path);
+		const prev = pathChains.get(key) ?? this.writeChain;
+		const next = prev
+			.then(() => task(anchor, dirExisted))
+			.catch(() => {
+				/* swallow; next write retries */
+			});
+		this.writeChain = next;
+		const tracked = next.finally(() => {
+			if (pathChains.get(key) === tracked) {
+				pathChains.delete(key);
+			}
+		});
+		pathChains.set(key, tracked);
 	}
 
 	get(key: string): AgySession | null {
@@ -94,24 +150,24 @@ export class SessionStore {
 		if (!s || typeof s.conversationId !== "string") return null;
 		return {
 			conversationId: s.conversationId,
-			lastStepIdx: s.lastStepIdx ?? -1,
 			lastMessageCount: s.lastMessageCount ?? 0,
 			...(s.compactionHash ? { compactionHash: s.compactionHash } : {}),
 		};
 	}
 
 	/** Update one session and persist atomically (temp file + rename). The
-	 *  write is queued; callers don't need to await it. */
+	 *  write is queued; callers can await flush() when durability is needed. */
 	set(key: string, session: AgySession): void {
-		this.cache[key] = session;
+		const mc = session.lastMessageCount;
+		const ch = session.compactionHash;
+		this.cache[key] = {
+			conversationId: session.conversationId,
+			lastMessageCount: typeof mc === "number" && Number.isFinite(mc) ? mc : 0,
+			...(typeof ch === "string" && ch.length > 0 ? { compactionHash: ch } : {}),
+		};
 		this.dirty.add(key);
 		this.removed.delete(key);
-		// Serialize through a chain so concurrent sets don't interleave renames.
-		this.writeChain = this.writeChain
-			.then(() => this.persist())
-			.catch(() => {
-				/* swallow; next set() retries */
-			});
+		this.enqueue((anchor, dirExisted) => this.persist(anchor, dirExisted));
 	}
 
 	/** Drop one session binding and persist the deletion. Used when the driver
@@ -123,16 +179,15 @@ export class SessionStore {
 		delete this.cache[key];
 		this.dirty.delete(key);
 		this.removed.add(key);
-		this.writeChain = this.writeChain
-			.then(() => this.persist())
-			.catch(() => {
-				/* swallow; next write retries */
-			});
+		this.enqueue((anchor, dirExisted) => this.persist(anchor, dirExisted));
 	}
 
-	private async persist(): Promise<void> {
+	private async persist(anchor: string, dirExisted: boolean): Promise<void> {
 		const dir = path.dirname(this.path);
-		await fs.promises.mkdir(dir, { recursive: true });
+		if (!dirExisted) {
+			if (!fs.existsSync(anchor)) return;
+			await fs.promises.mkdir(dir, { recursive: true });
+		}
 
 		// Re-read the current file so we merge against the latest on-disk state,
 		// not our possibly-stale in-memory snapshot. Overlay only OUR dirty keys
@@ -142,7 +197,7 @@ export class SessionStore {
 			const raw = await fs.promises.readFile(this.path, "utf8");
 			disk = narrowStoreMap(JSON.parse(raw));
 		} catch {
-			/* missing or corrupt  -  start from empty */
+			/* missing or corrupt - start from empty */
 		}
 		const merged: StoreMap = { ...disk };
 		for (const key of this.dirty) {
@@ -152,11 +207,20 @@ export class SessionStore {
 			delete merged[key];
 		}
 
-		const tmp = `${this.path}.${process.pid}.tmp`;
-		await fs.promises.writeFile(tmp, JSON.stringify(merged, null, 2) + "\n", {
-			mode: 0o600,
-		});
-		await fs.promises.rename(tmp, this.path);
+		const tmp = `${this.path}.${process.pid}.${++tmpSeq}.tmp`;
+		try {
+			await fs.promises.writeFile(tmp, JSON.stringify(merged, null, 2) + "\n", {
+				mode: 0o600,
+			});
+			await fs.promises.rename(tmp, this.path);
+		} catch (err) {
+			try {
+				await fs.promises.unlink(tmp);
+			} catch {
+				/* nothing to clean */
+			}
+			throw err;
+		}
 		this.dirty.clear();
 		// Mirror dirty: once the deletion is durable, stop re-asserting it. A
 		// later unrelated persist must not destroy a record another process
@@ -170,16 +234,29 @@ export class SessionStore {
 		this.cache = {};
 		this.dirty.clear();
 		this.removed.clear();
-		this.writeChain = this.writeChain
-			.then(async () => {
-				const tmp = `${this.path}.${process.pid}.tmp`;
+		this.enqueue(async (anchor, dirExisted) => {
+			if (!dirExisted) {
+				if (!fs.existsSync(anchor)) return;
 				await fs.promises.mkdir(path.dirname(this.path), { recursive: true });
+			}
+			const tmp = `${this.path}.${process.pid}.${++tmpSeq}.tmp`;
+			try {
 				await fs.promises.writeFile(tmp, "{}\n", { mode: 0o600 });
 				await fs.promises.rename(tmp, this.path);
-			})
-			.catch(() => {
-				/* swallow; user can retry */
-			});
+			} catch (err) {
+				try {
+					await fs.promises.unlink(tmp);
+				} catch {
+					/* nothing to clean */
+				}
+				throw err;
+			}
+		});
+	}
+
+	/** Resolves once all queued writes on this store instance have settled. */
+	flush(): Promise<void> {
+		return this.writeChain.catch(() => {});
 	}
 
 	/** Count persisted session bindings (for status display). */

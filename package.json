@@ -1,0 +1,27 @@
+{
+  "name": "pi-antigravity-bridge-local",
+  "private": true,
+  "version": "1.10.4-local.1",
+  "description": "Locally owned Antigravity provider and Pi MCP/tool bridge for Pi (forked from @estebanforge/pi-antigravity-bridge@1.10.4).",
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "changelogPath": ""
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.5.1"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@estebanforge/pi-ask-shared": "^0.1.4",
+    "@estebanforge/pi-tui-dialogs": "^0.1.3",
+    "@modelcontextprotocol/sdk": "^1.31.0"
+  }
+}

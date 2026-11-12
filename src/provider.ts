@@ -22,6 +22,7 @@ import {
 	type TranscriptContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -152,6 +153,25 @@ export const SYSTEM_PROMPT_END = "[END SYSTEM PROMPT]";
 export const TOOL_PRIORITY_NOTE =
 	"[Tool priority: this conversation runs inside pi, not as a standalone agy session; the user only sees what surfaces in pi. Native interactive tools, for example ask_question, never reach the user. When a Pi Bridge tool covers the same purpose, always use the Pi Bridge tool; for user questions use ask_user_question. For MCP servers marked (codemode) in <mcp_servers> (such as Slack, Linear, Sentry, or Figma), call Pi Bridge's codemode tool directly instead of searching local config files. For workspace files and commands, your native read_file, edit_file, write_file, and run_command tools operate directly on the real filesystem and render in pi (including visible images on read_file). When a bridge call answers STILL RUNNING, poll bridge_poll_result before doing other work: until you poll, the result (including any image) stays undelivered to you. Delegate subagent work through Pi Bridge: when pi's tool list includes a delegation tool (for example subagent, Agent, agent_spawn, agent_wait, or subagent_run), always delegate through it and never through the native invoke_subagent, run_subagent, or manage_subagents; use native ones only if no pi delegation tool is listed, because native subagents run inside agy and are invisible to pi and anything watching it. Long-running bridge calls do not fail: after ~20 seconds (120 seconds for subagent and codemode calls) the bridge answers STILL RUNNING with a callId; fetch the result with bridge_poll_result and poll until it lands.]";
 
+export const SUMMARIZATION_NO_TOOLS_NOTE = [
+	"[Summarization mode: summarize strictly from the provided <conversation> text. Do NOT call any",
+	"tools (no read_file, run_command, grep_search, MCP tools, or subagents); reply immediately with",
+	"the requested summary text only.]",
+].join(" ");
+
+/** True for Pi's standalone compaction and branch-summary calls
+ *  (completeSummarization sets cacheRetention="none" with zero tools). */
+export function isStandaloneSummarizationTurn(
+	context: TranscriptContext,
+	options?: SimpleStreamOptions,
+): boolean {
+	if (getCurrentTools(context.messages).length > 0) return false;
+	const cacheRetention = (options as { cacheRetention?: string } | undefined)?.cacheRetention;
+	if (cacheRetention === "none") return true;
+	const sys = getCurrentSystemPrompt(context.messages);
+	return /\bcontext summarization assistant\b/i.test(sys);
+}
+
 /** Assemble the full prompt on fresh turns (system prompt block + optional digest + user prompt). */
 export function buildFullPrompt(
 	systemPrompt: string | undefined,
@@ -190,6 +210,20 @@ function stripCompactionWrapping(t: string): string {
 	const close = t.lastIndexOf("</summary>");
 	if (open >= 0 && close > open) return t.slice(open + "<summary>".length, close).trim();
 	return t.trim();
+}
+
+/** Deterministic 16-hex-char SHA-256 tag of the latest Pi compaction summary in messages, if any. */
+export function latestCompactionHash(messages: Message[]): string | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const m = messages[i];
+		if (m.role !== "user") continue;
+		const t = blocksToText(m.content);
+		if (t.includes(COMPACTION_MARKER)) {
+			const summary = stripCompactionWrapping(t);
+			return createHash("sha256").update(summary).digest("hex").slice(0, 16);
+		}
+	}
+	return undefined;
 }
 
 export interface DigestOptions {
@@ -324,6 +358,7 @@ export interface StreamSimpleDeps {
 	roundTrips?: ToolRoundTrips;
 	onNativeEvent?: (event: NativeDisplayEvent) => void;
 	onNativeBackground?: (info: { conversationId: string; turnStartMs: number }) => void;
+	onTurnFinished?: () => void;
 	roster?: SubagentRoster;
 	log?: (event: string, data?: unknown, level?: "debug" | "info" | "warn" | "error") => void;
 }
@@ -759,6 +794,7 @@ export interface DriverDeps {
 	roundTrips: ToolRoundTrips;
 	onNativeEvent?: (event: NativeDisplayEvent) => void;
 	onNativeBackground?: (info: { conversationId: string; turnStartMs: number }) => void;
+	onTurnFinished?: () => void;
 	roster?: SubagentRoster;
 	log?: (event: string, data?: unknown, level?: "debug" | "info" | "warn" | "error") => void;
 }
@@ -1085,13 +1121,101 @@ async function runTurnDriver(
 	const blocks: BlockState = { partial, textIdx: null, thinkingIdx: null, started: false };
 
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-	const key = sessionKey(options, cwd);
-	const existing = store.get(key);
-	const messageCount = context.messages.length;
 	const config = loadConfig();
+	const entry = entries.find((e) => e.id === model.id) ?? null;
+	const agyModel = entry?.full ?? model.id;
+	const effort = entry?.efforts?.length ? toAgyEffort(options?.reasoning, entry.efforts) : undefined;
+
+	if (isStandaloneSummarizationTurn(context, options)) {
+		const userPrompt = extractUserPrompt(context, 0);
+		if (!userPrompt) {
+			deps.log?.("turn-error", { reason: "no-user-message" }, "error");
+			finalize(stream, blocks, "error", "No user message to send to agy.");
+			return;
+		}
+		const sysPrompt = getCurrentSystemPrompt(context.messages) || undefined;
+		const promptParts: string[] = [];
+		if (sysPrompt) {
+			promptParts.push(`${SYSTEM_PROMPT_PREAMBLE}\n\n${sysPrompt}\n\n${SYSTEM_PROMPT_END}`);
+		}
+		promptParts.push(SUMMARIZATION_NO_TOOLS_NOTE);
+		promptParts.push(userPrompt);
+		let summaryHandle: TurnHandle;
+		try {
+			summaryHandle = await deps.driver.run({
+				cwd,
+				model: agyModel,
+				effort,
+				mode: config.mode,
+				skipPermissions: config.skipPermissions,
+				timeoutMin: config.turnTimeoutMin,
+				inactivityMin: config.inactivityTimeoutMin,
+				conversationId: null,
+				prompt: promptParts.join("\n\n---\n\n"),
+				signal: options?.signal,
+			});
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			deps.log?.("turn-error", { reason: "driver-start-failed", error: msg }, "error");
+			finalize(stream, blocks, "error", `agy failed to start: ${msg}`);
+			return;
+		}
+		ensureStarted(stream, blocks);
+		const summaryDiffCtx = new TurnDiffContext(createExecGitOps());
+		const summaryFeats: ActivityFeatures = {
+			onNativeEvent: () => {},
+			log: deps.log,
+		};
+		for (;;) {
+			const activity = await summaryHandle.next();
+			if (!activity) break;
+			if (activity.type === "bridge_call") continue;
+			consumeActivity(stream, blocks, activity, summaryDiffCtx, cwd, summaryFeats);
+		}
+		const summaryOutcome = await summaryHandle.outcome;
+		if (summaryOutcome.aborted) {
+			finalize(stream, blocks, "aborted", "Operation aborted");
+			return;
+		}
+		if (summaryOutcome.status === "ERROR") {
+			finalize(stream, blocks, "error", summaryOutcome.error ?? "agy turn failed");
+			return;
+		}
+		if (blocks.textIdx === null && summaryOutcome.response) {
+			appendText(stream, blocks, summaryOutcome.response);
+		}
+		if (blocks.textIdx === null && blocks.thinkingIdx === null) {
+			ensureTextOpen(stream, blocks);
+		}
+		finalize(stream, blocks, "stop");
+		return;
+	}
+
+	const key = sessionKey(options, cwd);
+	const rawExisting = store.get(key);
+	const currentCompactionHash = latestCompactionHash(context.messages);
+	const messageCount = context.messages.length;
 
 	const results = collectToolResults(context.messages, deps.roundTrips.pendingIds);
 	const isContinuation = results.length > 0;
+	const resetForCompaction = Boolean(
+		!isContinuation &&
+			rawExisting?.conversationId &&
+			currentCompactionHash &&
+			currentCompactionHash !== rawExisting.compactionHash,
+	);
+	if (resetForCompaction) {
+		store.delete(key);
+		deps.log?.(
+			"session-reset-compaction",
+			{
+				previousConversation: rawExisting?.conversationId,
+				compactionHash: currentCompactionHash,
+			},
+			"info",
+		);
+	}
+	const existing = resetForCompaction ? null : rawExisting;
 	const escalatedNames = results
 		.map((r) => deps.roundTrips.poll(r.toolCallId)?.name)
 		.filter((n): n is string => Boolean(n));
@@ -1138,10 +1262,6 @@ async function runTurnDriver(
 				images: view.images,
 			};
 		});
-
-	const entry = entries.find((e) => e.id === model.id) ?? null;
-	const agyModel = entry?.full ?? model.id;
-	const effort = entry?.efforts?.length ? toAgyEffort(options?.reasoning, entry.efforts) : undefined;
 
 	let handle: TurnHandle | undefined;
 	const active = isContinuation ? deps.driver.reentry() : null;
@@ -1209,6 +1329,7 @@ async function runTurnDriver(
 				digest = buildContextDigest(context.messages, 0, {
 					ownProvider: "",
 					includeOwnAssistant: true,
+					maxChars: 32_000,
 				});
 				digestPreamble = SEED_DIGEST_PREAMBLE;
 			} else if (config.digest) {
@@ -1285,6 +1406,7 @@ async function runTurnDriver(
 					conversationId: parkedConv,
 					lastStepIdx: -1,
 					lastMessageCount: messageCount,
+					...(currentCompactionHash ? { compactionHash: currentCompactionHash } : {}),
 				});
 			}
 		}
@@ -1345,14 +1467,17 @@ async function runTurnDriver(
 				conversationId: outcome.conversationId,
 				lastStepIdx: -1,
 				lastMessageCount: messageCount,
+				...(currentCompactionHash ? { compactionHash: currentCompactionHash } : {}),
 			});
 		}
 	}
 	if (outcome.aborted) {
+		deps.onTurnFinished?.();
 		finalize(stream, blocks, "aborted", "Operation aborted");
 		return;
 	}
 	if (outcome.status === "ERROR") {
+		deps.onTurnFinished?.();
 		finalize(stream, blocks, "error", outcome.error ?? "agy turn failed");
 		return;
 	}
@@ -1366,6 +1491,7 @@ async function runTurnDriver(
 		deps.onNativeBackground?.({ conversationId: outcome.conversationId, turnStartMs });
 		deps.log?.("native-background-arm", { conversation: outcome.conversationId, turnStartMs }, "info");
 	}
+	deps.onTurnFinished?.();
 	finalize(stream, blocks, "stop");
 }
 
@@ -1430,6 +1556,7 @@ export function createStreamSimple(
 				roundTrips,
 				onNativeEvent: deps.onNativeEvent,
 				onNativeBackground: deps.onNativeBackground,
+				onTurnFinished: deps.onTurnFinished,
 				roster: deps.roster,
 				log: deps.log,
 			});

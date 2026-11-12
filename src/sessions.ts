@@ -25,6 +25,11 @@ export interface AgySession {
 	 *  fresh or pre-watermark session. Optional for backward compat with older
 	 *  persisted sessions that predate the watermark. */
 	lastMessageCount?: number;
+	/** Hash of the latest Pi compaction summary seen when this conversation was
+	 *  bound or updated. When Pi compacts the session, the hash changes (or
+	 *  appears), signaling provider.ts to start a fresh ACP session seeded with
+	 *  the compacted summary instead of resuming the uncompacted ACP session. */
+	compactionHash?: string;
 }
 
 type StoreMap = Record<string, AgySession>;
@@ -44,10 +49,12 @@ function narrowStoreMap(parsed: unknown): StoreMap {
 		if (typeof conversationId !== "string") continue;
 		const idx = (value as { lastStepIdx?: unknown }).lastStepIdx;
 		const mc = (value as { lastMessageCount?: unknown }).lastMessageCount;
+		const ch = (value as { compactionHash?: unknown }).compactionHash;
 		clean[key] = {
 			conversationId,
 			lastStepIdx: typeof idx === "number" && Number.isFinite(idx) ? idx : -1,
 			lastMessageCount: typeof mc === "number" && Number.isFinite(mc) ? mc : 0,
+			...(typeof ch === "string" && ch.length > 0 ? { compactionHash: ch } : {}),
 		};
 	}
 	return clean;
@@ -89,6 +96,7 @@ export class SessionStore {
 			conversationId: s.conversationId,
 			lastStepIdx: s.lastStepIdx ?? -1,
 			lastMessageCount: s.lastMessageCount ?? 0,
+			...(s.compactionHash ? { compactionHash: s.compactionHash } : {}),
 		};
 	}
 

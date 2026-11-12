@@ -301,10 +301,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			},
 			outcome.status === "OK" ? "info" : "warn",
 		);
-		pendingNativeTools = 0;
-		activeUi?.setStatus("agy-native", undefined);
 		roundTrips.failAll(FAIL_REASON_TURN_END);
-		closePollRun();
 		if (outcome.conversationId) roundTrips.stampConversation(outcome.conversationId);
 	};
 
@@ -448,6 +445,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		roundTrips,
 		onNativeEvent,
 		onNativeBackground: (info) => armConversationWatcher(info.conversationId, info.turnStartMs),
+		onTurnFinished: () => {
+			if (pendingNativeTools > 0) {
+				pendingNativeTools = 0;
+				activeUi?.setStatus("agy-native", undefined);
+			}
+			closePollRun();
+		},
 		roster,
 		log: fileLog.log.bind(fileLog),
 	});

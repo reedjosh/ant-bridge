@@ -1117,7 +1117,7 @@ async function runTurnDriver(
 	parkedTurnBgState.delete(key);
 
 	let outcome = await handle.outcome;
-	if (isContinuation && outcome.status === "OK" && !outcome.aborted) {
+	if (isContinuation && outcome.status === "OK" && !outcome.aborted && !outcome.steered) {
 		const more = collectStranded();
 		if (more.length > 0) {
 			const conv =
@@ -1186,7 +1186,7 @@ async function runTurnDriver(
 	if (blocks.textIdx === null && blocks.thinkingIdx === null) {
 		ensureTextOpen(stream, blocks);
 	}
-	if (nativeBackgroundSeen && outcome.conversationId) {
+	if (nativeBackgroundSeen && outcome.conversationId && !outcome.steered) {
 		deps.onNativeBackground?.({ conversationId: outcome.conversationId, turnStartMs });
 		deps.log?.("native-background-arm", { conversation: outcome.conversationId, turnStartMs }, "info");
 	}

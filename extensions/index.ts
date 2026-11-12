@@ -85,6 +85,8 @@ import { showTasksBrowser } from "../src/tasks-ui.js";
 import { showSettingsDialog } from "../src/ui-helpers.js";
 import { fetchAgyQuota, formatAgyQuotaReport } from "../src/usage.js";
 
+const PROVIDER_ID = "antigravity";
+
 let activeUi: ExtensionUIContext | null = null;
 
 function resolveAgyBinary(): string {
@@ -321,20 +323,45 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	acpDriver.onTurnEnd = (outcome: TurnOutcome) => {
 		fileLog.log(
 			"turn-end",
-			{ status: outcome.status, error: outcome.error?.slice(0, 500), aborted: outcome.aborted },
+			{
+				status: outcome.status,
+				error: outcome.error?.slice(0, 500),
+				aborted: outcome.aborted,
+				...(outcome.steered ? { steered: true } : {}),
+			},
 			outcome.status === "OK" ? "info" : "warn",
 		);
+		pendingNativeTools = 0;
+		activeUi?.setStatus("agy-native", undefined);
 		roundTrips.failAll(FAIL_REASON_TURN_END);
 		closePollRun();
 		if (outcome.conversationId) roundTrips.stampConversation(outcome.conversationId);
 	};
+
+	pi.on("input", (event, ctx) => {
+		if (
+			event.streamingBehavior !== "steer" ||
+			ctx.model?.provider !== PROVIDER_ID ||
+			roundTrips.pendingIds.length > 0
+		) {
+			return;
+		}
+		const interrupted = acpDriver.interruptForSteer();
+		if (interrupted) {
+			fileLog.log(
+				"steer-interrupt",
+				{ sessionId: acpDriver.snapshot().conversationId ?? null },
+				"info",
+			);
+		}
+	});
 
 	let lastUsageStatus = "";
 	pi.on("message_update", (event, ctx) => {
 		if (
 			!ctx.hasUI ||
 			event.message.role !== "assistant" ||
-			event.message.provider !== "antigravity" ||
+			event.message.provider !== PROVIDER_ID ||
 			loadConfig().acp.usageEstimate === "off"
 		) {
 			return;
@@ -455,7 +482,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		log: fileLog.log.bind(fileLog),
 	});
 
-	pi.registerProvider("antigravity", {
+	pi.registerProvider(PROVIDER_ID, {
 		name: "Antigravity (agy)",
 		baseUrl: "agy-bridge://antigravity",
 		apiKey: "not-used",

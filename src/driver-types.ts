@@ -90,6 +90,7 @@ export interface TurnOutcome {
 	usage?: AgyUsage;
 	finished: boolean;
 	aborted: boolean;
+	steered?: boolean;
 }
 
 export interface TurnHandle {
@@ -138,6 +139,8 @@ export interface TurnDriver {
 	reentry(): TurnHandle | null;
 	/** Resume turn timers after a parked bridge round-trip settles. */
 	kickIdle(): void;
+	/** Interrupt the active turn via session/cancel so a queued steer runs immediately. */
+	interruptForSteer?(opts?: { toolGraceMs?: number }): boolean;
 	set onTurnEnd(fn: ((outcome: TurnOutcome) => void) | undefined);
 	snapshot(): DriverSnapshot;
 	close(reason: "recycle" | "shutdown", cause?: string): Promise<void>;

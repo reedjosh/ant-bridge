@@ -20,7 +20,12 @@
 
 import { randomUUID } from "node:crypto";
 import type { UsageEstimate } from "../config.js";
-import { AcpConnection, type AcpMcpServer, type AcpPermissionRequest } from "./connection.js";
+import {
+	AcpAuthError,
+	AcpConnection,
+	type AcpMcpServer,
+	type AcpPermissionRequest,
+} from "./connection.js";
 import type { AcpPermissionHandler } from "./connection.js";
 import { mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
 import { estimateTokens, synthesizeUsage } from "./usage-estimate.js";
@@ -36,6 +41,8 @@ import type {
 } from "../driver-types.js";
 
 const LIFECYCLE_LIMIT = 24;
+const DEFAULT_STEER_GRACE_MS = 1_500;
+const DEFAULT_CANCEL_SAFETY_MS = 10_000;
 
 export interface AcpDriverOptions {
 	/** agy CLI binary. Tests may substitute node with a fake-server script. */
@@ -57,6 +64,10 @@ export interface AcpDriverOptions {
 	onPermissionRequest?: AcpPermissionHandler;
 	/** Park budget for one permission dialog (tests shrink it). */
 	permissionParkMs?: number;
+	/** Default grace window (ms) for in-flight native tools on steer cancel (default 1500). */
+	steerGraceMs?: number;
+	/** Safety-net timeout (ms) after session/cancel before tearing down the server (default 10000). */
+	cancelSafetyMs?: number;
 	/** Standing policy consulted when the turn is not skipPermissions:
 	 *  "auto" answers the first allow option synchronously, "deny" consults
 	 *  the human handler or fail-closes. Default deny. */
@@ -105,6 +116,12 @@ interface ActiveTurn {
 	promptStarted: boolean;
 	aborted: boolean;
 	abortedBy: "signal" | "timer" | null;
+	steered: boolean;
+	steerCancelSent: boolean;
+	steerGraceMs: number;
+	steerGraceTimer?: ReturnType<typeof setTimeout>;
+	steerSafetyTimer?: ReturnType<typeof setTimeout>;
+	abortSafetyTimer?: ReturnType<typeof setTimeout>;
 	parks: number;
 	/** Wall-clock deadline of the overall timer; null while paused. */
 	overallDeadline: number | null;
@@ -172,8 +189,35 @@ export class AcpDriver implements TurnDriver {
 			t.parks += 1;
 			this.#clearIdle(t);
 			this.#pauseOverall(t);
+			if (t.steered && !t.steerCancelSent) {
+				if (t.steerGraceTimer) {
+					clearTimeout(t.steerGraceTimer);
+					t.steerGraceTimer = undefined;
+				}
+				t.steered = false;
+			}
 		}
 		this.#emit(t, activity);
+	}
+
+	/** Interrupt a live non-parked turn so Pi can drain a queued steer message. */
+	interruptForSteer(opts?: { toolGraceMs?: number }): boolean {
+		const turn = this.#active;
+		if (!turn || turn.closed || turn.aborted || turn.parks > 0) return false;
+		if (turn.steered) return true;
+		const graceMs = opts?.toolGraceMs ?? this.#opts.steerGraceMs ?? DEFAULT_STEER_GRACE_MS;
+		turn.steered = true;
+		turn.steerGraceMs = graceMs;
+		this.#log("steer-interrupt-requested", {
+			sessionId: turn.sessionId || null,
+			promptStarted: turn.promptStarted,
+			activeTools: turn.toolCalls.size,
+			graceMs,
+		});
+		if (turn.promptStarted) {
+			this.#dispatchSteerCancel(turn, graceMs);
+		}
+		return true;
 	}
 
 	/** Run the human permission dialog with the turn parked: same budget
@@ -352,7 +396,16 @@ export class AcpDriver implements TurnDriver {
 		try {
 			// Nothing to cancel before the prompt RPC exists; see promptStarted.
 			turn.promptStarted = true;
-			const result = await conn.prompt(turn.sessionId, request.prompt, request.images, request.contextBlock);
+			const promptPromise = conn.prompt(
+				turn.sessionId,
+				request.prompt,
+				request.images,
+				request.contextBlock,
+			);
+			if (turn.steered && !turn.aborted) {
+				this.#dispatchSteerCancel(turn, turn.steerGraceMs);
+			}
+			const result = await promptPromise;
 			if (turn.closed) return;
 			turn.sawResult = true;
 			// Exact PromptResponse.usage supersedes every partial estimate, but
@@ -363,6 +416,29 @@ export class AcpDriver implements TurnDriver {
 				settleUsage = this.#contextCorrectedUsage(turn, result.usage);
 				this.#emit(turn, { type: "usage", usage: settleUsage });
 			}
+			if (turn.aborted) {
+				this.#settle(turn, {
+					conversationId: turn.sessionId,
+					status: "OK",
+					response: turn.response.text,
+					usage: settleUsage,
+					finished: true,
+					aborted: true,
+				});
+				return;
+			}
+			if (turn.steered && (result.stopReason === "cancelled" || result.stopReason === "end_turn")) {
+				this.#settle(turn, {
+					conversationId: turn.sessionId,
+					status: "OK",
+					response: turn.response.text,
+					usage: settleUsage,
+					finished: true,
+					aborted: false,
+					steered: true,
+				});
+				return;
+			}
 			const mapped = mapStopReason(result.stopReason);
 			this.#settle(turn, {
 				conversationId: turn.sessionId,
@@ -372,17 +448,38 @@ export class AcpDriver implements TurnDriver {
 				error: mapped.error,
 				finished: true,
 				aborted: mapped.aborted,
+				...(turn.steered && mapped.status === "OK" && !mapped.aborted ? { steered: true } : {}),
 			});
 		} catch (err) {
 			if (turn.closed) return;
-			const aborted = turn.aborted;
+			if (turn.aborted) {
+				this.#settle(turn, {
+					conversationId: turn.sessionId,
+					status: "OK",
+					response: turn.response.text,
+					finished: true,
+					aborted: true,
+				});
+				return;
+			}
+			if (turn.steered && !(err instanceof AcpAuthError)) {
+				this.#settle(turn, {
+					conversationId: turn.sessionId,
+					status: "OK",
+					response: turn.response.text,
+					finished: true,
+					aborted: false,
+					steered: true,
+				});
+				return;
+			}
 			this.#settle(turn, {
 				conversationId: turn.sessionId,
-				status: aborted ? "OK" : "ERROR",
+				status: "ERROR",
 				response: turn.response.text,
-				error: aborted ? undefined : `ACP prompt failed: ${describe(err)}`,
+				error: `ACP prompt failed: ${describe(err)}`,
 				finished: true,
-				aborted,
+				aborted: false,
 			});
 		}
 	}
@@ -478,6 +575,9 @@ export class AcpDriver implements TurnDriver {
 				// Native diff from the stored tool_call frame; the update's own
 				// diff (future builds) wins when present.
 				this.#emit(turn, { type: "tool_done", name, args, output: mapped.output, diff: mapped.diff ?? entry?.diff, mcpServer: mapped.mcpServer ?? entry?.mcpServer, toolCallId: mapped.toolCallId });
+				if (turn.steered && !turn.steerCancelSent && turn.promptStarted && turn.toolCalls.size === 0) {
+					this.#sendSteerCancel(turn);
+				}
 				return;
 			}
 			case "tool_error": {
@@ -485,6 +585,9 @@ export class AcpDriver implements TurnDriver {
 				turn.toolCalls.delete(mapped.toolCallId);
 				const name = entry?.name ?? "tool";
 				this.#emit(turn, { type: "tool_error", name, message: mapped.message, mcpServer: mapped.mcpServer ?? entry?.mcpServer, toolCallId: mapped.toolCallId });
+				if (turn.steered && !turn.steerCancelSent && turn.promptStarted && turn.toolCalls.size === 0) {
+					this.#sendSteerCancel(turn);
+				}
 				return;
 			}
 			case "replay_user":
@@ -507,7 +610,10 @@ export class AcpDriver implements TurnDriver {
 		// their stderr tail must never reach the UI. Only a live turn dying
 		// mid-flight is user-reportable, and it surfaces as a normal turn
 		// error, not as raw console noise.
-		const turnActive = Boolean(turn && !turn.closed && !turn.aborted && !turn.sawResult);
+		const steeredActive = Boolean(turn?.steered && turn.promptStarted);
+		const turnActive = Boolean(
+			turn && !turn.closed && !turn.aborted && !steeredActive && !turn.sawResult,
+		);
 		this.#log("connection-exited", {
 			expected: !turnActive,
 			code: info.code,
@@ -522,6 +628,17 @@ export class AcpDriver implements TurnDriver {
 				response: turn.response.text,
 				finished: true,
 				aborted: turn.aborted,
+			});
+			return;
+		}
+		if (steeredActive) {
+			this.#settle(turn, {
+				conversationId: turn.sessionId,
+				status: "OK",
+				response: turn.response.text,
+				finished: true,
+				aborted: false,
+				steered: true,
 			});
 			return;
 		}
@@ -588,6 +705,7 @@ export class AcpDriver implements TurnDriver {
 		if (turn.closed) return;
 		turn.aborted = true;
 		turn.abortedBy = "signal";
+		this.#clearSteerTimers(turn);
 		const conn = this.#conn;
 		// No session yet (killed during setup), no live connection, or a server
 		// already known not to implement cancel: teardown directly.
@@ -595,25 +713,103 @@ export class AcpDriver implements TurnDriver {
 			this.#teardownAbort(turn);
 			return;
 		}
+		const safetyMs = this.#opts.cancelSafetyMs ?? DEFAULT_CANCEL_SAFETY_MS;
 		try {
 			conn.cancel(turn.sessionId);
 			// Cancel accepted: the prompt result (stopReason cancelled) settles
 			// the turn through the normal path. Safety net below in case the
 			// server never answers.
-			const started = this.#nowMs();
-			const check = setInterval(() => {
-				if (turn.closed) {
-					clearInterval(check);
-					return;
-				}
-				if (this.#nowMs() - started > 10_000) {
-					clearInterval(check);
-					this.#teardownAbort(turn);
-				}
-			}, 250);
+			if (turn.abortSafetyTimer) clearTimeout(turn.abortSafetyTimer);
+			turn.abortSafetyTimer = setTimeout(() => {
+				turn.abortSafetyTimer = undefined;
+				if (!turn.closed) this.#teardownAbort(turn);
+			}, safetyMs);
 		} catch (err) {
 			this.#log("cancel-failed", { message: describe(err) });
 			this.#teardownAbort(turn);
+		}
+	}
+
+	/** Dispatch steer cancellation immediately, or after a bounded grace window
+	 *  when native file/shell tool calls are currently mid-flight. */
+	#dispatchSteerCancel(turn: ActiveTurn, graceMs = DEFAULT_STEER_GRACE_MS): void {
+		if (turn.closed || turn.aborted || turn.parks > 0 || turn.steerCancelSent) return;
+		if (turn.toolCalls.size === 0 || graceMs <= 0) {
+			this.#sendSteerCancel(turn);
+			return;
+		}
+		if (turn.steerGraceTimer) return;
+		turn.steerGraceTimer = setTimeout(() => {
+			turn.steerGraceTimer = undefined;
+			this.#sendSteerCancel(turn);
+		}, graceMs);
+	}
+
+	/** Send session/cancel for a steered turn and arm the safety-net timeout. */
+	#sendSteerCancel(turn: ActiveTurn): void {
+		if (turn.steerGraceTimer) {
+			clearTimeout(turn.steerGraceTimer);
+			turn.steerGraceTimer = undefined;
+		}
+		if (turn.closed || turn.aborted || turn.steerCancelSent) return;
+		if (turn.parks > 0) {
+			turn.steered = false;
+			return;
+		}
+		const conn = this.#conn;
+		if (!conn?.alive || turn.sessionId === "" || !turn.promptStarted) {
+			this.#teardownSteer(turn);
+			return;
+		}
+		turn.steerCancelSent = true;
+		const safetyMs = this.#opts.cancelSafetyMs ?? DEFAULT_CANCEL_SAFETY_MS;
+		try {
+			this.#log("steer-cancel-sent", { sessionId: turn.sessionId });
+			conn.cancel(turn.sessionId);
+			turn.steerSafetyTimer = setTimeout(() => {
+				turn.steerSafetyTimer = undefined;
+				if (turn.closed || turn.aborted || !turn.steered) return;
+				this.#teardownSteer(turn);
+			}, safetyMs);
+		} catch (err) {
+			this.#log("cancel-failed", { message: describe(err) });
+			this.#teardownSteer(turn);
+		}
+	}
+
+	/** Safety-net teardown for steer cancel: kill the unresponsive server and
+	 *  settle as steered (not aborted) unless Esc abort intervened. */
+	#teardownSteer(turn: ActiveTurn): void {
+		if (turn.closed) return;
+		if (turn.aborted) {
+			this.#teardownAbort(turn);
+			return;
+		}
+		this.#stats.kills += 1;
+		this.#log("teardown-steer", { sessionId: turn.sessionId });
+		const conn = this.#conn;
+		this.#conn = undefined;
+		this.#state = "dead";
+		conn?.abortAll("steer: connection torn down");
+		conn?.kill();
+		this.#settle(turn, {
+			conversationId: turn.sessionId,
+			status: "OK",
+			response: turn.response.text,
+			finished: true,
+			aborted: false,
+			steered: true,
+		});
+	}
+
+	#clearSteerTimers(turn: ActiveTurn): void {
+		if (turn.steerGraceTimer) {
+			clearTimeout(turn.steerGraceTimer);
+			turn.steerGraceTimer = undefined;
+		}
+		if (turn.steerSafetyTimer) {
+			clearTimeout(turn.steerSafetyTimer);
+			turn.steerSafetyTimer = undefined;
 		}
 	}
 
@@ -623,6 +819,7 @@ export class AcpDriver implements TurnDriver {
 		this.#stats.kills += 1;
 		this.#log("teardown-abort", { sessionId: turn.sessionId });
 		turn.aborted = true;
+		this.#clearSteerTimers(turn);
 		this.#conn?.abortAll("abort: connection torn down");
 		this.#conn?.kill();
 	}
@@ -652,6 +849,9 @@ export class AcpDriver implements TurnDriver {
 			promptStarted: false,
 			aborted: false,
 			abortedBy: null,
+			steered: false,
+			steerCancelSent: false,
+			steerGraceMs: DEFAULT_STEER_GRACE_MS,
 			parks: 0,
 			overallDeadline: null,
 			overallRemainingMs: null,
@@ -774,6 +974,11 @@ export class AcpDriver implements TurnDriver {
 		turn.closed = true;
 		if (turn.overallTimer) clearTimeout(turn.overallTimer);
 		if (turn.idleTimer) clearTimeout(turn.idleTimer);
+		this.#clearSteerTimers(turn);
+		if (turn.abortSafetyTimer) {
+			clearTimeout(turn.abortSafetyTimer);
+			turn.abortSafetyTimer = undefined;
+		}
 		this.#active = undefined;
 		this.#state = this.#conn?.alive ? "ready" : "dead";
 		if (outcome.conversationId) this.#lastSessionId = outcome.conversationId;

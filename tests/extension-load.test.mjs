@@ -66,6 +66,7 @@ test("extension registers antigravity provider and /agy command without register
     assert.equal(entryRenderers.has("agy-native-event"), true);
     assert.equal(entryRenderers.has("agy-poll-run"), true);
     assert.equal(messageRenderers.size, 0);
+    assert.equal(handlers.has("input"), true);
     assert.equal(handlers.has("session_start"), true);
     assert.equal(handlers.has("session_shutdown"), true);
   } finally {

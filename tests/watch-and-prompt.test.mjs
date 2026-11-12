@@ -5,8 +5,18 @@ import path from "node:path";
 import test from "node:test";
 import { importBridgeModule } from "./helpers/pi-loader.mjs";
 
-const { buildContextDigest, extractImages, extractUserPrompt, trailingUserTurnStart } =
-  await importBridgeModule("src/provider.ts");
+const {
+  DIGEST_PREAMBLE,
+  SEED_DIGEST_PREAMBLE,
+  ToolRoundTrips,
+  buildContextDigest,
+  createStreamSimple,
+  extractImages,
+  extractUserPrompt,
+  trailingUserTurnStart,
+} = await importBridgeModule("src/provider.ts");
+const { entriesFromRaw, toPiModel } = await importBridgeModule("src/models.ts");
+const { SessionStore } = await importBridgeModule("src/sessions.ts");
 const { armBackgroundWatch, partitionRearmPlans, rearmPlansFromEntries } =
   await importBridgeModule("src/background-watch.ts");
 const { readDeliveredTaskIds } = await importBridgeModule("src/tasks.ts");
@@ -211,4 +221,265 @@ test("partitionRearmPlans marks older unsettled arms as superseded when a newer 
     { conversationId: "c1", turnStartMs: 100, armedAt: 200 },
     { conversationId: "c2", turnStartMs: 100, armedAt: 250 },
   ]);
+});
+
+function createRecordingDriver(newConversationId = "agy-conv-1") {
+  const requests = [];
+  let lastConversationId;
+  const driver = {
+    state: "ready",
+    activeHandle: null,
+    async run(request) {
+      requests.push(request);
+      const convId = request.conversationId ?? newConversationId;
+      lastConversationId = convId;
+      let emittedText = false;
+      return {
+        id: `turn-${requests.length}`,
+        outcome: Promise.resolve({
+          conversationId: convId,
+          status: "OK",
+          response: `reply-${requests.length}`,
+          finished: true,
+          aborted: false,
+        }),
+        async next() {
+          if (!emittedText) {
+            emittedText = true;
+            return { type: "text", delta: `reply-${requests.length}` };
+          }
+          return null;
+        },
+        pushExternal() {},
+      };
+    },
+    reentry() {
+      return null;
+    },
+    kickIdle() {},
+    set onTurnEnd(_fn) {},
+    snapshot() {
+      return {
+        state: "ready",
+        conversationId: lastConversationId,
+        stats: { spawns: 1, turns: requests.length, reused: 0, recycles: 0, recycleReasons: {} },
+        lifecycle: [],
+      };
+    },
+    async close() {},
+  };
+  return { driver, requests };
+}
+
+function makeTestStream(tmpDir, driver) {
+  const entries = entriesFromRaw("gemini-4-carbon-high  Gemini 4 Carbon (High)\n");
+  const model = toPiModel(entries[0], ["text", "image"]);
+  const store = new SessionStore(path.join(tmpDir, "sessions.json"));
+  const roundTrips = new ToolRoundTrips(driver);
+  const streamSimple = createStreamSimple({ entries, store, acpDriver: driver, roundTrips });
+  return { model, store, streamSimple };
+}
+
+async function withIsolatedConfig(envOverrides, fn) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-seed-test-"));
+  const keys = ["PI_CODING_AGENT_DIR", "AGY_DIGEST", "AGY_READONLY", "AGY_MODE"];
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  process.env.PI_CODING_AGENT_DIR = path.join(tmpDir, "agent-dir");
+  delete process.env.AGY_DIGEST;
+  delete process.env.AGY_READONLY;
+  delete process.env.AGY_MODE;
+  for (const [k, v] of Object.entries(envOverrides)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  try {
+    await fn(tmpDir);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+test("/fork of Antigravity session seeds prior user, antigravity assistant, and toolResult once", async () => {
+  await withIsolatedConfig({}, async (tmpDir) => {
+    const { driver, requests } = createRecordingDriver("agy-fork-conv");
+    const { model, store, streamSimple } = makeTestStream(tmpDir, driver);
+    assert.equal(store.get("sid:pi-fork@acp"), null);
+
+    const turn1Messages = [
+      { role: "user", content: "Inspect src/foo.ts", timestamp: 1 },
+      {
+        role: "assistant",
+        provider: "antigravity",
+        content: [{ type: "text", text: "Reading src/foo.ts now." }],
+        timestamp: 2,
+      },
+      {
+        role: "toolResult",
+        toolCallId: "tc-1",
+        toolName: "read_file",
+        content: [{ type: "text", text: "export const answer = 41;" }],
+        isError: false,
+        timestamp: 3,
+      },
+      { role: "user", content: "Forked branch: change answer to 42", timestamp: 4 },
+    ];
+
+    const res1 = await streamSimple(
+      model,
+      { messages: turn1Messages },
+      { cwd: tmpDir, sessionId: "pi-fork" },
+    ).result();
+    assert.equal(res1.stopReason, "stop");
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].conversationId, null);
+    assert.ok(requests[0].contextBlock);
+    assert.equal(requests[0].contextBlock.uri, "urn:pi-bridge:context-digest/4");
+    assert.ok(requests[0].contextBlock.text.startsWith(`${SEED_DIGEST_PREAMBLE}\n\n`));
+    assert.match(requests[0].contextBlock.text, /\[earlier user message\]\nInspect src\/foo\.ts/);
+    assert.match(
+      requests[0].contextBlock.text,
+      /\[assistant turn from antigravity\]\nReading src\/foo\.ts now\./,
+    );
+    assert.match(
+      requests[0].contextBlock.text,
+      /\[tool result: read_file\]\nexport const answer = 41;/,
+    );
+    assert.doesNotMatch(requests[0].contextBlock.text, /Forked branch: change answer to 42/);
+    assert.match(requests[0].prompt, /Forked branch: change answer to 42/);
+
+    const turn2Messages = [
+      ...turn1Messages,
+      {
+        role: "assistant",
+        provider: "antigravity",
+        content: [{ type: "text", text: "Updated answer to 42." }],
+        timestamp: 5,
+      },
+      { role: "user", content: "Now run the unit tests", timestamp: 6 },
+    ];
+
+    const res2 = await streamSimple(
+      model,
+      { messages: turn2Messages },
+      { cwd: tmpDir, sessionId: "pi-fork" },
+    ).result();
+    assert.equal(res2.stopReason, "stop");
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].conversationId, "agy-fork-conv");
+    assert.equal(requests[1].contextBlock, undefined);
+    assert.equal(requests[1].prompt, "Now run the unit tests");
+  });
+});
+
+test("mid-session switch from claude-bridge to antigravity seeds turn 1 and omits turn 2", async () => {
+  await withIsolatedConfig({}, async (tmpDir) => {
+    const { driver, requests } = createRecordingDriver("agy-switched-conv");
+    const { model, streamSimple } = makeTestStream(tmpDir, driver);
+
+    const turn1Messages = [
+      { role: "user", content: "Design the migration plan", timestamp: 1 },
+      {
+        role: "assistant",
+        provider: "claude-bridge",
+        content: [{ type: "text", text: "Step 1: add nullable column." }],
+        timestamp: 2,
+      },
+      { role: "user", content: "Implement step 1", timestamp: 3 },
+    ];
+
+    await streamSimple(
+      model,
+      { messages: turn1Messages },
+      { cwd: tmpDir, sessionId: "pi-switch" },
+    ).result();
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].conversationId, null);
+    assert.ok(requests[0].contextBlock);
+    assert.ok(requests[0].contextBlock.text.startsWith(`${SEED_DIGEST_PREAMBLE}\n\n`));
+    assert.match(requests[0].contextBlock.text, /\[earlier user message\]\nDesign the migration plan/);
+    assert.match(
+      requests[0].contextBlock.text,
+      /\[assistant turn from claude-bridge\]\nStep 1: add nullable column\./,
+    );
+    assert.doesNotMatch(requests[0].contextBlock.text, /Implement step 1/);
+
+    const turn2Messages = [
+      ...turn1Messages,
+      {
+        role: "assistant",
+        provider: "antigravity",
+        content: [{ type: "text", text: "Added nullable column." }],
+        timestamp: 4,
+      },
+      { role: "user", content: "Now backfill existing rows", timestamp: 5 },
+    ];
+
+    await streamSimple(
+      model,
+      { messages: turn2Messages },
+      { cwd: tmpDir, sessionId: "pi-switch" },
+    ).result();
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].conversationId, "agy-switched-conv");
+    assert.equal(requests[1].contextBlock, undefined);
+
+    // When config.digest is explicitly enabled on the bound session, only post-watermark
+    // non-Antigravity turns are attached using DIGEST_PREAMBLE.
+    process.env.AGY_DIGEST = "1";
+    const turn3Messages = [
+      ...turn2Messages,
+      {
+        role: "assistant",
+        provider: "antigravity",
+        content: [{ type: "text", text: "Backfill complete." }],
+        timestamp: 6,
+      },
+      { role: "user", content: "Review migration safety", timestamp: 7 },
+      {
+        role: "assistant",
+        provider: "claude-bridge",
+        content: [{ type: "text", text: "Add a concurrent index." }],
+        timestamp: 8,
+      },
+      { role: "user", content: "Apply that index", timestamp: 9 },
+    ];
+
+    await streamSimple(
+      model,
+      { messages: turn3Messages },
+      { cwd: tmpDir, sessionId: "pi-switch" },
+    ).result();
+    assert.equal(requests.length, 3);
+    assert.equal(requests[2].conversationId, "agy-switched-conv");
+    assert.ok(requests[2].contextBlock);
+    assert.ok(requests[2].contextBlock.text.startsWith(`${DIGEST_PREAMBLE}\n\n`));
+    assert.match(
+      requests[2].contextBlock.text,
+      /\[assistant turn from claude-bridge\]\nAdd a concurrent index\./,
+    );
+    assert.doesNotMatch(requests[2].contextBlock.text, /Backfill complete/);
+    assert.doesNotMatch(requests[2].contextBlock.text, /Step 1: add nullable column/);
+  });
+});
+
+test("fresh 1-turn session sends no contextBlock", async () => {
+  await withIsolatedConfig({}, async (tmpDir) => {
+    const { driver, requests } = createRecordingDriver("agy-fresh-conv");
+    const { model, streamSimple } = makeTestStream(tmpDir, driver);
+
+    const res = await streamSimple(
+      model,
+      { messages: [{ role: "user", content: "Hello from a brand-new session", timestamp: 1 }] },
+      { cwd: tmpDir, sessionId: "pi-fresh" },
+    ).result();
+    assert.equal(res.stopReason, "stop");
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].conversationId, null);
+    assert.equal(requests[0].contextBlock, undefined);
+    assert.match(requests[0].prompt, /Hello from a brand-new session/);
+  });
 });

@@ -137,6 +137,13 @@ export const RESUME_PROMPT =
 export const DIGEST_PREAMBLE =
 	"[The following is context from the broader pi session that this Antigravity turn was not directly spawned for: compaction summaries and turns handled by other providers or pi's own tools. Your own prior turns are already in your conversation history. Use this for continuity only.]";
 
+export const SEED_DIGEST_PREAMBLE = [
+	"[The following is prior conversation history from the pi session before this fresh Antigravity",
+	"conversation started (for example after /fork or a mid-session provider switch): earlier user",
+	"messages, assistant turns, tool results, and any compaction summary. This fresh conversation",
+	"has no prior turns of its own; use this history for continuity.]",
+].join(" ");
+
 export const SYSTEM_PROMPT_PREAMBLE =
 	"[The following is the system prompt of the pi session that spawned this conversation: operating instructions plus project context (AGENTS.md files). Apply it for this whole conversation.]";
 
@@ -187,16 +194,18 @@ function stripCompactionWrapping(t: string): string {
 
 export interface DigestOptions {
 	ownProvider?: string;
+	includeOwnAssistant?: boolean;
 	maxChars?: number;
 }
 
-/** Build a delta digest of Pi-side context (compaction summary + non-Antigravity turns). */
+/** Build a delta or seed digest of Pi-side context (compaction summary + prior turns). */
 export function buildContextDigest(
 	messages: Message[],
 	watermark: number,
 	opts: DigestOptions = {},
 ): string {
 	const own = opts.ownProvider ?? "antigravity";
+	const includeOwn = opts.includeOwnAssistant === true || own === "";
 	const maxChars = opts.maxChars ?? 8000;
 	if (messages.length === 0) return "";
 
@@ -223,7 +232,7 @@ export function buildContextDigest(
 	for (let i = start; i < end; i++) {
 		const m = messages[i];
 		if (m.role === "assistant") {
-			if (m.provider === own) continue;
+			if (!includeOwn && m.provider === own) continue;
 			const t = blocksToText(m.content).trim();
 			if (!t) continue;
 			deltaParts.push(`[assistant turn from ${m.provider}]\n${t}`);
@@ -1170,7 +1179,8 @@ async function runTurnDriver(
 			return;
 		}
 
-		const watermark = existing?.lastMessageCount ?? 0;
+		const hasBoundSession = Boolean(existing?.conversationId);
+		const watermark = hasBoundSession ? (existing?.lastMessageCount ?? 0) : 0;
 		const userPrompt = extractUserPrompt(context, watermark);
 		const images = extractImages(context, watermark);
 		const lastRole = context.messages[context.messages.length - 1]?.role;
@@ -1178,7 +1188,7 @@ async function runTurnDriver(
 			!userPrompt &&
 			images.length === 0 &&
 			late.length === 0 &&
-			Boolean(existing?.conversationId) &&
+			hasBoundSession &&
 			(lastRole === "toolResult" || lastRole === "assistant");
 		const prompt = resume ? RESUME_PROMPT : userPrompt;
 		if (resume) deps.log?.("resume-turn", { conversation: existing?.conversationId }, "error");
@@ -1188,11 +1198,24 @@ async function runTurnDriver(
 			return;
 		}
 
-		const digest =
-			config.digest && late.length === 0 && !resume
-				? buildContextDigest(context.messages, watermark)
-				: "";
-		const gateOpen = config.systemPrompt && !existing?.conversationId;
+		// Fresh ACP sessions (/fork or mid-session provider switch) get a one-shot
+		// seed of prior transcript history, including prior Antigravity turns that
+		// the new session has never seen. Bound sessions stay cache-clean unless
+		// config.digest is enabled.
+		let digest = "";
+		let digestPreamble = DIGEST_PREAMBLE;
+		if (late.length === 0 && !resume) {
+			if (!hasBoundSession) {
+				digest = buildContextDigest(context.messages, 0, {
+					ownProvider: "",
+					includeOwnAssistant: true,
+				});
+				digestPreamble = SEED_DIGEST_PREAMBLE;
+			} else if (config.digest) {
+				digest = buildContextDigest(context.messages, watermark);
+			}
+		}
+		const gateOpen = config.systemPrompt && !hasBoundSession;
 		const sysPrompt = gateOpen ? getCurrentSystemPrompt(context.messages) || undefined : undefined;
 		const runImages = [...images, ...late.flatMap((l) => l.images ?? [])];
 		const fullPrompt =
@@ -1214,7 +1237,7 @@ async function runTurnDriver(
 				contextBlock: digest
 					? {
 							uri: `urn:pi-bridge:context-digest/${messageCount}`,
-							text: `${DIGEST_PREAMBLE}\n\n${digest}`,
+							text: `${digestPreamble}\n\n${digest}`,
 						}
 					: undefined,
 				signal: options?.signal,

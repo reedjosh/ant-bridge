@@ -10,6 +10,7 @@
 //   - Clamps newer `mcp-protocol-version` headers to the SDK's latest supported version.
 
 import crypto from "node:crypto";
+import fs from "node:fs";
 import http from "node:http";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -19,6 +20,16 @@ import {
 	ListToolsRequestSchema,
 	SUPPORTED_PROTOCOL_VERSIONS,
 } from "@modelcontextprotocol/sdk/types.js";
+
+const PACKAGE_VERSION = (() => {
+	try {
+		const raw = fs.readFileSync(new URL("../package.json", import.meta.url), "utf8");
+		const parsed = JSON.parse(raw) as { version?: unknown };
+		return typeof parsed.version === "string" && parsed.version.trim() ? parsed.version.trim() : "2.1.0";
+	} catch {
+		return "2.1.0";
+	}
+})();
 
 /** Shared-secret header required on every bridge HTTP request. */
 export const TOKEN_HEADER = "x-bridge-token";
@@ -114,7 +125,7 @@ export async function startMcpServer(
 
 	const makeServer = (signal: AbortSignal) => {
 		const s = new Server(
-			{ name: "ant-bridge", version: "2.0.0" },
+			{ name: "ant-bridge", version: PACKAGE_VERSION },
 			{ capabilities: { tools: {} } },
 		);
 		s.setRequestHandler(ListToolsRequestSchema, listHandler);

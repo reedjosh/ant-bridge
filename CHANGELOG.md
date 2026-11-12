@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.1.0 - 2026-11-12
+
+- **Mid-turn steering interruption:** Send `session/cancel` to `agy acp` when the user steers during an active
+  `session/prompt` turn (with a short grace period for running native tools and parked MCP round-trip protection),
+  preserving `conversationId` and delta state so Pi immediately delivers the steering message on the next turn.
+- **Native tool output and diff previews:** Show target file paths, line ranges, and search queries on `agy` native
+  tool rows, clean `agy` command output wrappers, render 5-line collapsed tail/diff previews, and support per-entry
+  left-click (`MouseRegion`) as well as global `Ctrl+O` expansion.
+
 ## 2.0.0 - 2026-11-12
 
 Focused `ant-bridge` fork from `@estebanforge/pi-antigravity-bridge` 1.10.4:

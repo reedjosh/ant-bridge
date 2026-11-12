@@ -1,12 +1,13 @@
 // Discover models from `agy models` and project them into pi's Model shape so
 // they appear in the /model picker as antigravity/<slug>.
 //
-// agy prints TWO columns per line: "<slug>  <display label>". --model takes
-// ONLY the slug (col 1); the label is display-only. Verified live 2026-10:
-//   gemini-3.8-flash-high     Gemini 3.8 Flash (High)
-//   gemini-3.8-flash-medium   Gemini 3.8 Flash (Medium)   (+ -low)
-//   gemini-3.1-pro-high       Gemini 3.1 Pro (High)        (Pro has NO medium)
-//   claude-sonnet-5-5-high    Claude Sonnet 5.5 (High)     (+ -medium, -low)
+// agy prints TWO columns per line: "<slug>\t<display label>". --model takes
+// ONLY the slug (col 1); col 2 becomes the human display label in pi's /model
+// picker (with the trailing tier tag stripped when tiers collapse). Verified:
+//   gemini-4-hydrogen-xhigh   Gemini 4 Hydrogen (XHigh)   (+ -high/-medium/-low)
+//   gemini-4-carbon-high      Gemini 4 Carbon (High)      (+ -medium, -low)
+//   gemini-pro-orchestrator   Orchestrator                (single fixed slug)
+//   claude-opus-5-5-high      Claude Opus 5.5 (High)      (+ -medium, -low)
 //
 // Gemini AND Claude models are collapsed to a BASE slug (gemini-3.8-flash,
 // claude-sonnet-5-5) and exposed with a thinking-effort toggle whose levels
@@ -30,25 +31,25 @@ const DISCOVERY_TIMEOUT_MS = 8_000;
  *  anything past 1 MiB is a runaway process. Fail closed to "" so the
  *  fallback catalog engages instead of letting the buffer grow without
  *  limit. The check counts decoded string length (UTF-16 code units), not
- *  raw bytes — a deliberate proxy, since the margin between a few KB of
+ *  raw bytes - a deliberate proxy, since the margin between a few KB of
  *  real output and 1 MiB dwarfs any encoding difference. */
 export const MODELS_OUTPUT_CAP_BYTES = 1024 * 1024;
 
-/** Reasoning-effort tiers agy accepts via --effort. */
-export type AgyEffort = "low" | "medium" | "high";
+/** Reasoning-effort tiers agy accepts via --effort / ACP thought_level. */
+export type AgyEffort = "low" | "medium" | "high" | "xhigh";
 
-/** low < medium < high, for sorting/clamping. */
-const EFFORT_RANK: Record<AgyEffort, number> = { low: 0, medium: 1, high: 2 };
+/** low < medium < high < xhigh, for sorting/clamping. */
+const EFFORT_RANK: Record<AgyEffort, number> = { low: 0, medium: 1, high: 2, xhigh: 3 };
 
 /** pi thinking-effort order mirrors agy's, for clamping. */
-export const AGY_EFFORT_ORDER: readonly AgyEffort[] = ["low", "medium", "high"];
+export const AGY_EFFORT_ORDER: readonly AgyEffort[] = ["low", "medium", "high", "xhigh"];
 
 /** Map pi's thinking level onto one of the tiers `efforts` the base actually
  *  supports, clamping to the nearest available. agy rejects an effort tier a
- *  base doesn't list (e.g. medium on Pro), so we never emit one. Shared by the
- *  provider turns AND the AskAntigravity delegation tool (thinking/effort
- *  params): one vocabulary, one clamp. When pi sends no level we fall to the
- *  first available tier. */
+ *  base doesn't list (e.g. medium on Pro, xhigh on 3-tier bases), so we never
+ *  emit one. Shared by the provider turns AND the AskAntigravity delegation
+ *  tool (thinking/effort params): one vocabulary, one clamp. When pi sends no
+ *  level we fall to the first available tier. */
 export function toAgyEffort(
 	reasoning: ThinkingLevel | undefined,
 	efforts: readonly AgyEffort[],
@@ -63,9 +64,11 @@ export function toAgyEffort(
 			candidate = "medium";
 			break;
 		case "high":
+			candidate = "high";
+			break;
 		case "xhigh":
 		case "max":
-			candidate = "high";
+			candidate = "xhigh";
 			break;
 		default:
 			candidate = efforts[0] ?? "low";
@@ -82,13 +85,16 @@ export function toAgyEffort(
 }
 
 /** Split an agy slug into (base, tier). tier is null when the slug has no
- *  -high/-medium/-low suffix - a shape only unverified families should
- *  produce now, and those stay whole. Every Claude slug carries a tier
- *  suffix and collapses to its base. */
-const TIER_RE = /^(.+)-(high|medium|low)$/;
+ *  -xhigh/-high/-medium/-low suffix - a shape only fixed or unverified slugs
+ *  produce (e.g. gemini-pro-orchestrator), and those stay whole. */
+const TIER_RE = /^(.+)-(xhigh|high|medium|low)$/;
+
+/** Trailing tier tag in `agy models` col 2, e.g. " (XHigh)" or " (Medium)".
+ *  Stripped when tier variants collapse into one base entry. */
+const LABEL_TIER_SUFFIX_RE = /\s*\((?:xhigh|high|medium|low)\)\s*$/i;
 
 /** agy emits clean slug ids (gemini-3.6-flash-high). Validate col1 of each
- *  line so a banner / auth / "Fetching models…" line can't register as a
+ *  line so a banner / auth / "Fetching models..." line can't register as a
  *  model, and a leading-dash token (e.g. "-high") can't reach agy's flag
  *  parser as --model. First char must be alphanumeric; the slug must contain
  *  at least one hyphen (every real agy slug does: family-version-name), which
@@ -115,6 +121,10 @@ export interface AgyModelEntry {
 	full: string;
 	/** pi model id, e.g. "gemini-3-8-flash". */
 	id: string;
+	/** Human display label from `agy models` col 2 (tier suffix stripped when
+	 *  collapsed, e.g. "Gemini 4 Hydrogen"; kept verbatim for single entries,
+	 *  e.g. "Orchestrator"). Omitted when raw input has no second column. */
+	label?: string;
 	/** Present iff this is an effort-driven base slug. Lists the tiers agy
 	 *  accepts for it; pi's thinking toggle picks among them and we always pass
 	 *  --effort. Absent => fixed model, never pass --effort. */
@@ -296,13 +306,17 @@ export async function loadModelCatalogRaw(
  *  risked. Hidden families are dropped outright. Insertion order of
  *  first-seen bases is preserved. */
 export function entriesFromRaw(raw: string): AgyModelEntry[] {
-	// agy prints TWO columns: "<slug>  <display label>". --model takes only the
-	// slug, so split col1 and validate THAT; the label is display-only. A
-	// bare-slug line (no whitespace) splits to itself, so this also tolerates
-	// the legacy one-column shape.
-	const groups = new Map<string, { lines: string[]; tiers: Set<AgyEffort> }>();
-	for (const line of raw.split("\n")) {
-		const slug = line.trim().split(/\s+/)[0] ?? "";
+	// agy prints TWO columns: "<slug>\t<display label>". --model takes only col 1;
+	// col 2 (everything after col 1 whitespace, trimmed) becomes `label`. A
+	// bare-slug line (no whitespace) yields an empty col 2 and omits `label`,
+	// preserving compatibility with legacy one-column input.
+	const groups = new Map<string, { items: Array<{ slug: string; col2: string }>; tiers: Set<AgyEffort> }>();
+	for (const rawLine of raw.split("\n")) {
+		const trimmed = rawLine.trim();
+		if (!trimmed) continue;
+		const wsMatch = /\s+/.exec(trimmed);
+		const slug = wsMatch ? trimmed.slice(0, wsMatch.index) : trimmed;
+		const col2 = wsMatch ? trimmed.slice(wsMatch.index + wsMatch[0].length).trim() : "";
 		if (!slug || !MODEL_LINE_RE.test(slug)) continue;
 		if (HIDDEN_FAMILY_RE.test(slug)) continue;
 		const m = TIER_RE.exec(slug);
@@ -310,19 +324,23 @@ export function entriesFromRaw(raw: string): AgyModelEntry[] {
 		const tier = m ? (m[2] as AgyEffort) : null;
 		let g = groups.get(base);
 		if (!g) {
-			g = { lines: [], tiers: new Set<AgyEffort>() };
+			g = { items: [], tiers: new Set<AgyEffort>() };
 			groups.set(base, g);
 		}
-		g.lines.push(slug);
+		g.items.push({ slug, col2 });
 		if (tier) g.tiers.add(tier);
 	}
 	const entries: AgyModelEntry[] = [];
 	for (const [base, g] of groups) {
 		const efforts = [...g.tiers].sort((a, b) => EFFORT_RANK[a] - EFFORT_RANK[b]);
 		if (efforts.length >= 2 && EFFORT_CAPABLE_FAMILIES.some((re) => re.test(base))) {
-			entries.push({ full: base, id: slugify(base), efforts });
+			const rawLabel = g.items.find((it) => it.col2.length > 0)?.col2 ?? "";
+			const label = rawLabel.replace(LABEL_TIER_SUFFIX_RE, "").trim();
+			entries.push({ full: base, id: slugify(base), ...(label ? { label } : {}), efforts });
 		} else {
-			for (const line of g.lines) entries.push({ full: line, id: slugify(line) });
+			for (const { slug, col2 } of g.items) {
+				entries.push({ full: slug, id: slugify(slug), ...(col2 ? { label: col2 } : {}) });
+			}
 		}
 	}
 	return entries.filter((e) => e.id.length > 0);
@@ -343,17 +361,22 @@ export function slugify(full: string): string {
 		.replace(/^-+|-+$/g, "");
 }
 
-/** Build the thinkingLevelMap for an effort-driven base: hide "off" and
- *  "minimal" always (agy has no no-thinking mode; a base REQUIRES an effort),
- *  and hide any of low/medium/high the base doesn't offer (e.g. Pro has no
- *  medium). pi's getSupportedThinkingLevels treats a null value as hidden, so
- *  the toggle then shows exactly agy's slider stops. */
+/** Build the thinkingLevelMap for an effort-driven base: hide "off", "minimal",
+ *  and "max" always (agy has no no-thinking mode and tops out at xhigh), map
+ *  each supported tier in low/medium/high/xhigh to itself (pi-ai's
+ *  getSupportedThinkingLevels treats xhigh and max as opt-in where undefined
+ *  is hidden, so supported tiers need a non-null string), and hide any tier
+ *  absent from `efforts` with null. */
 function thinkingLevelMapFor(efforts: readonly AgyEffort[]): ThinkingLevelMap {
-	const map: Record<string, string | null> = { off: null, minimal: null };
-	for (const level of ["low", "medium", "high"] as const) {
-		if (!efforts.includes(level)) map[level] = null;
-	}
-	return map as ThinkingLevelMap;
+	return {
+		off: null,
+		minimal: null,
+		low: efforts.includes("low") ? "low" : null,
+		medium: efforts.includes("medium") ? "medium" : null,
+		high: efforts.includes("high") ? "high" : null,
+		xhigh: efforts.includes("xhigh") ? "xhigh" : null,
+		max: null,
+	};
 }
 
 /** Project an agy entry to pi's Model shape. `input` advertises accepted
@@ -363,7 +386,7 @@ export function toPiModel(entry: AgyModelEntry, input: Array<"text" | "image"> =
 	const effortDriven = !!entry.efforts && entry.efforts.length > 0;
 	return {
 		id: entry.id,
-		name: entry.full,
+		name: entry.label ?? entry.full,
 		api: "agy-bridge" as Api,
 		provider: "antigravity",
 		// baseUrl/apiKey are not used (streamSimple intercepts everything), but
@@ -391,11 +414,42 @@ export function toPiModel(entry: AgyModelEntry, input: Array<"text" | "image"> =
  *  can still select a model and get a clear runtime error instead of an empty
  *  list. Update these when agy ships new Gemini versions. */
 export const FALLBACK_MODELS: AgyModelEntry[] = [
-	{ full: "gemini-4-carbon", id: "gemini-4-carbon", efforts: ["low", "medium", "high"] },
-	{ full: "gemini-4-argon", id: "gemini-4-argon", efforts: ["low", "medium", "high"] },
-	{ full: "gemini-3.8-flash", id: "gemini-3-8-flash", efforts: ["low", "medium", "high"] },
-	{ full: "claude-opus-5-5", id: "claude-opus-5-5", efforts: ["low", "medium", "high"] },
-	{ full: "claude-sonnet-5-5", id: "claude-sonnet-5-5", efforts: ["low", "medium", "high"] },
+	{
+		full: "gemini-4-carbon",
+		id: "gemini-4-carbon",
+		label: "Gemini 4 Carbon",
+		efforts: ["low", "medium", "high"],
+	},
+	{
+		full: "gemini-4-argon",
+		id: "gemini-4-argon",
+		label: "Gemini 4 Argon",
+		efforts: ["low", "medium", "high"],
+	},
+	{
+		full: "gemini-4-hydrogen",
+		id: "gemini-4-hydrogen",
+		label: "Gemini 4 Hydrogen",
+		efforts: ["low", "medium", "high", "xhigh"],
+	},
+	{
+		full: "gemini-3.8-flash",
+		id: "gemini-3-8-flash",
+		label: "Gemini 3.8 Flash",
+		efforts: ["low", "medium", "high"],
+	},
+	{
+		full: "claude-opus-5-5",
+		id: "claude-opus-5-5",
+		label: "Claude Opus 5.5",
+		efforts: ["low", "medium", "high"],
+	},
+	{
+		full: "claude-sonnet-5-5",
+		id: "claude-sonnet-5-5",
+		label: "Claude Sonnet 5.5",
+		efforts: ["low", "medium", "high"],
+	},
 ];
 
 

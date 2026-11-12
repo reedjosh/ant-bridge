@@ -1101,24 +1101,45 @@ export class AcpDriver implements TurnDriver {
 		return usage;
 	}
 
-	/** Keep PromptResponse.usage billing fields, replace only the context
-	 *  total. Occupancy frames win; otherwise derive (issue #12, derivation
-	 *  in AGENTS.md). */
+	/** Normalize PromptResponse.usage from multi-inference turn sums to
+	 *  single-turn prompt + context counts. PromptResponse.usage sums
+	 *  input_tokens, cache_read_tokens, and output_tokens across every internal
+	 *  inference of one session/prompt call, whereas Pi treats AssistantMessage
+	 *  usage as a single inference: isContextOverflow checks
+	 *  (input + cacheRead > contextWindow), footer/cache-stats compute prompt
+	 *  cache hit rate from input + cacheRead, and shouldCompact reads
+	 *  totalTokens as live context occupancy. Averaging input and cacheRead
+	 *  over the turn's inference batches preserves cache-hit ratio, keeps
+	 *  input + cacheRead <= totalTokens (exact at 1 batch), and avoids
+	 *  re-counting uncached tails across N tool loops. */
 	#contextCorrectedUsage(turn: ActiveTurn, usage: AgyUsage): AgyUsage {
-		return { ...usage, total_tokens: turn.contextUsed ?? this.#derivedContextTokens(turn, usage) };
-	}
-
-	/** PromptResponse.usage sums input+cacheRead+output over EVERY inference
-	 *  of the prompt, but pi reads Usage.totalTokens as the live context
-	 *  length. Each inference's cacheRead is at least the warm prefix C0, so
-	 *  the batch average lower-bounds C0 and added content reaches the total
-	 *  through the Σinput term; exact at one batch (the raw aggregate). Full
-	 *  derivation in AGENTS.md. */
-	#derivedContextTokens(turn: ActiveTurn, usage: AgyUsage): number {
-		const input = usage.input_tokens ?? 0;
+		const batches = turn.toolBatches + 1;
 		const output = usage.output_tokens ?? 0;
-		const cacheRead = usage.cache_read_tokens ?? 0;
-		return input + output + Math.ceil(cacheRead / (turn.toolBatches + 1));
+		let input = Math.ceil((usage.input_tokens ?? 0) / batches);
+		let cacheRead =
+			usage.cache_read_tokens !== undefined ? Math.ceil(usage.cache_read_tokens / batches) : undefined;
+		if (turn.contextUsed !== undefined) {
+			const promptSum = input + (cacheRead ?? 0);
+			if (promptSum > turn.contextUsed) {
+				const scale = turn.contextUsed / promptSum;
+				input = Math.floor(input * scale);
+				if (cacheRead !== undefined) {
+					cacheRead = Math.min(turn.contextUsed - input, Math.floor(cacheRead * scale));
+				}
+			}
+			return {
+				...usage,
+				input_tokens: input,
+				...(cacheRead === undefined ? {} : { cache_read_tokens: cacheRead }),
+				total_tokens: turn.contextUsed,
+			};
+		}
+		return {
+			...usage,
+			input_tokens: input,
+			...(cacheRead === undefined ? {} : { cache_read_tokens: cacheRead }),
+			total_tokens: input + (cacheRead ?? 0) + output,
+		};
 	}
 
 	#log(msg: string, data?: unknown): void {

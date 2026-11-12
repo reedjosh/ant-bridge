@@ -7,7 +7,7 @@ import type {
 	ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import { getCurrentTools } from "@earendil-works/pi-ai";
-import { type SettingItem, Text } from "@earendil-works/pi-tui";
+import type { SettingItem } from "@earendil-works/pi-tui";
 import { AcpDriver } from "../src/acp/driver.js";
 import { sweepStaleAcpHomes } from "../src/acp/home.js";
 import {
@@ -59,6 +59,8 @@ import {
 import {
 	capNativeOutput,
 	createNativeEventEntryRenderer,
+	createPollRunEntryRenderer,
+	formatNativeEventDetail,
 } from "../src/native-event-render.js";
 import { PollRunFolder, type PollRunData } from "../src/poll-fold.js";
 import {
@@ -110,9 +112,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const FAIL_REASON_TURN_END = "antigravity turn ended with an unresolved pi tool call";
 	const FAIL_REASON_SHUTDOWN = "antigravity session shut down";
 
+	let logClosed = false;
 	const fileLog = createDailyLogger({ dir: logsDir() });
 	const rawFileLog = fileLog.log.bind(fileLog);
 	fileLog.log = (event, data, level) => {
+		if (event === "turn-start") logClosed = false;
+		if (logClosed) return;
 		rawFileLog(event, data, level);
 		if (level !== "warn") return;
 		if (event.startsWith("abort:") || event === "connection-exited") return;
@@ -231,22 +236,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		createNativeEventEntryRenderer(),
 	);
 
-	pi.registerEntryRenderer<PollRunData>("agy-poll-run", (entry, { expanded }, theme) => {
-		const run = entry.data;
-		const count = run?.count ?? 0;
-		const label = `Poll ${run?.target ?? "bridge call"} (x${count}${run?.state === "failed" ? ", failed" : ""})`;
-		const lines = [`[poll] ${theme.fg("toolTitle", POLL_TOOL_NAME)} ${theme.fg("muted", label)}`];
-		if (expanded && run) {
-			const time = (iso: string): string => new Date(iso).toLocaleTimeString();
-			lines.push(
-				theme.fg(
-					"dim",
-					`${count} ${count === 1 ? "poll" : "polls"}, ${time(run.firstAt)} -> ${time(run.lastAt)}`,
-				),
-			);
-		}
-		return new Text(lines.join("\n"), 0, 0);
-	});
+	pi.registerEntryRenderer<PollRunData>("agy-poll-run", createPollRunEntryRenderer());
 
 	let pendingNativeTools = 0;
 	const pollRuns = new PollRunFolder();
@@ -281,7 +271,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		if (/^pi-bridge(?:-\d+)?$/.test(event.mcpServer ?? "")) return;
 		if (event.status === "started") {
 			pendingNativeTools++;
-			setDimStatus("agy-native", `agy ${event.name}... (${pendingNativeTools})`);
+			const detail = formatNativeEventDetail(event);
+			const snippet = detail
+				? ` ${detail.length > 60 ? `${detail.slice(0, 57)}...` : detail}`
+				: "";
+			const ellipsis = snippet.endsWith("...") ? "" : "...";
+			const count = pendingNativeTools > 1 ? ` (${pendingNativeTools})` : "";
+			setDimStatus("agy-native", `agy ${event.name}${snippet}${ellipsis}${count}`);
 			return;
 		}
 		pendingNativeTools = Math.max(0, pendingNativeTools - 1);
@@ -305,10 +301,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			},
 			outcome.status === "OK" ? "info" : "warn",
 		);
-		pendingNativeTools = 0;
-		activeUi?.setStatus("agy-native", undefined);
 		roundTrips.failAll(FAIL_REASON_TURN_END);
-		closePollRun();
 		if (outcome.conversationId) roundTrips.stampConversation(outcome.conversationId);
 	};
 
@@ -452,6 +445,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		roundTrips,
 		onNativeEvent,
 		onNativeBackground: (info) => armConversationWatcher(info.conversationId, info.turnStartMs),
+		onTurnFinished: () => {
+			if (pendingNativeTools > 0) {
+				pendingNativeTools = 0;
+				activeUi?.setStatus("agy-native", undefined);
+			}
+			closePollRun();
+		},
 		roster,
 		log: fileLog.log.bind(fileLog),
 	});
@@ -536,6 +536,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		logClosed = false;
 		backgroundWatchDisposed = false;
 		if (ctx.hasUI) activeUi = ctx.ui;
 
@@ -725,6 +726,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		roundTrips.failAll(FAIL_REASON_SHUTDOWN);
 		await h?.close();
 		hiddenBridgeTools.clear();
+		logClosed = true;
+		await fileLog.flush();
 	});
 }
 
@@ -764,6 +767,26 @@ function settingsRows(): string[] {
 
 function statusText(ctx: AgyCommandCtx): string {
 	const source = ctx.usingFallback ? "fallback (agy models failed)" : "discovered";
+	const subcommands = [
+		"/agy doctor",
+		"/agy auth",
+		"/agy auth-manual",
+		"/agy mode accept-edits|plan",
+		"/agy readonly on|off",
+		"/agy permissions on|off",
+		"/agy permission-mode ask|allow|deny",
+		"/agy bridge all|mcp|none",
+		"/agy tools [hide|show <name>|reset]",
+		"/agy usage estimate|direct|off",
+		"/agy digest on|off",
+		"/agy system-prompt on|off",
+		"/agy timeout <1-1440|off>",
+		"/agy quota",
+		"/agy subagents",
+		"/agy artifacts [open <n|name>]",
+		"/agy tasks [tail <id>]",
+		"/agy clear [all]",
+	].join(", ");
 	return [
 		"Antigravity bridge (agy acp)",
 		`  models:              ${ctx.entries.length} ${source}`,
@@ -771,14 +794,145 @@ function statusText(ctx: AgyCommandCtx): string {
 		`  sessions:            ${ctx.store.size} bound`,
 		`  config:              ${configPath()}`,
 		"",
-		"Subcommands: /agy doctor, /agy auth, /agy auth-manual, /agy mode accept-edits|plan, /agy readonly on|off, /agy permissions on|off, /agy permission-mode ask|allow|deny, /agy bridge all|mcp|none, /agy tools [hide|show <name>|reset], /agy usage estimate|direct|off, /agy digest on|off, /agy system-prompt on|off, /agy timeout <1-1440|off>, /agy quota, /agy subagents, /agy artifacts [open <n|name>], /agy tasks [tail <id>], /agy clear",
+		`Subcommands: ${subcommands}`,
 	].join("\n");
 }
 
-function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
+function currentSessionKey(cmdCtx: ExtensionCommandContext): string {
+	const sessionId = cmdCtx.sessionManager?.getSessionId?.();
+	if (sessionId && sessionId.length > 0) return `sid:${sessionId}@acp`;
+	return `cwd:${cmdCtx.cwd ?? cmdCtx.sessionManager?.getCwd?.() ?? process.cwd()}@acp`;
+}
+
+function resolveConversationId(
+	ctx: AgyCommandCtx,
+	cmdCtx: ExtensionCommandContext,
+): string | undefined {
+	const currentKey = currentSessionKey(cmdCtx);
+	return (
+		ctx.store.get(currentKey)?.conversationId ??
+		ctx.acpDriver.snapshot().conversationId ??
+		undefined
+	);
+}
+
+interface AgyCompletionItem {
+	value: string;
+	label: string;
+	description?: string;
+}
+
+const AGY_SUBCOMMANDS: ReadonlyArray<{ name: string; description: string }> = [
+	{ name: "doctor", description: "Inspect CLI, session, driver, and MCP bridge status" },
+	{ name: "auth", description: "Show Antigravity sign-in instructions" },
+	{ name: "auth-manual", description: "Show CLI install and manual sign-in instructions" },
+	{ name: "mode", description: "Show or set provider mode (accept-edits)" },
+	{ name: "readonly", description: "Toggle read-only kill switch (on|off)" },
+	{ name: "permissions", description: "Toggle ACP permission auto-approval (on|off)" },
+	{ name: "permission-mode", description: "Set ACP permission fallback (ask|allow|deny)" },
+	{ name: "bridge", description: "Set bridged Pi tool scope (all|mcp|none)" },
+	{ name: "tools", description: "Inspect, hide, show, or reset bridged Pi tools" },
+	{ name: "usage", description: "Set token usage estimate mode (estimate|direct|off)" },
+	{ name: "digest", description: "Toggle Pi context digest injection (on|off)" },
+	{ name: "system-prompt", description: "Toggle fresh-session system prompt injection (on|off)" },
+	{ name: "timeout", description: "Set per-turn timeout cap in minutes or off" },
+	{ name: "quota", description: "Check Antigravity model quota" },
+	{ name: "subagents", description: "List tracked Antigravity subagents" },
+	{ name: "artifacts", description: "Browse or open bound conversation artifacts" },
+	{ name: "tasks", description: "Browse or tail bound conversation background tasks" },
+	{ name: "clear", description: "Clear session binding (/agy clear [all])" },
+];
+
+const AGY_SUBCOMMAND_ARGS: Readonly<Record<string, readonly string[]>> = {
+	clear: ["all"],
+	mode: ["accept-edits"],
+	readonly: ["on", "off"],
+	permissions: ["on", "off"],
+	"permission-mode": ["ask", "allow", "deny"],
+	bridge: ["all", "mcp", "none"],
+	usage: ["estimate", "direct", "off"],
+	digest: ["on", "off"],
+	"system-prompt": ["on", "off"],
+	tools: ["reset", "hide", "show"],
+	tasks: ["tail"],
+	artifacts: ["open"],
+};
+
+function getAgyArgumentCompletions(
+	argumentPrefix: string,
+	getAllTools: () => ReadonlyArray<{ name: string; description?: string }>,
+): AgyCompletionItem[] | null {
+	const trimmedStart = argumentPrefix.trimStart();
+	if (trimmedStart === "") {
+		return AGY_SUBCOMMANDS.map((sub) => ({
+			value: sub.name,
+			label: sub.name,
+			description: sub.description,
+		}));
+	}
+
+	const hasTrailingSpace = /\s$/.test(trimmedStart);
+	const parts = trimmedStart.trimEnd().split(/\s+/);
+
+	if (parts.length === 1 && !hasTrailingSpace) {
+		const subPrefix = parts[0].toLowerCase();
+		const matches = AGY_SUBCOMMANDS.filter((sub) => sub.name.startsWith(subPrefix));
+		return matches.length > 0
+			? matches.map((sub) => ({
+					value: sub.name,
+					label: sub.name,
+					description: sub.description,
+				}))
+			: null;
+	}
+
+	const sub = parts[0].toLowerCase();
+
+	if ((parts.length === 1 && hasTrailingSpace) || (parts.length === 2 && !hasTrailingSpace)) {
+		const argPrefix = parts.length === 2 ? parts[1].toLowerCase() : "";
+		const candidates = AGY_SUBCOMMAND_ARGS[sub];
+		if (!candidates) return null;
+		const matches = candidates.filter((arg) => arg.startsWith(argPrefix));
+		return matches.length > 0
+			? matches.map((arg) => ({
+					value: `${sub} ${arg}`,
+					label: arg,
+				}))
+			: null;
+	}
+
+	if (sub === "tools") {
+		const action = parts[1].toLowerCase();
+		if (
+			(action === "hide" || action === "show") &&
+			((parts.length === 2 && hasTrailingSpace) || (parts.length === 3 && !hasTrailingSpace))
+		) {
+			const toolPrefix = parts.length === 3 ? parts[2].toLowerCase() : "";
+			const seen = new Set<string>();
+			const matches: AgyCompletionItem[] = [];
+			for (const tool of getAllTools()) {
+				if (!tool?.name || seen.has(tool.name)) continue;
+				if (!tool.name.toLowerCase().startsWith(toolPrefix)) continue;
+				seen.add(tool.name);
+				matches.push({
+					value: `tools ${action} ${tool.name}`,
+					label: tool.name,
+					...(tool.description ? { description: tool.description } : {}),
+				});
+			}
+			return matches.length > 0 ? matches : null;
+		}
+	}
+
+	return null;
+}
+
+export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 	pi.registerCommand("agy", {
 		description:
 			"Antigravity ACP provider: settings picker, doctor, session/task/artifact inspection. Usage: /agy [doctor|auth|auth-manual|mode|readonly|permissions|permission-mode|bridge|tools|usage|digest|system-prompt|timeout|quota|subagents|artifacts|tasks|clear]",
+		getArgumentCompletions: (argumentPrefix: string) =>
+			getAgyArgumentCompletions(argumentPrefix, () => pi.getAllTools()),
 		handler: async (args, cmdCtx: ExtensionCommandContext) => {
 			const ui = cmdCtx.ui;
 			if (ui) activeUi = ui;
@@ -789,8 +943,28 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 			ctx.fileLog.log("agy-command", { args }, "info");
 
 			if (sub === "clear") {
-				ctx.store.clear();
-				ui?.notify("Cleared all antigravity session bindings.", "info");
+				if (val === "all" || val === "--all") {
+					if (parts.length > 2) {
+						ui?.notify("usage: /agy clear [all]", "warning");
+						return;
+					}
+					ctx.store.clear();
+					ui?.notify("Cleared all antigravity session bindings.", "info");
+					return;
+				}
+				if (!val) {
+					const currentKey = currentSessionKey(cmdCtx);
+					const existing = ctx.store.get(currentKey);
+					ctx.store.delete(currentKey);
+					ui?.notify(
+						existing
+							? "Cleared Antigravity session binding for this Pi session. Use /agy clear all to clear every session."
+							: "No Antigravity session bound for this Pi session. Use /agy clear all to clear every session.",
+						"info",
+					);
+					return;
+				}
+				ui?.notify("usage: /agy clear [all]", "warning");
 				return;
 			}
 			if (sub === "auth") {
@@ -1052,7 +1226,7 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 				return;
 			}
 			if (sub === "tasks") {
-				const conversationId = ctx.acpDriver.snapshot().conversationId ?? undefined;
+				const conversationId = resolveConversationId(ctx, cmdCtx);
 				if (!conversationId) {
 					ui?.notify("no Antigravity conversation bound yet; run a turn first.", "warning");
 					return;
@@ -1107,7 +1281,7 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 				return;
 			}
 			if (sub === "artifacts") {
-				const conversationId = ctx.acpDriver.snapshot().conversationId ?? undefined;
+				const conversationId = resolveConversationId(ctx, cmdCtx);
 				if (!conversationId) {
 					ui?.notify("no Antigravity conversation bound yet; run a turn first.", "warning");
 					return;

@@ -20,10 +20,12 @@ Install directly from GitHub via Pi's package manager:
 pi install git:github.com/reedjosh/ant-bridge
 ```
 
-Update to the latest commit at any time:
+Update installed extensions to the latest commit (or update only `ant-bridge`):
 
 ```sh
-pi update
+pi update --extensions
+# or update only ant-bridge:
+pi update git:github.com/reedjosh/ant-bridge
 ```
 
 If you previously installed `@estebanforge/pi-antigravity-bridge`, remove it first so two extensions do not register
@@ -77,7 +79,9 @@ Run `/agy` inside Pi to open the settings picker, or pass a subcommand:
 - `/agy tasks` - inspect background task logs in the bound conversation directory.
 - `/agy artifacts` - browse artifacts written in the bound conversation directory.
 - `/agy quota` - display model quota status from `agy usage`.
-- `/agy clear` - clear the conversation binding for the current Pi session so the next turn starts fresh.
+- `/agy clear` - clear the conversation binding for the current Pi session only so the next turn starts fresh (leaving
+  other open Pi sessions untouched).
+- `/agy clear all` - clear persisted conversation bindings across all Pi sessions.
 
 Configuration and session bindings are stored under `~/.pi/agent/antigravity-bridge/` (or
 `$PI_CODING_AGENT_DIR/antigravity-bridge/`).

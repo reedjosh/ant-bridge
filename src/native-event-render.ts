@@ -1,4 +1,4 @@
-// Entry renderer and output cleaner for `agy-native-event` transcript items.
+// Entry renderers and output cleaner for `agy-native-event` and `agy-poll-run` transcript items.
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,9 +10,12 @@ import {
 	type TuiMouseEvent,
 	type TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
+import type { PollRunData } from "./poll-fold.js";
 import type { NativeDisplayEvent } from "./provider.js";
 
 export const PREVIEW_LINES = 5;
+
+const POLL_TOOL_NAME = "bridge_poll_result";
 
 export type NativeThemeColor =
 	| "error"
@@ -36,6 +39,10 @@ export interface NativeEntryRenderOptions {
 
 export interface NativeCustomEntry {
 	data?: NativeDisplayEvent;
+}
+
+export interface PollRunCustomEntry {
+	data?: PollRunData;
 }
 
 interface EntryExpandState {
@@ -237,9 +244,43 @@ export function formatNativeEventLines(
 	return lines;
 }
 
-/** Create a custom-entry renderer wrapped in `MouseRegion` for per-entry left-click toggling. */
-export function createNativeEventEntryRenderer(): (
-	entry: NativeCustomEntry,
+/** Build styled transcript lines for a folded poll run in collapsed or expanded state. */
+export function formatPollRunLines(
+	run: PollRunData | undefined,
+	expanded: boolean,
+	options: NativeEntryRenderOptions,
+	theme: NativeRenderTheme,
+): string[] {
+	const count = run?.count ?? 0;
+	const stateSuffix = run?.state === "failed" ? ", failed" : "";
+	const label = `Poll ${run?.target ?? "bridge call"} (x${count}${stateSuffix})`;
+	let hint = "";
+	if (!expanded && run) {
+		const rawKey = options.keyHint?.("app.tools.expand", "");
+		const plainKey = rawKey ? stripTerminalSequences(rawKey).trim() : "";
+		const keyLabel = plainKey.length > 0 ? plainKey : "ctrl+o";
+		hint = ` ${theme.fg("dim", `(click or ${keyLabel})`)}`;
+	}
+	const lines = [
+		`[poll] ${theme.fg("toolTitle", POLL_TOOL_NAME)} ${theme.fg("muted", label)}${hint}`,
+	];
+	if (expanded && run) {
+		const time = (iso: string): string => new Date(iso).toLocaleTimeString();
+		const unit = count === 1 ? "poll" : "polls";
+		lines.push(theme.fg("dim", `${count} ${unit}, ${time(run.firstAt)} -> ${time(run.lastAt)}`));
+	}
+	return lines;
+}
+
+function createExpandableEntryRenderer<TEntry extends object>(
+	renderLines: (
+		entry: TEntry,
+		expanded: boolean,
+		options: NativeEntryRenderOptions,
+		theme: NativeRenderTheme,
+	) => string[],
+): (
+	entry: TEntry,
 	options: NativeEntryRenderOptions,
 	theme: NativeRenderTheme,
 ) => Component {
@@ -257,7 +298,7 @@ export function createNativeEventEntryRenderer(): (
 
 		const currentExpanded = (): boolean => state.localExpanded ?? state.lastGlobalExpanded;
 		const renderText = (expanded: boolean): string =>
-			formatNativeEventLines(entry.data, expanded, options, theme).join("\n");
+			renderLines(entry, expanded, options, theme).join("\n");
 
 		const text = new Text(renderText(currentExpanded()), 0, 0);
 		return new MouseRegion(text, (mouseEvent: TuiMouseEvent): TuiMouseEventResult | undefined => {
@@ -271,4 +312,26 @@ export function createNativeEventEntryRenderer(): (
 			return { handled: true };
 		});
 	};
+}
+
+/** Create a custom-entry renderer wrapped in `MouseRegion` for per-entry left-click toggling. */
+export function createNativeEventEntryRenderer(): (
+	entry: NativeCustomEntry,
+	options: NativeEntryRenderOptions,
+	theme: NativeRenderTheme,
+) => Component {
+	return createExpandableEntryRenderer((entry, expanded, options, theme) =>
+		formatNativeEventLines(entry.data, expanded, options, theme),
+	);
+}
+
+/** Create a custom-entry renderer for `agy-poll-run` rows with per-entry left-click toggling. */
+export function createPollRunEntryRenderer(): (
+	entry: PollRunCustomEntry,
+	options: NativeEntryRenderOptions,
+	theme: NativeRenderTheme,
+) => Component {
+	return createExpandableEntryRenderer((entry, expanded, options, theme) =>
+		formatPollRunLines(entry.data, expanded, options, theme),
+	);
 }

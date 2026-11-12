@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.2.0 - 2026-11-12
+
+- **Accurate per-turn usage and compaction isolation:** Normalize multi-inference `PromptResponse.usage` (`input_tokens`
+  and `cache_read_tokens`) over each turn's tool batches so Pi's context-overflow check and context gauge see
+  single-turn prompt counts instead of cumulative multi-inference billing sums. Isolate standalone compaction and
+  branch-summary calls (`cacheRetention: "none"`) onto ephemeral tool-free turns without mutating `SessionStore` or
+  streaming native tool events, and start a fresh compacted ACP session seeded once after Pi compacts a conversation.
+- **`xhigh` thinking effort and model display labels:** Support 4-tier `xhigh` reasoning effort (such as
+  `gemini-4-hydrogen`), project column-2 human display labels from `agy models` into Pi's `/model` picker, and align
+  `FALLBACK_MODELS` with live discovery.
+- **Prior-context seeding on `/fork` and provider switches:** Seed prior Pi transcript history once via `contextBlock`
+  when starting a fresh Antigravity conversation mid-session while keeping subsequent bound turns cache-clean.
+- **Session-scoped `/agy` commands and tab completion:** Scope `/agy clear`, `/agy tasks`, and `/agy artifacts` to the
+  active Pi session (keeping `/agy clear all` for global resets), add `/agy` argument completions, and document
+  `pi update --extensions`.
+- **Clickable poll-run rows, live tool status details, and clean log shutdown:** Wrap `agy-poll-run` entries in
+  `MouseRegion` for click-to-expand, include target details and active counts in live `agy-native` footer status, clear
+  native status after buffered events drain, and flush `DailyLogger` during `session_shutdown`.
+
 ## 2.1.0 - 2026-11-12
 
 - **Mid-turn steering interruption:** Send `session/cancel` to `agy acp` when the user steers during an active

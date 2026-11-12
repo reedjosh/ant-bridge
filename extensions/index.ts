@@ -7,7 +7,7 @@ import type {
 	ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import { getCurrentTools } from "@earendil-works/pi-ai";
-import { type SettingItem, Text } from "@earendil-works/pi-tui";
+import type { SettingItem } from "@earendil-works/pi-tui";
 import { AcpDriver } from "../src/acp/driver.js";
 import { sweepStaleAcpHomes } from "../src/acp/home.js";
 import {
@@ -59,6 +59,8 @@ import {
 import {
 	capNativeOutput,
 	createNativeEventEntryRenderer,
+	createPollRunEntryRenderer,
+	formatNativeEventDetail,
 } from "../src/native-event-render.js";
 import { PollRunFolder, type PollRunData } from "../src/poll-fold.js";
 import {
@@ -110,9 +112,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const FAIL_REASON_TURN_END = "antigravity turn ended with an unresolved pi tool call";
 	const FAIL_REASON_SHUTDOWN = "antigravity session shut down";
 
+	let logClosed = false;
 	const fileLog = createDailyLogger({ dir: logsDir() });
 	const rawFileLog = fileLog.log.bind(fileLog);
 	fileLog.log = (event, data, level) => {
+		if (event === "turn-start") logClosed = false;
+		if (logClosed) return;
 		rawFileLog(event, data, level);
 		if (level !== "warn") return;
 		if (event.startsWith("abort:") || event === "connection-exited") return;
@@ -231,22 +236,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		createNativeEventEntryRenderer(),
 	);
 
-	pi.registerEntryRenderer<PollRunData>("agy-poll-run", (entry, { expanded }, theme) => {
-		const run = entry.data;
-		const count = run?.count ?? 0;
-		const label = `Poll ${run?.target ?? "bridge call"} (x${count}${run?.state === "failed" ? ", failed" : ""})`;
-		const lines = [`[poll] ${theme.fg("toolTitle", POLL_TOOL_NAME)} ${theme.fg("muted", label)}`];
-		if (expanded && run) {
-			const time = (iso: string): string => new Date(iso).toLocaleTimeString();
-			lines.push(
-				theme.fg(
-					"dim",
-					`${count} ${count === 1 ? "poll" : "polls"}, ${time(run.firstAt)} -> ${time(run.lastAt)}`,
-				),
-			);
-		}
-		return new Text(lines.join("\n"), 0, 0);
-	});
+	pi.registerEntryRenderer<PollRunData>("agy-poll-run", createPollRunEntryRenderer());
 
 	let pendingNativeTools = 0;
 	const pollRuns = new PollRunFolder();
@@ -281,7 +271,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		if (/^pi-bridge(?:-\d+)?$/.test(event.mcpServer ?? "")) return;
 		if (event.status === "started") {
 			pendingNativeTools++;
-			setDimStatus("agy-native", `agy ${event.name}... (${pendingNativeTools})`);
+			const detail = formatNativeEventDetail(event);
+			const snippet = detail
+				? ` ${detail.length > 60 ? `${detail.slice(0, 57)}...` : detail}`
+				: "";
+			const ellipsis = snippet.endsWith("...") ? "" : "...";
+			const count = pendingNativeTools > 1 ? ` (${pendingNativeTools})` : "";
+			setDimStatus("agy-native", `agy ${event.name}${snippet}${ellipsis}${count}`);
 			return;
 		}
 		pendingNativeTools = Math.max(0, pendingNativeTools - 1);
@@ -536,6 +532,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		logClosed = false;
 		backgroundWatchDisposed = false;
 		if (ctx.hasUI) activeUi = ctx.ui;
 
@@ -725,6 +722,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		roundTrips.failAll(FAIL_REASON_SHUTDOWN);
 		await h?.close();
 		hiddenBridgeTools.clear();
+		logClosed = true;
+		await fileLog.flush();
 	});
 }
 

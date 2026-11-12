@@ -13,8 +13,10 @@ const {
   capNativeOutput,
   cleanNativeCommandOutput,
   createNativeEventEntryRenderer,
+  createPollRunEntryRenderer,
   formatNativeEventDetail,
   formatNativeEventLines,
+  formatPollRunLines,
 } = await importBridgeModule("src/native-event-render.ts");
 
 const tagTheme = {
@@ -465,22 +467,97 @@ test("MouseRegion entry renderer toggles per-entry on left click and syncs with 
   globalCollapsed.handleMouse(mouseEvent("click", "left", 0, 8));
   assert.equal(globalCollapsed.render(120).length, 7);
 
-  // Verify extensions/index.ts wires the MouseRegion renderer for agy-native-event.
+  // Verify extensions/index.ts wires MouseRegion renderers and live agy-native target status.
   const tmpAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "ant-bridge-ext-render-"));
+  const fakeHome = path.join(tmpAgentDir, "home");
+  fs.mkdirSync(path.join(tmpAgentDir, "antigravity-bridge"), { recursive: true });
+  fs.mkdirSync(fakeHome, { recursive: true });
+  fs.writeFileSync(
+    path.join(tmpAgentDir, "antigravity-bridge", "config.json"),
+    JSON.stringify({ bridgeTools: "none" }),
+  );
+  const fakeRelay = path.join(tmpAgentDir, "fake-agy.mjs");
+  const fakeLauncher = path.join(tmpAgentDir, "fake-agy.sh");
+  fs.writeFileSync(
+    fakeRelay,
+    [
+      'if (process.argv[2] === "models") {',
+      '  process.stdout.write("gemini-4-carbon-high  Gemini 4 Carbon (High)\\n");',
+      "  process.exit(0);",
+      "}",
+      'if (process.argv[2] === "--version") {',
+      '  process.stdout.write("1.5.4\\n");',
+      "  process.exit(0);",
+      "}",
+      'process.stdin.setEncoding("utf8");',
+      'let buf = "";',
+      'const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");',
+      'process.stdin.on("data", (chunk) => {',
+      "  buf += chunk;",
+      '  const lines = buf.split("\\n");',
+      '  buf = lines.pop() ?? "";',
+      "  for (const line of lines) {",
+      "    if (!line.trim()) continue;",
+      "    const msg = JSON.parse(line);",
+      '    if (msg.method === "initialize") {',
+      "      const agentInfo = { name: \"mock\", version: \"1.5.4\" };",
+      '      send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentInfo } });',
+      '    } else if (msg.method === "session/new") {',
+      '      send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-status", configOptions: [] } });',
+      '    } else if (msg.method === "session/set_config_option") {',
+      '      send({ jsonrpc: "2.0", id: msg.id, result: { configOptions: [] } });',
+      '    } else if (msg.method === "session/prompt") {',
+      "      const sid = msg.params.sessionId;",
+      "      const upd = (update) =>",
+      '        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid, update } });',
+      '      const rInput = { Path: "src/provider.ts", StartLine: 10, EndLine: 20 };',
+      '      upd({ sessionUpdate: "tool_call", toolCallId: "t1", name: "read_file", rawInput: rInput });',
+      '      const cInput = { CommandLine: "a".repeat(70) };',
+      '      upd({ sessionUpdate: "tool_call", toolCallId: "t2", name: "run_command", rawInput: cInput });',
+      '      upd({ sessionUpdate: "tool_call", toolCallId: "t3", name: "list_resources", rawInput: { x: 1 } });',
+      '      upd({ sessionUpdate: "tool_call_update", toolCallId: "t1", status: "completed", rawOutput: "ok" });',
+      '      upd({ sessionUpdate: "tool_call_update", toolCallId: "t2", status: "completed", rawOutput: "ok" });',
+      '      upd({ sessionUpdate: "tool_call_update", toolCallId: "t3", status: "completed", rawOutput: "ok" });',
+      '      upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "done" } });',
+      '      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });',
+      "    }",
+      "  }",
+      "});",
+    ].join("\n"),
+  );
+  fs.writeFileSync(
+    fakeLauncher,
+    `#!/bin/sh\nexec "${process.execPath}" "${fakeRelay}" "$@"\n`,
+    { mode: 0o755 },
+  );
+
   const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const prevHome = process.env.HOME;
+  const prevAgyBin = process.env.AGY_BIN;
   process.env.PI_CODING_AGENT_DIR = tmpAgentDir;
+  process.env.HOME = fakeHome;
+  process.env.AGY_BIN = fakeLauncher;
+  const handlers = new Map();
+  const providers = new Map();
+  const nativeStatuses = [];
   try {
     const extMod = await importBridgeModule("extensions/index.ts");
     const entryRenderers = new Map();
     await extMod.default({
-      registerProvider() {},
+      registerProvider(id, spec) {
+        providers.set(id, spec);
+      },
       registerCommand() {},
       registerTool() {},
       registerEntryRenderer(customType, fn) {
         entryRenderers.set(customType, fn);
       },
       registerMessageRenderer() {},
-      on() {},
+      on(event, fn) {
+        const list = handlers.get(event) ?? [];
+        list.push(fn);
+        handlers.set(event, list);
+      },
       getAllTools: () => [],
       getActiveTools: () => [],
       appendEntry() {},
@@ -491,9 +568,167 @@ test("MouseRegion entry renderer toggles per-entry on left click and syncs with 
     assert.equal(typeof wired, "function");
     const rendered = wired(entry, { expanded: false }, plainTheme);
     assert.equal(rendered instanceof MouseRegion, true);
+
+    const wiredPoll = entryRenderers.get("agy-poll-run");
+    assert.equal(typeof wiredPoll, "function");
+    const pollEntry = {
+      customType: "agy-poll-run",
+      data: {
+        target: "git_commit",
+        count: 2,
+        state: "done",
+        firstAt: "2026-11-12T20:00:00.000Z",
+        lastAt: "2026-11-12T20:00:04.000Z",
+      },
+    };
+    const renderedPoll = wiredPoll(pollEntry, { expanded: false }, plainTheme);
+    assert.equal(renderedPoll instanceof MouseRegion, true);
+    assert.equal(renderedPoll.render(120).length, 1);
+    assert.equal(renderedPoll.handleMouse(mouseEvent("click", "left", 0, 1))?.handled, true);
+    assert.equal(renderedPoll.render(120).length, 2);
+
+    const mockUi = {
+      theme: plainTheme,
+      setStatus(key, text) {
+        if (key === "agy-native") nativeStatuses.push(text);
+      },
+      notify() {},
+    };
+    for (const fn of handlers.get("session_start") ?? []) {
+      await fn(
+        { type: "session_start", reason: "startup" },
+        {
+          hasUI: true,
+          mode: "rpc",
+          ui: mockUi,
+          isProjectTrusted: () => false,
+          sessionManager: { getEntries: () => [], getBranch: () => [] },
+        },
+      );
+    }
+
+    const providerSpec = providers.get("antigravity");
+    const stream = providerSpec.streamSimple(
+      providerSpec.models[0],
+      { messages: [{ role: "user", content: "Check status", timestamp: 1 }] },
+      { cwd: tmpAgentDir, sessionId: "status-1" },
+    );
+    const resMsg = await stream.result();
+    assert.equal(resMsg.stopReason, "stop");
+    assert.deepEqual(nativeStatuses.slice(0, 4), [
+      "agy read_file provider.ts:10-20...",
+      `agy run_command ${"a".repeat(57)}... (2)`,
+      "agy list_resources... (3)",
+      undefined,
+    ]);
   } finally {
+    for (const fn of handlers.get("session_shutdown") ?? []) {
+      await fn({}, { hasUI: false, ui: {} });
+    }
     if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    if (prevAgyBin === undefined) delete process.env.AGY_BIN;
+    else process.env.AGY_BIN = prevAgyBin;
     fs.rmSync(tmpAgentDir, { recursive: true, force: true });
   }
+});
+
+test("createPollRunEntryRenderer toggles poll rows on left click and syncs with global Ctrl+O", () => {
+  const firstAt = "2026-11-12T20:00:00.000Z";
+  const lastAt = "2026-11-12T20:00:08.000Z";
+  const expectedFirst = new Date(firstAt).toLocaleTimeString();
+  const expectedLast = new Date(lastAt).toLocaleTimeString();
+
+  assert.deepEqual(formatPollRunLines(undefined, false, { expanded: false }, plainTheme), [
+    "[poll] bridge_poll_result Poll bridge call (x0)",
+  ]);
+
+  assert.deepEqual(
+    formatPollRunLines(
+      { target: "codemode", count: 2, state: "failed", firstAt, lastAt },
+      false,
+      { expanded: false, keyHint: () => "ctrl+e " },
+      tagTheme,
+    ),
+    [
+      "[poll] <toolTitle>bridge_poll_result</toolTitle> " +
+        "<muted>Poll codemode (x2, failed)</muted> <dim>(click or ctrl+e)</dim>",
+    ],
+  );
+
+  assert.deepEqual(
+    formatPollRunLines(
+      { target: "subagent", count: 1, state: "done", firstAt, lastAt },
+      true,
+      { expanded: true },
+      plainTheme,
+    ),
+    [
+      "[poll] bridge_poll_result Poll subagent (x1)",
+      `1 poll, ${expectedFirst} -> ${expectedLast}`,
+    ],
+  );
+
+  const renderer = createPollRunEntryRenderer();
+  const entry = {
+    customType: "agy-poll-run",
+    data: { target: "git_commit", count: 4, state: "done", firstAt, lastAt },
+  };
+  const otherEntry = {
+    customType: "agy-poll-run",
+    data: { target: "slack_search", count: 2, state: "running", firstAt, lastAt },
+  };
+
+  const comp = renderer(entry, { expanded: false }, plainTheme);
+  assert.equal(comp instanceof MouseRegion, true);
+
+  const host = new Container();
+  host.addChild(comp);
+
+  const collapsedLines = host.render(120).map((l) => l.trimEnd());
+  assert.deepEqual(collapsedLines, [
+    "[poll] bridge_poll_result Poll git_commit (x4) (click or ctrl+o)",
+  ]);
+
+  // Press and right-click are ignored so text selection and context actions work.
+  assert.equal(host.handleMouse(mouseEvent("press", "left", 0, 1)), undefined);
+  assert.equal(host.handleMouse(mouseEvent("click", "right", 0, 1)), undefined);
+
+  // Left-click expands this poll entry while leaving sibling poll entries collapsed.
+  assert.equal(host.handleMouse(mouseEvent("click", "left", 0, 1))?.handled, true);
+  assert.deepEqual(
+    host.render(120).map((l) => l.trimEnd()),
+    [
+      "[poll] bridge_poll_result Poll git_commit (x4)",
+      `4 polls, ${expectedFirst} -> ${expectedLast}`,
+    ],
+  );
+  assert.deepEqual(
+    renderer(otherEntry, { expanded: false }, plainTheme)
+      .render(120)
+      .map((l) => l.trimEnd()),
+    ["[poll] bridge_poll_result Poll slack_search (x2) (click or ctrl+o)"],
+  );
+
+  // Rebuild with unchanged global expanded=false preserves local click expansion.
+  const rebuiltSameGlobal = renderer(entry, { expanded: false }, plainTheme);
+  assert.equal(rebuiltSameGlobal.render(120).length, 2);
+
+  // Global Ctrl+O toggle (false -> true -> false) resets local override and syncs cleanly.
+  const globalExpanded = renderer(entry, { expanded: true }, plainTheme);
+  assert.equal(globalExpanded.render(120).length, 2);
+
+  const globalCollapsed = renderer(entry, { expanded: false }, plainTheme);
+  assert.deepEqual(
+    globalCollapsed.render(120).map((l) => l.trimEnd()),
+    ["[poll] bridge_poll_result Poll git_commit (x4) (click or ctrl+o)"],
+  );
+
+  // Direct left-click toggles expanded -> collapsed.
+  globalCollapsed.handleMouse(mouseEvent("click", "left", 0, 1));
+  assert.equal(globalCollapsed.render(120).length, 2);
+  globalCollapsed.handleMouse(mouseEvent("click", "left", 0, 2));
+  assert.equal(globalCollapsed.render(120).length, 1);
 });

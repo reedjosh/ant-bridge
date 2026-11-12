@@ -934,4 +934,7 @@ test("extension input handler interrupts only active non-parked antigravity stee
     else process.env.AGY_DEBUG = prevDebug;
     await h.close();
   }
+  assert.equal(fs.existsSync(h.tmpDir), false);
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(fs.existsSync(h.tmpDir), false);
 });

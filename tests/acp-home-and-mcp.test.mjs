@@ -9,6 +9,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { importBridgeModule } from "./helpers/pi-loader.mjs";
 
 const { AcpConnection } = await importBridgeModule("src/acp/connection.ts");
+const { mapUpdate } = await importBridgeModule("src/acp/events.ts");
 const {
   acpHomeDir,
   acpHomeStagingDir,
@@ -38,6 +39,8 @@ test(
         mcpServers: {
           "pi-bridge": { url: "http://127.0.0.1:9999/mcp" },
           "pi-bridge-12345": { url: "http://127.0.0.1:9998/mcp" },
+          "pi-bridge-slack": { url: "http://127.0.0.1:9997/mcp/ns/slack" },
+          "pi-bridge-claude-in-chrome": { url: "http://127.0.0.1:9997/mcp/ns/claude-in-chrome" },
           "custom-server": { command: "echo", args: ["ok"] },
         },
       }),
@@ -365,4 +368,296 @@ test("startMcpServer enforces x-bridge-token and serves tools/list and tools/cal
   } finally {
     await handle.close();
   }
+});
+
+test(
+  "startMcpServer routes /mcp, /mcp/pi-bridge, and /mcp/ns/<ns>, resolves instructions, and fast-fails server/discover",
+  async () => {
+    const listCalls = [];
+    const toolCalls = [];
+    const instructionCalls = [];
+
+    const started = await startMcpServer({
+      instructions: (route) => {
+        instructionCalls.push(route);
+        if (route === "pi-bridge") return "Core bridge instructions";
+        if (route === "ns:slack") return "Slack namespace instructions";
+        return "   ";
+      },
+      listTools: (route) => {
+        listCalls.push(route);
+        if (route === "ns:slack") {
+          return [
+            {
+              name: "search",
+              description: "Search Slack",
+              inputSchema: { type: "object", properties: { q: { type: "string" } } },
+            },
+          ];
+        }
+        return [
+          {
+            name: "core_ping",
+            description: "Ping core",
+            inputSchema: { type: "object", properties: {} },
+          },
+        ];
+      },
+      onToolCall: async (_callId, name, args, _signal, route) => {
+        toolCalls.push({ name, args, route });
+        return {
+          content: [{ type: "text", text: `${route}:${name}:${JSON.stringify(args)}` }],
+          isError: false,
+        };
+      },
+    });
+
+    assert.equal(started.ok, true);
+    const { handle } = started;
+    const base = `http://127.0.0.1:${handle.port}`;
+    const authHeaders = {
+      [TOKEN_HEADER]: handle.token,
+      "content-type": "application/json",
+    };
+
+    try {
+      // Pre-auth /.well-known/ returns 404 even on GET without x-bridge-token.
+      const wellKnown = await fetch(`${base}/.well-known/oauth-protected-resource`);
+      assert.equal(wellKnown.status, 404);
+      assert.deepEqual(await wellKnown.json(), { error: "not found" });
+
+      // Unknown routes return 404 {"error":"not found"}.
+      for (const badPath of [
+        "/unknown",
+        "/mcp/other",
+        "/mcp/ns/",
+        "/mcp/ns/UPPER",
+        "/mcp/ns/foo_bar",
+        "/mcp/ns/a/b",
+        "/mcp/ns/..",
+      ]) {
+        const badRes = await fetch(`${base}${badPath}`, {
+          method: "POST",
+          headers: authHeaders,
+          body: "{}",
+        });
+        assert.equal(badRes.status, 404, `expected 404 for ${badPath}`);
+        assert.deepEqual(await badRes.json(), { error: "not found" });
+      }
+
+      // server/discover fast-fails without instantiating Server (no instructions resolution).
+      const beforeInstrCount = instructionCalls.length;
+      const discoverWithId = await fetch(`${base}/mcp`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ jsonrpc: "2.0", id: 42, method: "server/discover" }),
+      });
+      assert.equal(discoverWithId.status, 200);
+      assert.match(discoverWithId.headers.get("content-type") ?? "", /application\/json/);
+      assert.deepEqual(await discoverWithId.json(), {
+        jsonrpc: "2.0",
+        id: 42,
+        error: { code: -32601, message: "Method not found" },
+      });
+
+      const discoverZeroId = await fetch(`${base}/mcp/ns/slack`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "server/discover" }),
+      });
+      assert.equal(discoverZeroId.status, 200);
+      assert.deepEqual(await discoverZeroId.json(), {
+        jsonrpc: "2.0",
+        id: 0,
+        error: { code: -32601, message: "Method not found" },
+      });
+
+      const discoverNoId = await fetch(`${base}/mcp/pi-bridge`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ jsonrpc: "2.0", method: "server/discover" }),
+      });
+      assert.equal(discoverNoId.status, 200);
+      assert.deepEqual(await discoverNoId.json(), {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32601, message: "Method not found" },
+      });
+      assert.equal(instructionCalls.length, beforeInstrCount);
+
+      // Connect MCP client to /mcp/pi-bridge -> route "pi-bridge", serverName "pi-bridge".
+      const coreClient = new Client({ name: "test-core", version: "1.0.0" });
+      await coreClient.connect(
+        new StreamableHTTPClientTransport(new URL(`${base}/mcp/pi-bridge`), {
+          requestInit: { headers: { [TOKEN_HEADER]: handle.token } },
+        }),
+      );
+      assert.equal(coreClient.getServerVersion()?.name, "pi-bridge");
+      assert.equal(coreClient.getInstructions(), "Core bridge instructions");
+      const coreListed = await coreClient.listTools();
+      assert.deepEqual(
+        coreListed.tools.map((t) => t.name),
+        ["core_ping"],
+      );
+      const coreCalled = await coreClient.callTool({ name: "core_ping", arguments: {} });
+      assert.equal(coreCalled.content[0].text, "pi-bridge:core_ping:{}");
+      await coreClient.close();
+
+      // Connect MCP client to /mcp/ns/slack -> route "ns:slack", serverName "pi-bridge-slack".
+      const slackClient = new Client({ name: "test-slack", version: "1.0.0" });
+      await slackClient.connect(
+        new StreamableHTTPClientTransport(new URL(`${base}/mcp/ns/slack`), {
+          requestInit: { headers: { [TOKEN_HEADER]: handle.token } },
+        }),
+      );
+      assert.equal(slackClient.getServerVersion()?.name, "pi-bridge-slack");
+      assert.equal(slackClient.getInstructions(), "Slack namespace instructions");
+      const slackListed = await slackClient.listTools();
+      assert.deepEqual(
+        slackListed.tools.map((t) => t.name),
+        ["search"],
+      );
+      const slackCalled = await slackClient.callTool({
+        name: "search",
+        arguments: { q: "deploy" },
+      });
+      assert.equal(slackCalled.content[0].text, 'ns:slack:search:{"q":"deploy"}');
+      await slackClient.close();
+
+      // Blank instructions resolve to undefined on /mcp/ns/empty-instr.
+      const quietClient = new Client({ name: "test-quiet", version: "1.0.0" });
+      await quietClient.connect(
+        new StreamableHTTPClientTransport(new URL(`${base}/mcp/ns/empty-instr`), {
+          requestInit: { headers: { [TOKEN_HEADER]: handle.token } },
+        }),
+      );
+      assert.equal(quietClient.getServerVersion()?.name, "pi-bridge-empty-instr");
+      assert.equal(quietClient.getInstructions(), undefined);
+      await quietClient.close();
+
+      assert.deepEqual(listCalls, ["pi-bridge", "ns:slack"]);
+      assert.deepEqual(toolCalls, [
+        { name: "core_ping", args: {}, route: "pi-bridge" },
+        { name: "search", args: { q: "deploy" }, route: "ns:slack" },
+      ]);
+    } finally {
+      await handle.close();
+    }
+  },
+);
+
+test("startMcpServer accepts static string instructions", async () => {
+  const started = await startMcpServer({
+    instructions: "Static bridge guidance",
+    listTools: () => [],
+    onToolCall: async () => ({ content: [{ type: "text", text: "ok" }], isError: false }),
+  });
+  assert.equal(started.ok, true);
+  const { handle } = started;
+  try {
+    const client = new Client({ name: "test-static", version: "1.0.0" });
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${handle.port}/mcp`), {
+        requestInit: { headers: { [TOKEN_HEADER]: handle.token } },
+      }),
+    );
+    assert.equal(client.getServerVersion()?.name, "pi-bridge");
+    assert.equal(client.getInstructions(), "Static bridge guidance");
+    await client.close();
+  } finally {
+    await handle.close();
+  }
+});
+
+test("mapUpdate tags native mcp_pi-bridge* tools and call_mcp_tool targeting pi-bridge* servers", () => {
+  // Eagerly registered namespace MCP tool: mcp_pi-bridge-<ns>_<tool>
+  const eagerStart = mapUpdate({
+    sessionUpdate: "tool_call",
+    toolCallId: "tc-ns-1",
+    name: "mcp_pi-bridge-claude-in-chrome_read_page",
+    rawInput: { arguments: { tabId: 3 } },
+  });
+  assert.equal(eagerStart.kind, "tool_start");
+  assert.equal(eagerStart.name, "read_page");
+  assert.equal(eagerStart.mcpServer, "pi-bridge-claude-in-chrome");
+  assert.deepEqual(eagerStart.args, { tabId: 3 });
+
+  const eagerDone = mapUpdate({
+    sessionUpdate: "tool_call_update",
+    toolCallId: "tc-ns-1",
+    status: "completed",
+    name: "mcp_pi-bridge-claude-in-chrome_read_page",
+    content: [{ type: "content", content: { type: "text", text: "page body" } }],
+  });
+  assert.equal(eagerDone.kind, "tool_done");
+  assert.equal(eagerDone.mcpServer, "pi-bridge-claude-in-chrome");
+
+  // Unrelated native MCP server stays untagged without _meta.
+  const externalMcp = mapUpdate({
+    sessionUpdate: "tool_call",
+    toolCallId: "tc-ext-1",
+    name: "mcp_github_list_issues",
+    rawInput: {},
+  });
+  assert.equal(externalMcp.mcpServer, undefined);
+
+  // Lazily invoked call_mcp_tool targeting pi-bridge* via ServerName / serverName / server.
+  const lazyStart = mapUpdate({
+    sessionUpdate: "tool_call",
+    toolCallId: "tc-lazy-1",
+    name: "call_mcp_tool",
+    rawInput: { ServerName: "pi-bridge-slack", ToolName: "search", Arguments: { q: "incident" } },
+  });
+  assert.equal(lazyStart.kind, "tool_start");
+  assert.equal(lazyStart.name, "call_mcp_tool");
+  assert.equal(lazyStart.mcpServer, "pi-bridge-slack");
+
+  const lazyDoneCamel = mapUpdate({
+    sessionUpdate: "tool_call_update",
+    toolCallId: "tc-lazy-1",
+    status: "completed",
+    name: "call_mcp_tool",
+    rawInput: { arguments: { serverName: "pi-bridge", toolName: "codemode" } },
+    rawOutput: "done",
+  });
+  assert.equal(lazyDoneCamel.kind, "tool_done");
+  assert.equal(lazyDoneCamel.mcpServer, "pi-bridge");
+
+  const lazyFailedShort = mapUpdate({
+    sessionUpdate: "tool_call_update",
+    toolCallId: "tc-lazy-2",
+    status: "failed",
+    title: "Running call_mcp_tool",
+    rawInput: { server: "pi-bridge-linear" },
+    rawOutput: "boom",
+  });
+  assert.equal(lazyFailedShort.kind, "tool_error");
+  assert.equal(lazyFailedShort.mcpServer, "pi-bridge-linear");
+
+  const lazyProgress = mapUpdate({
+    sessionUpdate: "tool_call_update",
+    toolCallId: "tc-lazy-3",
+    status: "in_progress",
+    name: "call_mcp_tool",
+    rawInput: { ServerName: "pi-bridge-github" },
+  });
+  assert.equal(lazyProgress.kind, "tool_update");
+  assert.equal(lazyProgress.mcpServer, "pi-bridge-github");
+
+  // call_mcp_tool targeting non-bridge server or non-call_mcp_tool with server arg stays undefined.
+  const nonBridgeLazy = mapUpdate({
+    sessionUpdate: "tool_call",
+    toolCallId: "tc-lazy-ext",
+    name: "call_mcp_tool",
+    rawInput: { ServerName: "external-mcp", ToolName: "ping" },
+  });
+  assert.equal(nonBridgeLazy.mcpServer, undefined);
+
+  const unrelatedWithServerArg = mapUpdate({
+    sessionUpdate: "tool_call",
+    toolCallId: "tc-other",
+    name: "edit_file",
+    rawInput: { Path: "a.ts", server: "pi-bridge" },
+  });
+  assert.equal(unrelatedWithServerArg.mcpServer, undefined);
 });

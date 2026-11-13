@@ -2,7 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { importBridgeModule } from "./helpers/pi-loader.mjs";
 
-const { bridgedPiTools } = await importBridgeModule("src/bridge-catalog.ts");
+const {
+  PI_BRIDGE_SERVER_PREFIX,
+  PI_BRIDGE_SERVER_RE,
+  bridgeCatalogFingerprint,
+  bridgedPiTools,
+  parseMcpBridgeToolName,
+  partitionBridgeTools,
+} = await importBridgeModule("src/bridge-catalog.ts");
 
 const ALL_TOOLS = [
   { name: "read", sourceInfo: { path: "builtin:read", source: "builtin" } },
@@ -56,4 +63,123 @@ test("legacy pathless builtin fixtures still exclude core tools by name", () => 
   ];
   const names = bridgedPiTools(legacy, ["read", "bash", "subagent"], "all", new Set()).map((t) => t.name);
   assert.deepEqual(names, ["subagent"]);
+});
+
+test("PI_BRIDGE_SERVER_PREFIX and PI_BRIDGE_SERVER_RE match pi-bridge and namespace server names", () => {
+  assert.equal(PI_BRIDGE_SERVER_PREFIX, "pi-bridge");
+  for (const valid of ["pi-bridge", "pi-bridge-12345", "pi-bridge-slack", "pi-bridge-Google-Workspace-2"]) {
+    assert.equal(PI_BRIDGE_SERVER_RE.test(valid), true, `expected ${valid} to match`);
+  }
+  for (const invalid of ["", "pi-bridge-", "pi-bridge_slack", "pi-bridge/slack", "other-server"]) {
+    assert.equal(PI_BRIDGE_SERVER_RE.test(invalid), false, `expected ${invalid} not to match`);
+  }
+});
+
+test("parseMcpBridgeToolName normalizes mcp__<ns>__<tool> names and falls back to mcp route", () => {
+  assert.equal(parseMcpBridgeToolName("codemode"), null);
+  assert.equal(parseMcpBridgeToolName("read_mcp_resource"), null);
+  assert.equal(parseMcpBridgeToolName("mcp_single_sep"), null);
+  assert.equal(parseMcpBridgeToolName("mcp__bad.ns__tool"), null);
+
+  assert.deepEqual(parseMcpBridgeToolName("mcp__slack__search_messages"), {
+    rawNamespace: "slack",
+    routeName: "slack",
+    serverName: "pi-bridge-slack",
+    shortToolName: "search_messages",
+  });
+
+  assert.deepEqual(parseMcpBridgeToolName("mcp__Google_Workspace__list_events"), {
+    rawNamespace: "Google_Workspace",
+    routeName: "google-workspace",
+    serverName: "pi-bridge-google-workspace",
+    shortToolName: "list_events",
+  });
+
+  assert.deepEqual(parseMcpBridgeToolName("mcp__---__ping"), {
+    rawNamespace: "---",
+    routeName: "mcp",
+    serverName: "pi-bridge-mcp",
+    shortToolName: "ping",
+  });
+
+  assert.deepEqual(parseMcpBridgeToolName("mcp_____ping"), {
+    rawNamespace: "_",
+    routeName: "mcp",
+    serverName: "pi-bridge-mcp",
+    shortToolName: "ping",
+  });
+});
+
+test("partitionBridgeTools separates coreTools, sorts namespaces, and resolves shortToolName collisions", () => {
+  const catalog = [
+    { name: "codemode" },
+    { name: "mcp__zendesk__get_ticket" },
+    { name: "mcp__foo_bar__run" },
+    { name: "mcp__foo-bar__run" },
+    { name: "mcp__foo_bar__status" },
+    { name: "subagent" },
+    { name: "mcp__alpha__ping" },
+  ];
+
+  const partitioned = partitionBridgeTools(catalog);
+  assert.deepEqual(
+    partitioned.coreTools.map((t) => t.name),
+    ["codemode", "subagent"],
+  );
+  assert.deepEqual(
+    partitioned.namespaces.map((ns) => ({ routeName: ns.routeName, serverName: ns.serverName })),
+    [
+      { routeName: "alpha", serverName: "pi-bridge-alpha" },
+      { routeName: "foo-bar", serverName: "pi-bridge-foo-bar" },
+      { routeName: "zendesk", serverName: "pi-bridge-zendesk" },
+    ],
+  );
+
+  const fooBar = partitioned.namespaces.find((ns) => ns.routeName === "foo-bar");
+  assert.deepEqual(
+    fooBar.tools.map((item) => ({ piName: item.piName, exposedName: item.exposedName })),
+    [
+      { piName: "mcp__foo_bar__run", exposedName: "mcp__foo_bar__run" },
+      { piName: "mcp__foo-bar__run", exposedName: "mcp__foo-bar__run" },
+      { piName: "mcp__foo_bar__status", exposedName: "status" },
+    ],
+  );
+
+  const alpha = partitioned.namespaces.find((ns) => ns.routeName === "alpha");
+  assert.deepEqual(
+    alpha.tools.map((item) => ({ piName: item.piName, exposedName: item.exposedName })),
+    [{ piName: "mcp__alpha__ping", exposedName: "ping" }],
+  );
+});
+
+test("bridgeCatalogFingerprint returns deterministic SHA-256 hex invariant to input ordering", () => {
+  const toolsA = [
+    { name: "codemode", description: "desc 1" },
+    { name: "mcp__slack__search", description: "s1" },
+    { name: "mcp__github__list_prs", description: "g1" },
+  ];
+  const toolsB = [
+    { name: "mcp__github__list_prs", description: "different description" },
+    { name: "codemode", description: "different core description" },
+    { name: "mcp__slack__search", description: "s2" },
+  ];
+
+  const fpDefault = bridgeCatalogFingerprint(toolsA);
+  assert.match(fpDefault, /^[0-9a-f]{64}$/);
+  assert.equal(fpDefault, bridgeCatalogFingerprint(toolsB, []));
+
+  const fpWithExtras1 = bridgeCatalogFingerprint(toolsA, ["skill:pdf", "skill:docx"]);
+  const fpWithExtras2 = bridgeCatalogFingerprint(toolsB, ["skill:docx", "skill:pdf"]);
+  assert.equal(fpWithExtras1, fpWithExtras2);
+  assert.notEqual(fpWithExtras1, fpDefault);
+
+  const fpAddedTool = bridgeCatalogFingerprint([...toolsA, { name: "subagent" }], ["skill:pdf", "skill:docx"]);
+  assert.notEqual(fpAddedTool, fpWithExtras1);
+
+  const fpCollision = bridgeCatalogFingerprint([
+    { name: "mcp__foo_bar__run" },
+    { name: "mcp__foo-bar__run" },
+  ]);
+  const fpSingle = bridgeCatalogFingerprint([{ name: "mcp__foo_bar__run" }]);
+  assert.notEqual(fpCollision, fpSingle);
 });

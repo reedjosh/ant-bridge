@@ -3,6 +3,7 @@ import type { BridgeTools } from "./config.js";
 
 export const PI_BRIDGE_SERVER_PREFIX = "pi-bridge";
 export const PI_BRIDGE_SERVER_RE = /^pi-bridge(?:-[a-zA-Z0-9-]+)?$/;
+export const CALL_PI_TOOL_NAME = "call_pi_tool";
 
 const MCP_BRIDGE_TOOL_RE = /^mcp__([a-zA-Z0-9_-]+?)__(.+)$/;
 
@@ -53,7 +54,7 @@ const CORE_BUILTIN_TOOLS = new Set(["read", "bash", "powershell", "edit", "write
 const CORE_BUILTIN_PATHS = new Set([...CORE_BUILTIN_TOOLS].map((name) => `builtin:${name}`));
 
 /** Bridge-local pseudo-tools registered on the MCP endpoint itself (never Pi round-trips). */
-const SELF_TOOLS = new Set(["bridge_poll_result", "activate_skill"]);
+const SELF_TOOLS = new Set(["bridge_poll_result", CALL_PI_TOOL_NAME, "activate_skill"]);
 
 function isCoreBuiltin(tool: BridgeToolInfo): boolean {
 	if (tool.sourceInfo?.source !== "builtin") return false;
@@ -183,4 +184,132 @@ export function bridgeCatalogFingerprint(
 		.createHash("sha256")
 		.update(JSON.stringify({ tools: toolEntries, extraTokens: sortedExtras }))
 		.digest("hex");
+}
+
+export type ResolvedCallPiToolTarget =
+	| { kind: "self"; name: "bridge_poll_result" | "activate_skill" }
+	| { kind: "tool"; piName: string; tool: BridgeToolInfo }
+	| { kind: "ambiguous"; requested: string; candidates: string[] }
+	| { kind: "recursive" }
+	| { kind: "not_found"; requested: string };
+
+/** Resolve any tool identifier passed to `call_pi_tool` into its canonical Pi or bridge target. */
+export function resolveCallPiToolTarget(
+	rawName: string,
+	tools: BridgeToolInfo[],
+	serverPrefix: string = PI_BRIDGE_SERVER_PREFIX,
+): ResolvedCallPiToolTarget {
+	const requested = rawName.trim();
+	if (!requested) return { kind: "not_found", requested };
+
+	const corePrefixes =
+		serverPrefix === PI_BRIDGE_SERVER_PREFIX
+			? [PI_BRIDGE_SERVER_PREFIX]
+			: [serverPrefix, PI_BRIDGE_SERVER_PREFIX];
+	let unwrappedCore = requested;
+	for (const srv of corePrefixes) {
+		if (requested.startsWith(`${srv}/`) || requested.startsWith(`${srv}:`)) {
+			unwrappedCore = requested.slice(srv.length + 1);
+			break;
+		}
+		if (requested.startsWith(`mcp_${srv}_`)) {
+			unwrappedCore = requested.slice(`mcp_${srv}_`.length);
+			break;
+		}
+	}
+
+	if (unwrappedCore === CALL_PI_TOOL_NAME) return { kind: "recursive" };
+	if (unwrappedCore === "bridge_poll_result" || unwrappedCore === "activate_skill") {
+		return { kind: "self", name: unwrappedCore };
+	}
+
+	const { coreTools, namespaces } = partitionBridgeTools(tools, serverPrefix);
+	const coreMatch = coreTools.find((t) => t.name === requested || t.name === unwrappedCore);
+	if (coreMatch) return { kind: "tool", piName: coreMatch.name, tool: coreMatch };
+
+	for (const ns of namespaces) {
+		for (const item of ns.tools) {
+			if (item.piName === requested) {
+				return { kind: "tool", piName: item.piName, tool: item.tool };
+			}
+		}
+	}
+
+	for (const ns of namespaces) {
+		const srvNames = new Set([ns.serverName, `${PI_BRIDGE_SERVER_PREFIX}-${ns.routeName}`]);
+		for (const srv of srvNames) {
+			const mcpPrefix = `mcp_${srv}_`;
+			if (requested.startsWith(mcpPrefix)) {
+				const rest = requested.slice(mcpPrefix.length);
+				const item = ns.tools.find((entry) => entry.exposedName === rest || entry.piName === rest);
+				if (item) return { kind: "tool", piName: item.piName, tool: item.tool };
+			}
+		}
+	}
+
+	const sepIdx = requested.search(/[/:]/);
+	if (sepIdx > 0) {
+		const prefix = requested.slice(0, sepIdx);
+		const rest = requested.slice(sepIdx + 1);
+		const ns = namespaces.find(
+			(entry) =>
+				entry.serverName === prefix ||
+				entry.routeName === prefix ||
+				`${PI_BRIDGE_SERVER_PREFIX}-${entry.routeName}` === prefix,
+		);
+		const item = ns?.tools.find((entry) => entry.exposedName === rest || entry.piName === rest);
+		if (item) return { kind: "tool", piName: item.piName, tool: item.tool };
+	}
+
+	const bareMatches: Array<{ serverName: string; item: PartitionedNamespaceTool }> = [];
+	for (const ns of namespaces) {
+		for (const item of ns.tools) {
+			if (item.exposedName === requested) {
+				bareMatches.push({ serverName: ns.serverName, item });
+			}
+		}
+	}
+	if (bareMatches.length === 1) {
+		const only = bareMatches[0]!;
+		return { kind: "tool", piName: only.item.piName, tool: only.item.tool };
+	}
+	if (bareMatches.length > 1) {
+		return {
+			kind: "ambiguous",
+			requested,
+			candidates: bareMatches.map((m) => `${m.serverName}/${m.item.exposedName}`),
+		};
+	}
+
+	return { kind: "not_found", requested };
+}
+
+/** Normalize `call_pi_tool` `arguments` (object or JSON object string) and strip stray `toolSummary`. */
+export function normalizeCallPiToolArguments(
+	rawArgs: unknown,
+	toolParameters?: object,
+): { ok: true; args: Record<string, unknown> } | { ok: false; error: string } {
+	if (rawArgs === undefined || rawArgs === null) return { ok: true, args: {} };
+	let parsed: unknown = rawArgs;
+	if (typeof rawArgs === "string") {
+		const trimmed = rawArgs.trim();
+		if (!trimmed) return { ok: true, args: {} };
+		try {
+			parsed = JSON.parse(trimmed);
+		} catch {
+			return { ok: false, error: "call_pi_tool arguments must be a JSON object" };
+		}
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		return { ok: false, error: "call_pi_tool arguments must be a JSON object" };
+	}
+	const copy: Record<string, unknown> = { ...(parsed as Record<string, unknown>) };
+	if ("toolSummary" in copy) {
+		const props = (toolParameters as { properties?: Record<string, unknown> } | undefined)
+			?.properties;
+		if (!props || !("toolSummary" in props)) {
+			delete copy.toolSummary;
+		}
+	}
+	return { ok: true, args: copy };
 }

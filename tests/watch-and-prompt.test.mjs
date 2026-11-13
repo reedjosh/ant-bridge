@@ -495,7 +495,14 @@ test("TOOL_PRIORITY_NOTE and PI_BRIDGE_INSTRUCTIONS are plain ASCII and cover MC
     assert.equal(typeof value, "string", `${label} must be a string`);
     assert.ok(value.length > 0, `${label} must be non-empty`);
     assert.doesNotMatch(value, /[^\x00-\x7f]/, `${label} must be plain ASCII`);
-    for (const token of ["pi-bridge-", "call_mcp_tool", "text(", "bridge_poll_result"]) {
+    for (const token of [
+      "pi-bridge-",
+      "mcp_pi-bridge_call_pi_tool",
+      "<tool>.json",
+      "call_mcp_tool",
+      "text(",
+      "bridge_poll_result",
+    ]) {
       assert.ok(value.includes(token), `${label} must cover ${token}`);
     }
   }
@@ -527,6 +534,7 @@ test("TOOL_PRIORITY_NOTE and PI_BRIDGE_INSTRUCTIONS are plain ASCII and cover MC
     "~/.pi",
     "<server>/<tool>",
     "swarm",
+    "schedule",
     "pi-bridge* tools",
     "parent turn ends",
     "never wake pi",

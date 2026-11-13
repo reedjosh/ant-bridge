@@ -27,7 +27,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { looksBackgroundNativeCall } from "./background-watch.js";
+import { CALL_PI_TOOL_NAME } from "./bridge-catalog.js";
 import { loadConfig } from "./config.js";
+
+export { CALL_PI_TOOL_NAME };
 import { createExecGitOps, formatInlineDiff, TurnDiffContext } from "./diff-render.js";
 import {
 	toPiUsage,
@@ -155,8 +158,13 @@ export const SYSTEM_PROMPT_END = "[END SYSTEM PROMPT]";
 export const PI_BRIDGE_INSTRUCTIONS: string = [
 	"Pi Bridge exposes active Pi tools and direct MCP servers (`pi-bridge` and `pi-bridge-<server>`).",
 	"",
-	"- Direct Pi tools live on `pi-bridge` and `pi-bridge-<server>`; if `agy` marks any tool `Lazy:`,",
-	"  read its `<toolName>.json` schema in this directory and invoke it via `call_mcp_tool`.",
+	"- Eager tools register natively as `mcp_pi-bridge_<tool>` and `mcp_pi-bridge-<server>_<tool>`.",
+	"- `agy acp` drops schemas above ~1.48 KB (such as `subagent`, `codemode`, `activate_skill`, and",
+	"  larger MCP tools) from `Eager:` without registering `Lazy:` or `call_mcp_tool`, even though",
+	"  every tool's `<tool>.json` schema is written to `<appDataDir>/mcp/pi-bridge*/` on disk.",
+	"- To use any non-eager Pi or MCP tool, read `<appDataDir>/mcp/<serverName>/<tool>.json` for its",
+	"  parameters and invoke `mcp_pi-bridge_call_pi_tool` with `{ name, arguments }` (for example",
+	"  `name: \"subagent\"`, `name: \"codemode\"`, or `name: \"pi-bridge-slack/slack_read_thread\"`).",
 	"- If any bridged call answers `STILL RUNNING` with a `callId`, poll `bridge_poll_result` on",
 	"  `pi-bridge` until it settles before ending your turn.",
 	"- Inside `codemode` scripts, MCP tools resolve to `{ content, structuredContent, isError }`",
@@ -170,11 +178,16 @@ export const TOOL_PRIORITY_NOTE: string = [
 	"sees what surfaces in pi. Native interactive tools, for example ask_question, never reach the",
 	"user. When a Pi Bridge tool covers the same purpose, always use the Pi Bridge tool; for user",
 	"questions use ask_user_question. Direct Pi MCP servers appear in agy's <mcp_servers> as",
-	"pi-bridge-<server> (mcp_pi-bridge-<server>_<tool> when eager, or via call_mcp_tool when Lazy:);",
-	"call them directly so Pi renders clean <server>/<tool> rows. Servers marked (codemode) in Pi's",
+	"pi-bridge-<server> (mcp_pi-bridge-<server>_<tool> when eager); call eager tools directly so Pi",
+	"renders clean <server>/<tool> rows. Because agy acp omits schemas above ~1.48 KB (including",
+	"subagent, codemode, activate_skill, and larger MCP tools) without registering Lazy: or",
+	"call_mcp_tool, every tool's <tool>.json schema is still written under <appDataDir>/mcp/pi-bridge*/",
+	"on disk: read <appDataDir>/mcp/<serverName>/<tool>.json and invoke any non-eager tool via",
+	"mcp_pi-bridge_call_pi_tool with { name, arguments }. Servers marked (codemode) in Pi's",
 	"<mcp_servers> section (such as Slack, Linear, Sentry, or Figma) do not appear as separate agy MCP",
-	"servers; reach them via mcp_pi-bridge_codemode (searchTools / describeNamespace) and never inspect",
-	"local ~/.pi MCP config files. When batching calls in codemode, extract readable text from",
+	"servers; reach them via mcp_pi-bridge_codemode (or mcp_pi-bridge_call_pi_tool with name",
+	"\"codemode\" when non-eager, using searchTools / describeNamespace) and never inspect local ~/.pi",
+	"MCP config files. When batching calls in codemode, extract readable text from",
 	"{ content, structuredContent } results and emit formatted multi-line text via text(...) rather",
 	"than returning raw or nested JSON objects. For workspace files and commands, your native",
 	"read_file, edit_file, write_file, and run_command tools operate directly on the real filesystem",
@@ -182,11 +195,15 @@ export const TOOL_PRIORITY_NOTE: string = [
 	"RUNNING, poll bridge_poll_result before doing other work: until you poll, the result (including",
 	"any image) stays undelivered to you. Delegate subagent work through Pi Bridge: when pi's tool list",
 	"includes a delegation tool (for example subagent, Agent, agent_spawn, agent_wait, or",
-	"subagent_run), always delegate through it and never through the native invoke_subagent,",
-	"run_subagent, manage_subagents, or swarm; native invoke_subagent and swarm background workers run",
-	"inside agy invisible to pi, lose access to pi-bridge* tools as soon as the parent turn ends, and",
-	"never wake pi on completion (even if no pi delegation tool is listed, never leave native subagents",
-	"running across turn boundaries or expect them to call pi-bridge* tools).",
+	"subagent_run), always delegate through it (directly or via mcp_pi-bridge_call_pi_tool with name",
+	"\"subagent\") and never through the native invoke_subagent, run_subagent, manage_subagents, or",
+	"swarm; native invoke_subagent and swarm background workers run inside agy invisible to pi, lose",
+	"access to pi-bridge* tools as soon as the parent turn ends, and never wake pi on completion (even",
+	"if no pi delegation tool is listed, never leave native subagents running across turn boundaries or",
+	"expect them to call pi-bridge* tools). Never call the native schedule tool and end your turn to",
+	"wait for a timer or cron: ending your turn closes the active pi prompt, so a later native schedule",
+	"wakeup runs with no active pi turn, drops its output, cannot call pi-bridge* tools, and races with",
+	"subsequent prompts; keep polling bounded inside the active turn or use Pi Bridge tools instead.",
 	"Long-running bridge calls do not fail: after ~20 seconds (120 seconds for subagent and codemode",
 	"calls) the bridge answers STILL RUNNING with a callId; fetch the result with bridge_poll_result",
 	"and poll until it lands.]",

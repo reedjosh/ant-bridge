@@ -28,9 +28,9 @@ const PACKAGE_VERSION = (() => {
 		const parsed = JSON.parse(raw) as { version?: unknown };
 		return typeof parsed.version === "string" && parsed.version.trim()
 			? parsed.version.trim()
-			: "2.4.0";
+			: "2.4.1";
 	} catch {
-		return "2.4.0";
+		return "2.4.1";
 	}
 })();
 

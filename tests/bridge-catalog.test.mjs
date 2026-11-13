@@ -27,9 +27,17 @@ const ALL_TOOLS = [
 
 const ACTIVE = ALL_TOOLS.map((t) => t.name);
 
-test("mode=all bridges Pi 1.5 builtin extensions while excluding core file/shell builtins", () => {
+test("mode=all bridges every active Pi tool, core file and shell builtins included", () => {
   const names = bridgedPiTools(ALL_TOOLS, ACTIVE, "all", new Set()).map((t) => t.name);
   assert.deepEqual(names, [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "powershell",
     "codemode",
     "tool_search",
     "mcp__slack__search",
@@ -47,15 +55,20 @@ test("mode=mcp bridges Pi 1.5 builtin MCP, codemode, and tool_search without non
 test("mode=none and hidden tool overrides suppress matching tools", () => {
   assert.deepEqual(bridgedPiTools(ALL_TOOLS, ACTIVE, "none", new Set()), []);
   const names = bridgedPiTools(ALL_TOOLS, ACTIVE, "all", new Set(["pr_work"])).map((t) => t.name);
-  assert.deepEqual(names, ["codemode", "tool_search", "mcp__slack__search", "read_mcp_resource", "subagent"]);
+  assert.deepEqual(names, [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "powershell",
+    "codemode",
+    "tool_search",
+    "mcp__slack__search",
+    "read_mcp_resource",
+    "subagent",
+  ]);
 });
 
-test("legacy pathless builtin fixtures still exclude core tools by name", () => {
-  const legacy = [
-    { name: "read", sourceInfo: { source: "builtin" } },
-    { name: "bash", sourceInfo: { source: "builtin" } },
-    { name: "subagent", sourceInfo: { source: "npm:pi-subagents" } },
-  ];
-  const names = bridgedPiTools(legacy, ["read", "bash", "subagent"], "all", new Set()).map((t) => t.name);
-  assert.deepEqual(names, ["subagent"]);
-});

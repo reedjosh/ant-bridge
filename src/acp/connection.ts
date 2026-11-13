@@ -19,7 +19,7 @@ import { frameCarriesUsage } from "./events.js";
 import type { AgyUsage } from "../driver-types.js";
 import { redactText } from "../redact.js";
 import { JsonRpcResponseError, JsonRpcSession } from "./jsonrpc.js";
-import { removeStagedAcpHome, stageAcpHome } from "./home.js";
+import { BRIDGE_AGENT_NAME, removeStagedAcpHome, stageAcpHome } from "./home.js";
 
 export interface AcpMcpServer {
 	name: string;
@@ -168,7 +168,7 @@ export class AcpConnection {
 		const args = [...(this.#opts.binArgs ?? [])];
 		if (this.#opts.isolateHome) {
 			this.#stagedHome = stageAcpHome(typeof this.#opts.isolateHome === "object" ? this.#opts.isolateHome : {});
-			args.push("--gemini-dir", this.#stagedHome);
+			args.push("--gemini-dir", this.#stagedHome, "--agent", BRIDGE_AGENT_NAME);
 		}
 		let child: ChildProcess;
 		try {

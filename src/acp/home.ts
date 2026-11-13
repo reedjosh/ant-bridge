@@ -4,6 +4,22 @@ import path from "node:path";
 import { bridgeStateDir } from "../agy-paths.js";
 import { isPidAlive } from "../mcp-server.js";
 
+// agy's native tools run outside pi, so the bridge agent declares none and the model only sees pi's MCP tools.
+export const BRIDGE_AGENT_NAME = "pi-bridge";
+
+const BRIDGE_AGENT_DEFINITION = [
+	"---",
+	`name: ${BRIDGE_AGENT_NAME}`,
+	"description: Calls only the tools pi serves over MCP",
+	"mainAgent: true",
+	"subagent: false",
+	"tools: []",
+	"inheritMcp: false",
+	"---",
+	"Use only the provided tools.",
+	"",
+].join("\n");
+
 type McpConfig = { mcpServers: Record<string, unknown> };
 
 function record(value: unknown, label: string): Record<string, unknown> {
@@ -74,7 +90,7 @@ export function stageAcpHome(opts: { geminiHome?: string; parentDir?: string } =
 		if (fs.existsSync(instructions)) fs.copyFileSync(instructions, path.join(staged, "GEMINI.md"));
 		if (fs.existsSync(globalConfigDir)) {
 			for (const entry of fs.readdirSync(globalConfigDir, { withFileTypes: true })) {
-				if (entry.name === "mcp_config.json") continue;
+				if (entry.name === "mcp_config.json" || entry.name === "agents") continue;
 				const source = path.join(globalConfigDir, entry.name);
 				const target = path.join(staged, "config", entry.name);
 				let stat: fs.Stats | fs.Dirent = entry;
@@ -90,6 +106,10 @@ export function stageAcpHome(opts: { geminiHome?: string; parentDir?: string } =
 				else if (stat.isFile()) fs.copyFileSync(source, target);
 			}
 		}
+		fs.mkdirSync(path.join(staged, "config", "agents"), { mode: 0o700 });
+		fs.writeFileSync(path.join(staged, "config", "agents", `${BRIDGE_AGENT_NAME}.md`), BRIDGE_AGENT_DEFINITION, {
+			mode: 0o600,
+		});
 		return staged;
 	} catch (err) {
 		fs.rmSync(staged, { recursive: true, force: true });

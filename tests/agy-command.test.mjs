@@ -897,6 +897,7 @@ async function createRecycleAcpHarness() {
   const waiters = [];
   const sockets = new Set();
   let activeSocket = null;
+  const frameSockets = new WeakMap();
   let sessionCounter = 0;
 
   function sendToClient(frame, sock = activeSocket) {
@@ -906,6 +907,7 @@ async function createRecycleAcpHarness() {
 
   function handleClientFrame(msg, sock) {
     received.push(msg);
+    frameSockets.set(msg, sock);
     if (msg.method === "initialize") {
       sendToClient(
         {
@@ -979,6 +981,7 @@ async function createRecycleAcpHarness() {
     },
     replyPrompt(promptFrame, text = "ok") {
       const sid = promptFrame.params.sessionId;
+      const sock = frameSockets.get(promptFrame);
       sendToClient({
         jsonrpc: "2.0",
         method: "session/update",
@@ -986,8 +989,8 @@ async function createRecycleAcpHarness() {
           sessionId: sid,
           update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
         },
-      });
-      sendToClient({ jsonrpc: "2.0", id: promptFrame.id, result: { stopReason: "end_turn" } });
+      }, sock);
+      sendToClient({ jsonrpc: "2.0", id: promptFrame.id, result: { stopReason: "end_turn" } }, sock);
     },
     async close() {
       for (const s of sockets) s.destroy();
@@ -1706,6 +1709,26 @@ test(
       );
       assert.equal(disconnectLogs.length, 1);
       assert.equal(disconnectLogs[0].level, "error");
+
+      // A child summarization call must not queue behind that child's unfinished turn.
+      idx = h.received.length;
+      const child = providerSpec.streamSimple(model, {
+        messages: [{ role: "user", content: "Child task", timestamp: 10 }],
+      }, { cwd: h.tmpDir, sessionId: "hardening-child" });
+      const childPrompt = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+      idx = h.received.length;
+      const childSummary = providerSpec.streamSimple(model, { messages: [
+        { role: "system", content: "You are a context summarization assistant.", timestamp: 0 },
+        { role: "user", content: "Summarize child context.", timestamp: 11 },
+      ] }, { cwd: h.tmpDir, sessionId: "hardening-child", cacheRetention: "none" });
+      const summaryNew = await h.waitForFrame((f) => f.method === "session/new", idx);
+      assert.deepEqual(summaryNew.params.mcpServers, []);
+      const summaryPrompt = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+      assert.notEqual(summaryPrompt.params.sessionId, childPrompt.params.sessionId);
+      h.replyPrompt(summaryPrompt, "child summary");
+      assert.equal((await childSummary.result()).stopReason, "stop");
+      h.replyPrompt(childPrompt, "child finished");
+      assert.equal((await child.result()).stopReason, "stop");
     } finally {
       try {
         await mcpClient?.close();

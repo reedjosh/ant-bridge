@@ -29,9 +29,8 @@ export interface BackgroundWatchOptions {
 	/** Task logs older than the turn start are other turns' work and are
 	 *  never tracked (the task dir is cumulative per conversation). */
 	turnStartMs: number;
-	/** Timestamp when the turn ended and armed the watch. Idle tasks whose log
-	 *  stopped changing before armedAt already finished inside the turn and must
-	 *  not fire a post-turn wake. */
+	/** Timestamp when the turn ended and armed the watch. Completion can race
+	 *  with arming; only transcript consumption, not this timestamp, suppresses a wake. */
 	armedAt?: number;
 	listTasks: (conversationDir: string) => Promise<AgyTask[]>;
 	/** Optional reader for task IDs agy already delivered in-turn via transcript.jsonl. */
@@ -124,7 +123,7 @@ export function armBackgroundWatch(opts: BackgroundWatchOptions): BackgroundWatc
 				(t) =>
 					tracked.has(t.id) ||
 					t.active ||
-					(t.modifiedMs >= opts.turnStartMs && (opts.armedAt === undefined || t.modifiedMs >= opts.armedAt)),
+					t.modifiedMs >= opts.turnStartMs,
 			);
 			let delivered = new Set<number>();
 			if (candidates.length > 0 && opts.deliveredTaskIds) {
@@ -134,6 +133,7 @@ export function armBackgroundWatch(opts: BackgroundWatchOptions): BackgroundWatc
 					delivered = new Set<number>();
 				}
 			}
+			const consumedAllTracked = tracked.size > 0 && [...tracked.keys()].every((id) => delivered.has(id));
 			const current = delivered.size > 0 ? candidates.filter((t) => !delivered.has(t.id)) : candidates;
 			if (current.length > 0) everSeen = true;
 			const seen = new Set<number>();
@@ -149,11 +149,10 @@ export function armBackgroundWatch(opts: BackgroundWatchOptions): BackgroundWatc
 			for (const id of [...tracked.keys()]) {
 				if (!seen.has(id)) tracked.delete(id);
 			}
-			if (!everSeen) {
-				if (now() - startedAt >= quietMs) {
-					// Spurious arm: the flagged call left no post-turn task log (foreground
-					// or already completed inside the turn). Persist settled so reloads do
-					// not re-arm stale watches, and stop silently without waking.
+			if (!everSeen || (consumedAllTracked && tracked.size === 0)) {
+				if (everSeen || now() - startedAt >= quietMs) {
+					// No unconsumed task remains. Persist settled so reloads do not
+					// re-arm stale watches, and stop silently without waking.
 					opts.onSettle?.({ outcome: "settled", taskIds: [] });
 					opts.log?.("background-watch-spurious", { conversationId: opts.conversationId }, "info");
 					stopped = true;

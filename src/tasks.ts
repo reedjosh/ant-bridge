@@ -200,8 +200,8 @@ export async function tailAgyTaskLog(logPath: string): Promise<string> {
 	return readFileTail(logPath, TASK_TAIL_BYTES);
 }
 
-/** Task IDs whose completion agy already injected in-turn via a SYSTEM_MESSAGE
- *  step in transcript.jsonl. Empty set when the transcript is absent or unreadable. */
+/** Task IDs whose completion was followed by another model inference. A queued
+ *  SYSTEM_MESSAGE alone does not prove the model consumed the result. */
 export async function readDeliveredTaskIds(conversationDir: string): Promise<Set<number>> {
 	const transcriptPath = path.join(conversationDir, ".system_generated", "logs", "transcript.jsonl");
 	const delivered = new Set<number>();
@@ -211,11 +211,29 @@ export async function readDeliveredTaskIds(conversationDir: string): Promise<Set
 	} catch {
 		return delivered;
 	}
+	const notifications: { step: number; content: string }[] = [];
+	let lastInferenceStep = -1;
 	for (const line of text.split("\n")) {
-		if (!line.includes('"SYSTEM_MESSAGE"')) continue;
+		let record;
+		try {
+			record = JSON.parse(line);
+		} catch {
+			// The bounded tail can start or end inside a partially written record.
+			continue;
+		}
+		if (!record || typeof record.step_index !== "number") continue;
+		if (record.source === "MODEL" && record.type === "PLANNER_RESPONSE" && record.status === "DONE") {
+			lastInferenceStep = Math.max(lastInferenceStep, record.step_index);
+		} else if (record.source === "SYSTEM" && record.type === "SYSTEM_MESSAGE" &&
+			typeof record.content === "string") {
+			notifications.push({ step: record.step_index, content: record.content });
+		}
+	}
+	for (const notification of notifications) {
+		if (notification.step >= lastInferenceStep) continue;
 		DELIVERED_TASK_RE.lastIndex = 0;
 		let match: RegExpExecArray | null;
-		while ((match = DELIVERED_TASK_RE.exec(line)) !== null) {
+		while ((match = DELIVERED_TASK_RE.exec(notification.content)) !== null) {
 			const id = Number(match[1]);
 			if (Number.isInteger(id) && id >= 0) delivered.add(id);
 		}

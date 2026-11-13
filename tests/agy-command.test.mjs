@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { importBridgeModule, jiti } from "./helpers/pi-loader.mjs";
 
 const { CombinedAutocompleteProvider } = await jiti.import("@earendil-works/pi-tui");
@@ -825,3 +829,905 @@ test("message_update suppresses 0 in / 0 out and renders exact vs estimated ACP 
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+const RECYCLE_RELAY_SCRIPT = `
+import net from "node:net";
+
+if (process.argv[2] === "models") {
+  process.stdout.write("gemini-4-carbon-high  Gemini 4 Carbon (High)\\n");
+  process.exit(0);
+}
+if (process.argv[2] === "--version") {
+  process.stdout.write("1.5.4\\n");
+  process.exit(0);
+}
+
+const port = Number(process.env.FAKE_ACP_PORT);
+const sock = net.createConnection({ host: "127.0.0.1", port });
+sock.setEncoding("utf8");
+process.stdin.setEncoding("utf8");
+
+let connected = false;
+const queued = [];
+let stdinBuf = "";
+
+process.stdin.on("data", (chunk) => {
+  stdinBuf += chunk;
+  const lines = stdinBuf.split("\\n");
+  stdinBuf = lines.pop() ?? "";
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    if (connected) sock.write(line + "\\n");
+    else queued.push(line);
+  }
+});
+
+sock.on("connect", () => {
+  connected = true;
+  while (queued.length > 0) sock.write(queued.shift() + "\\n");
+});
+
+let sockBuf = "";
+sock.on("data", (chunk) => {
+  sockBuf += chunk;
+  const lines = sockBuf.split("\\n");
+  sockBuf = lines.pop() ?? "";
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    process.stdout.write(line + "\\n");
+  }
+});
+
+sock.on("close", () => process.exit(0));
+sock.on("error", () => process.exit(1));
+`;
+
+async function createRecycleAcpHarness() {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ant-catalog-recycle-"));
+  const relayPath = path.join(tmpDir, "fake-acp-relay.mjs");
+  const launcherPath = path.join(tmpDir, "fake-agy.sh");
+  fs.writeFileSync(relayPath, RECYCLE_RELAY_SCRIPT, "utf8");
+  fs.writeFileSync(
+    launcherPath,
+    `#!/bin/sh\nexec "${process.execPath}" "${relayPath}" "$@"\n`,
+    { mode: 0o755 },
+  );
+
+  const received = [];
+  const waiters = [];
+  const sockets = new Set();
+  let activeSocket = null;
+  let sessionCounter = 0;
+
+  function sendToClient(frame, sock = activeSocket) {
+    if (!sock || sock.destroyed) return;
+    sock.write(JSON.stringify(frame) + "\n");
+  }
+
+  function handleClientFrame(msg, sock) {
+    received.push(msg);
+    if (msg.method === "initialize") {
+      sendToClient(
+        {
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: { protocolVersion: 1, agentInfo: { name: "fake-agy", version: "1.5.4" } },
+        },
+        sock,
+      );
+    } else if (msg.method === "session/new") {
+      sessionCounter += 1;
+      sendToClient(
+        {
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: { sessionId: `sess-${sessionCounter}`, configOptions: [] },
+        },
+        sock,
+      );
+    } else if (msg.method === "session/load" || msg.method === "session/set_config_option") {
+      sendToClient({ jsonrpc: "2.0", id: msg.id, result: { configOptions: [] } }, sock);
+    }
+    for (let i = waiters.length - 1; i >= 0; i--) {
+      if (waiters[i].pred(msg)) {
+        const w = waiters.splice(i, 1)[0];
+        w.resolve(msg);
+      }
+    }
+  }
+
+  const server = net.createServer((sock) => {
+    sock.setEncoding("utf8");
+    sockets.add(sock);
+    activeSocket = sock;
+    let buf = "";
+    sock.on("data", (chunk) => {
+      buf += chunk;
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        handleClientFrame(JSON.parse(line), sock);
+      }
+    });
+    sock.on("close", () => sockets.delete(sock));
+  });
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+
+  return {
+    tmpDir,
+    launcherPath,
+    port,
+    received,
+    initCount() {
+      return received.filter((f) => f.method === "initialize").length;
+    },
+    waitForFrame(pred, startIndex = 0) {
+      for (let i = startIndex; i < received.length; i++) {
+        if (pred(received[i])) return Promise.resolve(received[i]);
+      }
+      return new Promise((resolve) => waiters.push({ pred, resolve }));
+    },
+    sendUpdate(sessionId, update) {
+      sendToClient({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update } });
+    },
+    sendServerFrame(frame) {
+      sendToClient(frame);
+    },
+    replyPrompt(promptFrame, text = "ok") {
+      const sid = promptFrame.params.sessionId;
+      sendToClient({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: sid,
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+        },
+      });
+      sendToClient({ jsonrpc: "2.0", id: promptFrame.id, result: { stopReason: "end_turn" } });
+    },
+    async close() {
+      for (const s of sockets) s.destroy();
+      await new Promise((resolve) => server.close(resolve));
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    },
+  };
+}
+
+test(
+  "beforeTurn and /agy tools hide recycle warm acpDriver on catalog changes while preserving conversationId",
+  async () => {
+    const h = await createRecycleAcpHarness();
+    const fakeHome = path.join(h.tmpDir, "home");
+    const agentDir = path.join(h.tmpDir, "agent");
+    fs.mkdirSync(fakeHome, { recursive: true });
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    const prevHome = process.env.HOME;
+    const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const prevAgyBin = process.env.AGY_BIN;
+    const prevFakePort = process.env.FAKE_ACP_PORT;
+    const prevDebug = process.env.AGY_DEBUG;
+    const prevSubagentChild = process.env.PI_SUBAGENT_CHILD;
+    process.env.HOME = fakeHome;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    process.env.AGY_BIN = h.launcherPath;
+    process.env.FAKE_ACP_PORT = String(h.port);
+    process.env.AGY_DEBUG = "1";
+    delete process.env.PI_SUBAGENT_CHILD;
+
+    const allTools = [
+      {
+        name: "codemode",
+        description: "Run codemode batch",
+        parameters: { type: "object", properties: {} },
+        sourceInfo: { source: "builtin", path: "builtin:codemode" },
+      },
+      {
+        name: "subagent",
+        description: "Delegate to worker",
+        parameters: { type: "object", properties: {} },
+        sourceInfo: { source: "extension", path: "/ext/subagent.ts" },
+      },
+      {
+        name: "mcp__slack__slack_read_channel",
+        description: "Read Slack channel",
+        parameters: { type: "object", properties: {} },
+        sourceInfo: { source: "builtin", path: "builtin:mcp" },
+      },
+      {
+        name: "mcp__linear__list_issues",
+        description: "List Linear issues",
+        parameters: { type: "object", properties: {} },
+        sourceInfo: { source: "builtin", path: "builtin:mcp" },
+      },
+    ];
+    let activeToolNames = ["codemode", "subagent"];
+
+    const commands = new Map();
+    const handlers = new Map();
+    const providers = new Map();
+    const mockPi = {
+      registerProvider(id, spec) {
+        providers.set(id, spec);
+      },
+      registerCommand(name, spec) {
+        commands.set(name, spec);
+      },
+      registerTool() {},
+      registerEntryRenderer() {},
+      registerMessageRenderer() {},
+      on(event, fn) {
+        const list = handlers.get(event) ?? [];
+        list.push(fn);
+        handlers.set(event, list);
+      },
+      getAllTools() {
+        return allTools;
+      },
+      getActiveTools() {
+        return activeToolNames;
+      },
+      appendEntry() {},
+      sendMessage() {},
+      events: { emit() {}, on() {} },
+    };
+
+    const sessionCtx = {
+      hasUI: false,
+      mode: "rpc",
+      cwd: h.tmpDir,
+      ui: { notify() {}, setStatus() {} },
+      isProjectTrusted: () => false,
+      sessionManager: {
+        getSessionId: () => "recycle-sess",
+        getCwd: () => h.tmpDir,
+        getEntries: () => [],
+        getBranch: () => [],
+      },
+    };
+
+    let mcpClient = null;
+    try {
+      saveConfig({ bridgeTools: "all" });
+      await registerExtension(mockPi);
+      const agyCmd = commands.get("agy");
+      const providerSpec = providers.get("antigravity");
+      const model = providerSpec.models[0];
+
+      for (const fn of handlers.get("session_start") ?? []) {
+        await fn({ type: "session_start", reason: "startup" }, sessionCtx);
+      }
+
+      // 1. Turn 1 spawns initial ACP server (initCount = 1) and binds sess-1.
+      const u1 = { role: "user", content: "Turn one", timestamp: 1 };
+      let idx = h.received.length;
+      const t1Stream = providerSpec.streamSimple(
+        model,
+        { messages: [u1] },
+        { cwd: h.tmpDir, sessionId: "recycle-sess" },
+      );
+      const sNew1 = await h.waitForFrame((f) => f.method === "session/new", idx);
+      assert.deepEqual(
+        sNew1.params.mcpServers.map((s) => s.name),
+        ["pi-bridge"],
+      );
+      const p1 = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+      h.replyPrompt(p1, "reply one");
+      const a1 = await t1Stream.result();
+      assert.equal(a1.stopReason, "stop");
+      assert.equal(h.initCount(), 1);
+
+      // 2. Turn 2 with unchanged catalog skips recycle (initCount stays 1) and loads sess-1.
+      const u2 = { role: "user", content: "Turn two", timestamp: 2 };
+      idx = h.received.length;
+      const t2Stream = providerSpec.streamSimple(
+        model,
+        { messages: [u1, a1, u2] },
+        { cwd: h.tmpDir, sessionId: "recycle-sess" },
+      );
+      const sLoad2 = await h.waitForFrame((f) => f.method === "session/load", idx);
+      assert.equal(sLoad2.params.sessionId, "sess-1");
+      const p2 = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+      h.replyPrompt(p2, "reply two");
+      const a2 = await t2Stream.result();
+      assert.equal(a2.stopReason, "stop");
+      assert.equal(h.initCount(), 1);
+
+      // 3. Standalone summarization turn skips beforeTurn recycle even after active tools change.
+      activeToolNames = ["codemode", "subagent", "mcp__slack__slack_read_channel"];
+      idx = h.received.length;
+      const sumStream = providerSpec.streamSimple(
+        model,
+        {
+          messages: [
+            {
+              role: "system",
+              content: "You are a context summarization assistant.",
+              timestamp: 0,
+            },
+            { role: "user", content: "Summarize prior turns.", timestamp: 3 },
+          ],
+        },
+        { cwd: h.tmpDir, sessionId: "recycle-sess", cacheRetention: "none" },
+      );
+      const pSum = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+      h.replyPrompt(pSum, "summary text");
+      const sumMsg = await sumStream.result();
+      assert.equal(sumMsg.stopReason, "stop");
+      assert.equal(h.initCount(), 1);
+
+      // 4. Turn 3 triggers beforeTurn recycle (initCount -> 2), preserves sess-1, and adds pi-bridge-slack.
+      const u3 = { role: "user", content: "Turn three", timestamp: 4 };
+      idx = h.received.length;
+      const t3Stream = providerSpec.streamSimple(
+        model,
+        { messages: [u1, a1, u2, a2, u3] },
+        { cwd: h.tmpDir, sessionId: "recycle-sess" },
+      );
+      const sLoad3 = await h.waitForFrame((f) => f.method === "session/load", idx);
+      assert.equal(h.initCount(), 2);
+      assert.equal(sLoad3.params.sessionId, "sess-1");
+      assert.deepEqual(
+        sLoad3.params.mcpServers.map((s) => s.name),
+        ["pi-bridge", "pi-bridge-slack"],
+      );
+      const p3 = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+      h.replyPrompt(p3, "reply three");
+      const a3 = await t3Stream.result();
+      assert.equal(a3.stopReason, "stop");
+
+      // 5. Parked reentry() continuation skips recycle when active tools change mid-turn, then recycles on Turn 5.
+      const u4 = { role: "user", content: "Turn four with tool", timestamp: 5 };
+      idx = h.received.length;
+      const t4Stream = providerSpec.streamSimple(
+        model,
+        { messages: [u1, a1, u2, a2, u3, a3, u4] },
+        { cwd: h.tmpDir, sessionId: "recycle-sess" },
+      );
+      const sLoad4 = await h.waitForFrame((f) => f.method === "session/load", idx);
+      const p4 = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+      assert.equal(h.initCount(), 2);
+
+      const coreSrv = sLoad4.params.mcpServers[0];
+      mcpClient = new Client({ name: "park-client", version: "1.0.0" });
+      await mcpClient.connect(
+        new StreamableHTTPClientTransport(new URL(coreSrv.url), {
+          requestInit: {
+            headers: Object.fromEntries(coreSrv.headers.map((hdr) => [hdr.name, hdr.value])),
+          },
+        }),
+      );
+      const parkedToolPromise = mcpClient.callTool({ name: "codemode", arguments: {} });
+      const parkedA4 = await t4Stream.result();
+      assert.equal(parkedA4.stopReason, "toolUse");
+      const parkedCall = parkedA4.content.find((c) => c.type === "toolCall");
+      assert.equal(parkedCall?.name, "codemode");
+
+      // Mutate active tools while Turn 4 is parked (simulating tool_search loading Linear tools).
+      activeToolNames = [
+        "codemode",
+        "subagent",
+        "mcp__slack__slack_read_channel",
+        "mcp__linear__list_issues",
+      ];
+
+      const t4Cont = providerSpec.streamSimple(
+        model,
+        {
+          messages: [
+            u1,
+            a1,
+            u2,
+            a2,
+            u3,
+            a3,
+            u4,
+            parkedA4,
+            {
+              role: "toolResult",
+              toolCallId: parkedCall.id,
+              toolName: "codemode",
+              content: [{ type: "text", text: "loaded linear" }],
+              isError: false,
+              timestamp: 6,
+            },
+          ],
+        },
+        { cwd: h.tmpDir, sessionId: "recycle-sess" },
+      );
+      const parkedToolRes = await parkedToolPromise;
+      assert.equal(parkedToolRes.content[0].text, "loaded linear");
+      assert.equal(h.initCount(), 2);
+      h.replyPrompt(p4, "reply four");
+      const a4 = await t4Cont.result();
+      assert.equal(a4.stopReason, "stop");
+      assert.equal(h.initCount(), 2);
+
+      // Next normal turn (Turn 5) recycles (initCount -> 3) and exposes pi-bridge-linear + pi-bridge-slack.
+      const u5 = { role: "user", content: "Turn five", timestamp: 7 };
+      idx = h.received.length;
+      const t5Stream = providerSpec.streamSimple(
+        model,
+        { messages: [u1, a1, u2, a2, u3, a3, u4, a4, u5] },
+        { cwd: h.tmpDir, sessionId: "recycle-sess" },
+      );
+      const sLoad5 = await h.waitForFrame((f) => f.method === "session/load", idx);
+      assert.equal(h.initCount(), 3);
+      assert.equal(sLoad5.params.sessionId, "sess-1");
+      assert.deepEqual(
+        sLoad5.params.mcpServers.map((s) => s.name),
+        ["pi-bridge", "pi-bridge-linear", "pi-bridge-slack"],
+      );
+      const p5 = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+      h.replyPrompt(p5, "reply five");
+      const a5 = await t5Stream.result();
+      assert.equal(a5.stopReason, "stop");
+
+      // 6. /agy tools hide immediately recycles the warm ready driver while preserving sess-1.
+      const docReady = makeCmdCtx({ sessionId: "recycle-sess" });
+      await agyCmd.handler("doctor", docReady.cmdCtx);
+      assert.match(docReady.notifications[0]?.message ?? "", /driver:\s+ready\b/);
+
+      const hideSubagent = makeCmdCtx({ sessionId: "recycle-sess" });
+      await agyCmd.handler("tools hide subagent", hideSubagent.cmdCtx);
+      assert.match(
+        hideSubagent.notifications[0]?.message ?? "",
+        /subagent: hidden from Antigravity/,
+      );
+
+      const docRecycled = makeCmdCtx({ sessionId: "recycle-sess" });
+      await agyCmd.handler("doctor", docRecycled.cmdCtx);
+      assert.match(docRecycled.notifications[0]?.message ?? "", /driver:\s+dead\b/);
+      assert.match(docRecycled.notifications[0]?.message ?? "", /bound conversation:\s+sess-1/);
+
+      // /agy tools show and /agy tools reset also sync cleanly while driver is dead.
+      const showSubagent = makeCmdCtx({ sessionId: "recycle-sess" });
+      await agyCmd.handler("tools show subagent", showSubagent.cmdCtx);
+      const resetTools = makeCmdCtx({ sessionId: "recycle-sess" });
+      await agyCmd.handler("tools reset", resetTools.cmdCtx);
+
+      // /agy bridge none exposes mcpServers: [] on the next turn while preserving sess-1.
+      const bridgeNone = makeCmdCtx({ sessionId: "recycle-sess" });
+      await agyCmd.handler("bridge none", bridgeNone.cmdCtx);
+      const u6 = { role: "user", content: "Turn six no bridge", timestamp: 8 };
+      idx = h.received.length;
+      const t6Stream = providerSpec.streamSimple(
+        model,
+        { messages: [u1, a1, u2, a2, u3, a3, u4, a4, u5, a5, u6] },
+        { cwd: h.tmpDir, sessionId: "recycle-sess" },
+      );
+      const sLoad6 = await h.waitForFrame((f) => f.method === "session/load", idx);
+      assert.equal(h.initCount(), 4);
+      assert.equal(sLoad6.params.sessionId, "sess-1");
+      assert.deepEqual(sLoad6.params.mcpServers, []);
+      const p6 = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+      h.replyPrompt(p6, "reply six");
+      const a6 = await t6Stream.result();
+      assert.equal(a6.stopReason, "stop");
+
+      // Verify bridge-catalog-recycle was logged at info level.
+      const logDir = path.join(agentDir, "antigravity-bridge", "logs");
+      let logContent = "";
+      for (let i = 0; i < 20; i++) {
+        if (fs.existsSync(logDir)) {
+          const logFiles = fs.readdirSync(logDir).filter((n) => n.endsWith(".ndjson"));
+          logContent = logFiles
+            .map((n) => fs.readFileSync(path.join(logDir, n), "utf8"))
+            .join("\n");
+          if (logContent.includes('"event":"bridge-catalog-recycle"')) break;
+        }
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      assert.match(logContent, /"event":"bridge-catalog-recycle"/);
+    } finally {
+      try {
+        await mcpClient?.close();
+      } catch {}
+      for (const fn of handlers.get("session_shutdown") ?? []) {
+        await fn({ type: "session_shutdown" }, sessionCtx);
+      }
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+      if (prevAgyBin === undefined) delete process.env.AGY_BIN;
+      else process.env.AGY_BIN = prevAgyBin;
+      if (prevFakePort === undefined) delete process.env.FAKE_ACP_PORT;
+      else process.env.FAKE_ACP_PORT = prevFakePort;
+      if (prevDebug === undefined) delete process.env.AGY_DEBUG;
+      else process.env.AGY_DEBUG = prevDebug;
+      if (prevSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = prevSubagentChild;
+      await h.close();
+    }
+    await waitForDiskFlush();
+    assert.equal(fs.existsSync(h.tmpDir), false);
+  },
+);
+
+test(
+  "mcpServers records warm-up fingerprint, idle permissionPolicy honors skipPermissions, and mcpLog dedupes",
+  async () => {
+    const h = await createRecycleAcpHarness();
+    const fakeHome = path.join(h.tmpDir, "home");
+    const agentDir = path.join(h.tmpDir, "agent");
+    fs.mkdirSync(fakeHome, { recursive: true });
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    const prevHome = process.env.HOME;
+    const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const prevAgyBin = process.env.AGY_BIN;
+    const prevFakePort = process.env.FAKE_ACP_PORT;
+    const prevDebug = process.env.AGY_DEBUG;
+    const prevSubagentChild = process.env.PI_SUBAGENT_CHILD;
+    process.env.HOME = fakeHome;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    process.env.AGY_BIN = h.launcherPath;
+    process.env.FAKE_ACP_PORT = String(h.port);
+    process.env.AGY_DEBUG = "1";
+    delete process.env.PI_SUBAGENT_CHILD;
+
+    const allTools = [
+      {
+        name: "codemode",
+        description: "Run codemode batch",
+        parameters: { type: "object", properties: {} },
+        sourceInfo: { source: "builtin", path: "builtin:codemode" },
+      },
+      {
+        name: "mcp__slack__users__list",
+        description: "List Slack users",
+        parameters: { type: "object", properties: {} },
+        sourceInfo: { source: "builtin", path: "builtin:mcp" },
+      },
+    ];
+    let activeToolNames = ["codemode"];
+
+    const handlers = new Map();
+    const providers = new Map();
+    const uiNotifications = [];
+    let selectCalls = 0;
+    const mockPi = {
+      registerProvider(id, spec) {
+        providers.set(id, spec);
+      },
+      registerCommand() {},
+      registerTool() {},
+      registerEntryRenderer() {},
+      registerMessageRenderer() {},
+      on(event, fn) {
+        const list = handlers.get(event) ?? [];
+        list.push(fn);
+        handlers.set(event, list);
+      },
+      getAllTools() {
+        return allTools;
+      },
+      getActiveTools() {
+        return activeToolNames;
+      },
+      appendEntry() {},
+      sendMessage() {},
+      events: { emit() {}, on() {} },
+    };
+
+    const sessionCtx = {
+      hasUI: true,
+      mode: "tui",
+      cwd: h.tmpDir,
+      ui: {
+        theme: { fg: (_c, s) => s, bold: (s) => s },
+        notify(message, type) {
+          uiNotifications.push({ message, type });
+        },
+        setStatus() {},
+        async select() {
+          selectCalls += 1;
+          return undefined;
+        },
+      },
+      isProjectTrusted: () => false,
+      sessionManager: {
+        getSessionId: () => "hardening-sess",
+        getCwd: () => h.tmpDir,
+        getEntries: () => [],
+        getBranch: () => [],
+      },
+    };
+
+    let mcpClient = null;
+    try {
+      saveConfig({ bridgeTools: "all", skipPermissions: true, permissionMode: "ask" });
+      await registerExtension(mockPi);
+      const providerSpec = providers.get("antigravity");
+      const model = providerSpec.models[0];
+
+      for (const fn of handlers.get("session_start") ?? []) {
+        await fn({ type: "session_start", reason: "startup" }, sessionCtx);
+      }
+
+      // 1. Pre-turn standalone summarization warm-up spawns agy acp (initCount = 1) and records
+      //    lastSyncedCatalogFingerprint via mcpServers().
+      let idx = h.received.length;
+      const sumStream = providerSpec.streamSimple(
+        model,
+        {
+          messages: [
+            {
+              role: "system",
+              content: "You are a context summarization assistant.",
+              timestamp: 0,
+            },
+            { role: "user", content: "Summarize history.", timestamp: 1 },
+          ],
+        },
+        { cwd: h.tmpDir, sessionId: "hardening-sess", cacheRetention: "none" },
+      );
+      const sumSessionNew = await h.waitForFrame((f) => f.method === "session/new", idx);
+      assert.deepEqual(
+        sumSessionNew.params.mcpServers.map((s) => s.name),
+        ["pi-bridge"],
+      );
+      const sumPrompt = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+      h.replyPrompt(sumPrompt, "summary");
+      const sumRes = await sumStream.result();
+      assert.equal(sumRes.stopReason, "stop");
+      assert.equal(h.initCount(), 1);
+
+      // Mutate active tools BEFORE Turn 1: because mcpServers() recorded the warm-up fingerprint,
+      // Turn 1's beforeTurn recycles the warm driver (initCount -> 2) and exposes pi-bridge-slack.
+      activeToolNames = ["codemode", "mcp__slack__users__list"];
+      const u1 = { role: "user", content: "First real turn", timestamp: 2 };
+      idx = h.received.length;
+      const t1Stream = providerSpec.streamSimple(
+        model,
+        { messages: [u1] },
+        { cwd: h.tmpDir, sessionId: "hardening-sess" },
+      );
+      const t1New = await h.waitForFrame((f) => f.method === "session/new", idx);
+      assert.equal(h.initCount(), 2);
+      assert.deepEqual(
+        t1New.params.mcpServers.map((s) => s.name),
+        ["pi-bridge", "pi-bridge-slack"],
+      );
+      const p1 = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+      h.replyPrompt(p1, "first reply");
+      const a1 = await t1Stream.result();
+      assert.equal(a1.stopReason, "stop");
+
+      // 2. Out-of-turn session/request_permission while idle honors skipPermissions=true without prompting UI.
+      idx = h.received.length;
+      h.sendServerFrame({
+        jsonrpc: "2.0",
+        id: "perm-idle-allow",
+        method: "session/request_permission",
+        params: {
+          sessionId: t1New.params.sessionId ?? "sess-2",
+          toolCall: { toolCallId: "bg-1", kind: "execute", title: "Run background check" },
+          options: [
+            { optionId: "allow_once", kind: "allow_once", name: "Allow once" },
+            { optionId: "reject_once", kind: "reject_once", name: "Reject" },
+          ],
+        },
+      });
+      const permAllowReply = await h.waitForFrame((f) => f.id === "perm-idle-allow", idx);
+      assert.deepEqual(permAllowReply.result, {
+        outcome: { outcome: "selected", optionId: "allow_once" },
+      });
+      assert.equal(selectCalls, 0);
+
+      // When skipPermissions=false and permissionMode="deny", idle permission requests reject cleanly.
+      saveConfig({ skipPermissions: false, permissionMode: "deny" });
+      idx = h.received.length;
+      h.sendServerFrame({
+        jsonrpc: "2.0",
+        id: "perm-idle-deny",
+        method: "session/request_permission",
+        params: {
+          sessionId: "sess-2",
+          toolCall: { toolCallId: "bg-2", kind: "execute", title: "Run denied check" },
+          options: [
+            { optionId: "allow_once", kind: "allow_once", name: "Allow once" },
+            { optionId: "reject_once", kind: "reject_once", name: "Reject" },
+          ],
+        },
+      });
+      const permDenyReply = await h.waitForFrame((f) => f.id === "perm-idle-deny", idx);
+      assert.deepEqual(permDenyReply.result, {
+        outcome: { outcome: "selected", optionId: "reject_once" },
+      });
+      assert.equal(selectCalls, 0);
+      saveConfig({ skipPermissions: true, permissionMode: "ask" });
+
+      // 3. Out-of-turn bridged tool calls return actionable guidance, notify once in readable prose,
+      //    deduplicate repeats, and reset on the next turn.
+      const coreSrv = t1New.params.mcpServers[0];
+      const authHeaders = Object.fromEntries(coreSrv.headers.map((hdr) => [hdr.name, hdr.value]));
+      mcpClient = new Client({ name: "idle-test-client", version: "1.0.0" });
+      await mcpClient.connect(
+        new StreamableHTTPClientTransport(new URL(coreSrv.url), {
+          requestInit: { headers: authHeaders },
+        }),
+      );
+
+      uiNotifications.length = 0;
+      const idleRes1 = await mcpClient.callTool({ name: "codemode", arguments: {} });
+      assert.equal(idleRes1.isError, true);
+      assert.match(
+        idleRes1.content[0].text,
+        /no active antigravity turn; the pi tool bridge only works while an antigravity model is streaming/,
+      );
+      assert.match(
+        idleRes1.content[0].text,
+        /background native agy subagents cannot call pi-bridge\* tools/,
+      );
+      assert.deepEqual(uiNotifications, [
+        {
+          message:
+            "[ant-bridge] Ignored bridged tool call (codemode) because no Antigravity turn is active.",
+          type: "warning",
+        },
+      ]);
+
+      // Second out-of-turn call while still idle is deduplicated in UI notifications.
+      const idleRes2 = await mcpClient.callTool({ name: "codemode", arguments: {} });
+      assert.equal(idleRes2.isError, true);
+      assert.equal(uiNotifications.length, 1);
+
+      // Starting Turn 2 resets outOfTurnWarned; test non-out-of-turn call-tool-fail formatting mid-turn
+      // by aborting an in-flight tools/call HTTP request, then verify out-of-turn warns once again after Turn 2.
+      const u2 = { role: "user", content: "Second real turn", timestamp: 3 };
+      idx = h.received.length;
+      const t2Stream = providerSpec.streamSimple(
+        model,
+        { messages: [u1, a1, u2] },
+        { cwd: h.tmpDir, sessionId: "hardening-sess" },
+      );
+      const p2 = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+
+      const mcpUrl = new URL(coreSrv.url);
+      const payload = JSON.stringify({
+        jsonrpc: "2.0",
+        id: 99,
+        method: "tools/call",
+        params: { name: "codemode", arguments: {} },
+      });
+      const rawReq = http.request({
+        hostname: mcpUrl.hostname,
+        port: Number(mcpUrl.port),
+        path: mcpUrl.pathname,
+        method: "POST",
+        headers: {
+          ...authHeaders,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          "content-length": Buffer.byteLength(payload),
+        },
+      });
+      rawReq.on("error", () => {});
+      rawReq.end(payload);
+
+      const parkedA2 = await t2Stream.result();
+      assert.equal(parkedA2.stopReason, "toolUse");
+      rawReq.destroy();
+
+      // Wait briefly for server socket close -> call-tool-fail notification.
+      for (let i = 0; i < 30; i++) {
+        if (uiNotifications.some((n) => n.message.startsWith("[ant-bridge] Bridge tool codemode failed:"))) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.equal(
+        uiNotifications.some(
+          (n) =>
+            n.message ===
+            "[ant-bridge] Bridge tool codemode failed: agy disconnected before the tool result arrived",
+        ),
+        true,
+      );
+
+      const logDir = path.join(agentDir, "antigravity-bridge", "logs");
+      const countTurnEnds = () => {
+        if (!fs.existsSync(logDir)) return 0;
+        return fs
+          .readdirSync(logDir)
+          .filter((n) => n.endsWith(".ndjson"))
+          .map((n) => fs.readFileSync(path.join(logDir, n), "utf8"))
+          .join("\n")
+          .split("\n")
+          .filter((l) => l.includes('"event":"turn-end"')).length;
+      };
+      const turnEndsBefore = countTurnEnds();
+      h.replyPrompt(p2, "second reply");
+      for (let i = 0; i < 60 && countTurnEnds() <= turnEndsBefore; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+
+      const beforePostTurnIdle = uiNotifications.length;
+      const idleAfterTurn2 = await mcpClient.callTool({ name: "codemode", arguments: {} });
+      assert.equal(idleAfterTurn2.isError, true);
+      assert.equal(uiNotifications.length, beforePostTurnIdle + 1);
+      assert.equal(
+        uiNotifications.at(-1)?.message,
+        "[ant-bridge] Ignored bridged tool call (codemode) because no Antigravity turn is active.",
+      );
+
+      // Unauthorized request formats as clean prose without JSON.stringify.
+      const unauthRes = await fetch(coreSrv.url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      assert.equal(unauthRes.status, 403);
+      assert.equal(
+        uiNotifications.at(-1)?.message,
+        "[ant-bridge] Rejected unauthorized MCP bridge request (/mcp).",
+      );
+      assert.equal(
+        uiNotifications.some((n) => n.message.includes('{"')),
+        false,
+      );
+
+      // Verify structured NDJSON log still records call-tool-fail entries at warn and error levels.
+      let logContent = "";
+      for (let i = 0; i < 20; i++) {
+        if (fs.existsSync(logDir)) {
+          const logFiles = fs.readdirSync(logDir).filter((n) => n.endsWith(".ndjson"));
+          logContent = logFiles
+            .map((n) => fs.readFileSync(path.join(logDir, n), "utf8"))
+            .join("\n");
+          if (logContent.includes('"event":"unauthorized"')) break;
+        }
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      const parsedLogs = logContent
+        .split("\n")
+        .filter((l) => l.trim().startsWith("{"))
+        .map((l) => JSON.parse(l));
+      const outOfTurnLogs = parsedLogs.filter(
+        (e) =>
+          e.event === "call-tool-fail" &&
+          String(e.data?.msg ?? "").includes("no active antigravity turn"),
+      );
+      assert.equal(outOfTurnLogs.length, 3);
+      assert.equal(
+        outOfTurnLogs.every((e) => e.level === "warn"),
+        true,
+      );
+      const disconnectLogs = parsedLogs.filter(
+        (e) =>
+          e.event === "call-tool-fail" &&
+          String(e.data?.msg ?? "").includes("agy disconnected"),
+      );
+      assert.equal(disconnectLogs.length, 1);
+      assert.equal(disconnectLogs[0].level, "error");
+    } finally {
+      try {
+        await mcpClient?.close();
+      } catch {}
+      for (const fn of handlers.get("session_shutdown") ?? []) {
+        await fn({ type: "session_shutdown" }, sessionCtx);
+      }
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+      if (prevAgyBin === undefined) delete process.env.AGY_BIN;
+      else process.env.AGY_BIN = prevAgyBin;
+      if (prevFakePort === undefined) delete process.env.FAKE_ACP_PORT;
+      else process.env.FAKE_ACP_PORT = prevFakePort;
+      if (prevDebug === undefined) delete process.env.AGY_DEBUG;
+      else process.env.AGY_DEBUG = prevDebug;
+      if (prevSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = prevSubagentChild;
+      await h.close();
+    }
+    await waitForDiskFlush();
+    assert.equal(fs.existsSync(h.tmpDir), false);
+  },
+);

@@ -20,20 +20,25 @@ import {
 	ListToolsRequestSchema,
 	SUPPORTED_PROTOCOL_VERSIONS,
 } from "@modelcontextprotocol/sdk/types.js";
+import { PI_BRIDGE_SERVER_PREFIX } from "./bridge-catalog.js";
 
 const PACKAGE_VERSION = (() => {
 	try {
 		const raw = fs.readFileSync(new URL("../package.json", import.meta.url), "utf8");
 		const parsed = JSON.parse(raw) as { version?: unknown };
-		return typeof parsed.version === "string" && parsed.version.trim() ? parsed.version.trim() : "2.3.0";
+		return typeof parsed.version === "string" && parsed.version.trim()
+			? parsed.version.trim()
+			: "2.4.0";
 	} catch {
-		return "2.3.0";
+		return "2.4.0";
 	}
 })();
 
 /** Shared-secret header required on every bridge HTTP request. */
 export const TOKEN_HEADER = "x-bridge-token";
 const MAX_BODY_BYTES = 1_000_000;
+const NS_ROUTE_PREFIX = "/mcp/ns/";
+const NS_ROUTE_NAME_RE = /^[a-z0-9-]+$/;
 
 export interface McpServerHandle {
 	port: number;
@@ -49,13 +54,43 @@ export interface McpStartResult {
 }
 
 export interface McpBridgeDeps {
-	listTools(): Array<{ name: string; description: string; inputSchema: object }>;
+	listTools(route?: string): Array<{ name: string; description: string; inputSchema: object }>;
 	onToolCall(
 		callId: string,
 		name: string,
 		args: Record<string, unknown>,
 		signal: AbortSignal,
+		route?: string,
 	): Promise<import("./provider.js").BridgeCallResultShape>;
+	instructions?: string | ((route: string) => string | undefined);
+}
+
+function resolveMcpRoute(rawUrl: string | undefined): { route: string; serverName: string } | null {
+	if (!rawUrl) return null;
+	let pathname: string;
+	if (rawUrl.startsWith("/")) {
+		const queryIdx = rawUrl.indexOf("?");
+		pathname = queryIdx >= 0 ? rawUrl.slice(0, queryIdx) : rawUrl;
+	} else {
+		try {
+			pathname = new URL(rawUrl).pathname;
+		} catch {
+			return null;
+		}
+	}
+	if (pathname === "/mcp" || pathname === `/mcp/${PI_BRIDGE_SERVER_PREFIX}`) {
+		return { route: PI_BRIDGE_SERVER_PREFIX, serverName: PI_BRIDGE_SERVER_PREFIX };
+	}
+	if (pathname.startsWith(NS_ROUTE_PREFIX)) {
+		const routeName = pathname.slice(NS_ROUTE_PREFIX.length);
+		if (NS_ROUTE_NAME_RE.test(routeName)) {
+			return {
+				route: `ns:${routeName}`,
+				serverName: `${PI_BRIDGE_SERVER_PREFIX}-${routeName}`,
+			};
+		}
+	}
+	return null;
 }
 
 export function isPidAlive(pid: number): boolean {
@@ -88,48 +123,57 @@ export async function startMcpServer(
 ): Promise<McpStartResult> {
 	const log = opts.log ?? (() => {});
 
-	const listHandler = async () => {
-		const tools = deps.listTools();
-		log("list-tools", { count: tools.length });
+	const listHandler = async (route: string) => {
+		const tools = deps.listTools(route);
+		log("list-tools", { route, count: tools.length });
 		return { tools };
 	};
 
 	const callHandler = async (
+		route: string,
 		request: { params: { name: string; arguments?: unknown } },
 		signal?: AbortSignal,
 	) => {
 		const { name, arguments: args } = request.params;
 		const meta = (request.params as { _meta?: { progressToken?: unknown } })._meta;
 		if (meta && meta.progressToken !== undefined) {
-			log("progress-token", { name, token: String(meta.progressToken) });
+			log("progress-token", { route, name, token: String(meta.progressToken) });
 		}
 		const callId = crypto.randomUUID();
-		log("call-tool", { name, callId });
+		log("call-tool", { route, name, callId });
 		try {
 			const r = await deps.onToolCall(
 				callId,
 				name,
 				(args && typeof args === "object" ? args : {}) as Record<string, unknown>,
 				signal ?? new AbortController().signal,
+				route,
 			);
 			const content =
 				r.content && r.content.length > 0 ? r.content : [{ type: "text", text: JSON.stringify(r) }];
-			log("call-tool-ok", { name, callId });
+			log("call-tool-ok", { route, name, callId });
 			return { content, isError: r.isError ?? false };
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
-			log("call-tool-fail", { name, callId, msg });
+			log("call-tool-fail", { route, name, callId, msg });
 			return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
 		}
 	};
 
-	const makeServer = (signal: AbortSignal) => {
+	const resolveInstructions = (route: string): string | undefined => {
+		const raw =
+			typeof deps.instructions === "function" ? deps.instructions(route) : deps.instructions;
+		return typeof raw === "string" && raw.trim().length > 0 ? raw : undefined;
+	};
+
+	const makeServer = (route: string, serverName: string, signal: AbortSignal) => {
+		const instructions = resolveInstructions(route);
 		const s = new Server(
-			{ name: "ant-bridge", version: PACKAGE_VERSION },
-			{ capabilities: { tools: {} } },
+			{ name: serverName, version: PACKAGE_VERSION },
+			{ capabilities: { tools: {} }, ...(instructions ? { instructions } : {}) },
 		);
-		s.setRequestHandler(ListToolsRequestSchema, listHandler);
-		s.setRequestHandler(CallToolRequestSchema, (request) => callHandler(request, signal));
+		s.setRequestHandler(ListToolsRequestSchema, () => listHandler(route));
+		s.setRequestHandler(CallToolRequestSchema, (request) => callHandler(route, request, signal));
 		return s;
 	};
 
@@ -168,6 +212,11 @@ export async function startMcpServer(
 					res.writeHead(403, { "content-type": "application/json" }).end('{"error":"forbidden"}');
 					return;
 				}
+				const resolvedRoute = resolveMcpRoute(req.url);
+				if (!resolvedRoute) {
+					res.writeHead(404, { "content-type": "application/json" }).end('{"error":"not found"}');
+					return;
+				}
 				let body = "";
 				let bytes = 0;
 				let tooLarge = false;
@@ -185,11 +234,26 @@ export async function startMcpServer(
 						.end('{"error":"payload too large"}');
 					return;
 				}
-				let parsed: { method?: string; params?: { protocolVersion?: string } };
+				let parsed: { id?: unknown; method?: string; params?: { protocolVersion?: string } };
 				try {
 					parsed = JSON.parse(body);
 				} catch {
 					res.writeHead(400).end("invalid json");
+					return;
+				}
+				if (
+					parsed &&
+					typeof parsed === "object" &&
+					!Array.isArray(parsed) &&
+					parsed.method === "server/discover"
+				) {
+					res.writeHead(200, { "content-type": "application/json" }).end(
+						JSON.stringify({
+							jsonrpc: "2.0",
+							id: (parsed as { id?: unknown }).id ?? null,
+							error: { code: -32601, message: "Method not found" },
+						}),
+					);
 					return;
 				}
 				clampProtocolVersionHeader(req);
@@ -201,7 +265,7 @@ export async function startMcpServer(
 				try {
 					const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 					transport.onerror = (e: Error) => log("transport-error", e.message);
-					const server = makeServer(ac.signal);
+					const server = makeServer(resolvedRoute.route, resolvedRoute.serverName, ac.signal);
 					await server.connect(transport);
 					await transport.handleRequest(req, res, parsed as object);
 				} catch (e) {

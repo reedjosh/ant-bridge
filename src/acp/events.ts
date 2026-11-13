@@ -15,6 +15,7 @@
 // Exact turn usage is read from PromptResponse by the connection.
 
 import { fileURLToPath } from "node:url";
+import { PI_BRIDGE_SERVER_RE } from "../bridge-catalog.js";
 import { StreamSanitizer, sanitizeSystemMessage } from "../stream-sanitizer.js";
 
 export { StreamSanitizer, sanitizeSystemMessage };
@@ -55,6 +56,7 @@ export type MappedUpdate =
 			toolCallId: string;
 			args?: Record<string, unknown>;
 			location?: AcpToolLocation;
+			mcpServer?: string;
 	  }
 	| {
 			kind: "tool_done";
@@ -101,18 +103,23 @@ export function mapUpdate(update: unknown): MappedUpdate {
 			if (!id) return null;
 			const nativeMcp = nativeMcpTool(u);
 			const location = firstLocation(u.locations) ?? titleLocation(u.title);
+			const rawArgs = rawArguments(u.rawInput);
+			const name =
+				metaToolName(u._meta) ??
+				nativeMcp?.name ??
+				stringField(u.name) ??
+				toolName(u.title, u.kind);
+			const mcpServer =
+				stringField(recordField(recordField(u._meta).mcp).server) ??
+				nativeMcp?.server ??
+				(isCallMcpTool(u, nativeMcp) ? callMcpServerArg(rawArgs) : undefined);
 			return {
 				kind: "tool_start",
 				toolCallId: id,
-				name:
-					metaToolName(u._meta) ??
-					nativeMcp?.name ??
-					stringField(u.name) ??
-					toolName(u.title, u.kind),
-				args: rawArguments(u.rawInput),
+				name,
+				args: rawArgs,
 				...(location ? { location } : {}),
-				mcpServer:
-					stringField(recordField(recordField(u._meta).mcp).server) ?? nativeMcp?.server,
+				mcpServer,
 				// Edits carry their native diff HERE, on the pending tool_call
 				// frame (run 6:10) - the completed update carries only display
 				// text. contentDiff on the update stays as a future-build
@@ -124,7 +131,13 @@ export function mapUpdate(update: unknown): MappedUpdate {
 			const id = stringField(u.toolCallId);
 			if (!id) return null;
 			const location = firstLocation(u.locations) ?? titleLocation(u.title);
-			const args = nonEmptyRecord(rawArguments(u.rawInput));
+			const rawArgs = rawArguments(u.rawInput);
+			const args = nonEmptyRecord(rawArgs);
+			const nativeMcp = nativeMcpTool(u);
+			const mcpServer =
+				stringField(recordField(recordField(u._meta).mcp).server) ??
+				nativeMcp?.server ??
+				(isCallMcpTool(u, nativeMcp) ? callMcpServerArg(rawArgs) : undefined);
 			if (u.status === "failed") {
 				// Legacy approved-echo: after an allow, the APPROVED call
 				// id reports failed with this sentinel while the real work runs
@@ -133,9 +146,6 @@ export function mapUpdate(update: unknown): MappedUpdate {
 				// failure next to a successful edit.
 				const raw = stringField(u.rawOutput);
 				if (raw?.includes("approved but never executed")) return null;
-				const mcpServer =
-					stringField(recordField(recordField(u._meta).mcp).server) ??
-					nativeMcpTool(u)?.server;
 				return {
 					kind: "tool_error",
 					toolCallId: id,
@@ -150,9 +160,6 @@ export function mapUpdate(update: unknown): MappedUpdate {
 				// often just the server's display title, not the result (probe
 				// 2026-09-03: completed MCP call, rawOutput "Call bridge_echo").
 				const diff = contentDiff(u.content);
-				const mcpServer =
-					stringField(recordField(recordField(u._meta).mcp).server) ??
-					nativeMcpTool(u)?.server;
 				return {
 					kind: "tool_done",
 					toolCallId: id,
@@ -163,12 +170,13 @@ export function mapUpdate(update: unknown): MappedUpdate {
 					...(diff ? { diff } : {}),
 				};
 			}
-			if (args || location) {
+			if (args || location || mcpServer) {
 				return {
 					kind: "tool_update",
 					toolCallId: id,
 					...(args ? { args } : {}),
 					...(location ? { location } : {}),
+					...(mcpServer ? { mcpServer } : {}),
 				};
 			}
 			return null; // in_progress or unknown status: nothing to render yet
@@ -192,9 +200,31 @@ function rawArguments(rawInput: unknown): Record<string, unknown> {
 }
 
 /** Only our known server prefix is unambiguous without _meta. */
-function nativeMcpTool(update: Record<string, unknown>): { name: string; server: string } | undefined {
-	const match = /^mcp_(pi-bridge(?:-\d+)?)_(.+)$/.exec(stringField(update.name) ?? "");
+function nativeMcpTool(
+	update: Record<string, unknown>,
+): { name: string; server: string } | undefined {
+	const match = /^mcp_(pi-bridge(?:-[a-zA-Z0-9-]+)?)_(.+)$/.exec(stringField(update.name) ?? "");
 	return match ? { server: match[1]!, name: match[2]! } : undefined;
+}
+
+function isCallMcpTool(
+	update: Record<string, unknown>,
+	nativeMcp?: { name: string; server: string },
+): boolean {
+	const resolved =
+		metaToolName(update._meta) ??
+		nativeMcp?.name ??
+		stringField(update.name) ??
+		toolName(update.title, update.kind);
+	if (resolved === "call_mcp_tool") return true;
+	const title = stringField(update.title)?.trim();
+	return title ? /^(?:(?:Run|Running|Call|Calling)\s+)?call_mcp_tool\??$/i.test(title) : false;
+}
+
+export function callMcpServerArg(args: Record<string, unknown>): string | undefined {
+	const candidate =
+		stringField(args.ServerName) ?? stringField(args.serverName) ?? stringField(args.server);
+	return candidate && PI_BRIDGE_SERVER_RE.test(candidate) ? candidate : undefined;
 }
 
 /** Clean tool name for MCP tools: the title is "<server>_<tool>" (e.g.

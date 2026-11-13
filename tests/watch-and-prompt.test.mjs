@@ -7,9 +7,12 @@ import { importBridgeModule } from "./helpers/pi-loader.mjs";
 
 const {
   DIGEST_PREAMBLE,
+  PI_BRIDGE_INSTRUCTIONS,
   SEED_DIGEST_PREAMBLE,
+  TOOL_PRIORITY_NOTE,
   ToolRoundTrips,
   buildContextDigest,
+  buildFullPrompt,
   createStreamSimple,
   extractImages,
   extractUserPrompt,
@@ -482,4 +485,55 @@ test("fresh 1-turn session sends no contextBlock", async () => {
     assert.equal(requests[0].contextBlock, undefined);
     assert.match(requests[0].prompt, /Hello from a brand-new session/);
   });
+});
+
+test("TOOL_PRIORITY_NOTE and PI_BRIDGE_INSTRUCTIONS are plain ASCII and cover MCP routing and codemode UX", () => {
+  for (const [label, value] of [
+    ["TOOL_PRIORITY_NOTE", TOOL_PRIORITY_NOTE],
+    ["PI_BRIDGE_INSTRUCTIONS", PI_BRIDGE_INSTRUCTIONS],
+  ]) {
+    assert.equal(typeof value, "string", `${label} must be a string`);
+    assert.ok(value.length > 0, `${label} must be non-empty`);
+    assert.doesNotMatch(value, /[^\x00-\x7f]/, `${label} must be plain ASCII`);
+    for (const token of ["pi-bridge-", "call_mcp_tool", "text(", "bridge_poll_result"]) {
+      assert.ok(value.includes(token), `${label} must cover ${token}`);
+    }
+  }
+
+  for (const line of PI_BRIDGE_INSTRUCTIONS.split("\n")) {
+    assert.ok(line.length <= 120, `PI_BRIDGE_INSTRUCTIONS line exceeds 120 cols: ${line}`);
+  }
+  assert.ok(PI_BRIDGE_INSTRUCTIONS.includes("STILL RUNNING"));
+  assert.ok(PI_BRIDGE_INSTRUCTIONS.includes("structuredContent"));
+
+  assert.ok(TOOL_PRIORITY_NOTE.startsWith("[Tool priority:"));
+  assert.ok(TOOL_PRIORITY_NOTE.endsWith("]"));
+  assert.doesNotMatch(TOOL_PRIORITY_NOTE, /  /);
+  for (const preserved of [
+    "ask_user_question",
+    "ask_question",
+    "read_file",
+    "edit_file",
+    "write_file",
+    "run_command",
+    "subagent",
+    "invoke_subagent",
+    "STILL RUNNING",
+    "20 seconds",
+    "120 seconds",
+    "mcp_pi-bridge_codemode",
+    "searchTools",
+    "describeNamespace",
+    "~/.pi",
+    "<server>/<tool>",
+    "swarm",
+    "pi-bridge* tools",
+    "parent turn ends",
+    "never wake pi",
+  ]) {
+    assert.ok(TOOL_PRIORITY_NOTE.includes(preserved), `TOOL_PRIORITY_NOTE must include ${preserved}`);
+  }
+
+  const full = buildFullPrompt("System rules.", "", "Hello");
+  assert.ok(full.includes(TOOL_PRIORITY_NOTE));
 });

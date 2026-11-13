@@ -892,6 +892,11 @@ test(
     const agentDir = path.join(h.tmpDir, "agent");
     fs.mkdirSync(fakeHome, { recursive: true });
     fs.mkdirSync(agentDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(h.tmpDir, "SKILL.md"),
+      "---\nname: demo\ndescription: Demo skill\n---\n# Demo Body\n",
+      "utf8",
+    );
 
     const prevHome = process.env.HOME;
     const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -1049,11 +1054,24 @@ test(
       );
       assert.equal(coreClient.getServerVersion()?.name, "pi-bridge");
       assert.equal(coreClient.getInstructions(), PI_BRIDGE_INSTRUCTIONS);
-      const coreToolsList = (await coreClient.listTools()).tools.map((t) => t.name);
+      const coreListedFull = (await coreClient.listTools()).tools;
+      const coreToolsList = coreListedFull.map((t) => t.name);
       assert.equal(coreToolsList.includes("codemode"), true);
       assert.equal(coreToolsList.includes("subagent"), true);
       assert.equal(coreToolsList.includes("activate_skill"), true);
+      assert.equal(coreToolsList.includes("call_pi_tool"), true);
       assert.equal(coreToolsList.includes("bridge_poll_result"), true);
+      const callPiToolDef = coreListedFull.find((t) => t.name === "call_pi_tool");
+      const serializedCallPiTool = JSON.stringify({
+        name: callPiToolDef.name,
+        description: callPiToolDef.description,
+        parameters: callPiToolDef.inputSchema,
+      });
+      const callPiToolBytes = Buffer.byteLength(serializedCallPiTool, "utf8");
+      assert.ok(
+        callPiToolBytes < 500,
+        `call_pi_tool schema must stay <500B so agy loads it eagerly; got ${callPiToolBytes}B`,
+      );
       assert.equal(
         coreToolsList.some((n) => n.includes("slack")),
         false,
@@ -1063,6 +1081,13 @@ test(
         arguments: { channel: "C123" },
       });
       assert.equal(rejectedOnCore.isError, true);
+
+      const skillViaDispatcher = await coreClient.callTool({
+        name: "call_pi_tool",
+        arguments: { name: "activate_skill", arguments: { name: "demo" } },
+      });
+      assert.equal(skillViaDispatcher.isError, false);
+      assert.match(skillViaDispatcher.content[0].text, /# Demo Body/);
 
       // (3) /mcp/ns/slack lists ONLY slack_read_channel and routes tools/call to Pi's mcp__slack__slack_read_channel.
       slackClient = new Client({ name: "slack-client", version: "1.0.0" });
@@ -1119,6 +1144,52 @@ test(
       const slackResult = await callPromise;
       assert.equal(slackResult.isError, false);
       assert.equal(slackResult.content[0].text, "deploy succeeded in #general");
+
+      // (3b) call_pi_tool dispatches both core tools (subagent) and non-eager MCP tools cleanly.
+      const subagentViaDispatcher = coreClient.callTool({
+        name: "call_pi_tool",
+        arguments: {
+          name: "subagent",
+          arguments: { agent: "worker", task: "ping", toolSummary: "Run subagent" },
+        },
+      });
+      const parkedSubagent = await streamCont.result();
+      assert.equal(parkedSubagent.stopReason, "toolUse");
+      const subagentToolCall = parkedSubagent.content.find((c) => c.type === "toolCall");
+      assert.equal(subagentToolCall?.name, "subagent");
+      assert.deepEqual(subagentToolCall?.arguments, { agent: "worker", task: "ping" });
+
+      const streamAfterSubagent = providerSpec.streamSimple(
+        model,
+        {
+          messages: [
+            userMsg,
+            parkedMsg,
+            {
+              role: "toolResult",
+              toolCallId: toolCall.id,
+              toolName: "mcp__slack__slack_read_channel",
+              content: [{ type: "text", text: "deploy succeeded in #general" }],
+              isError: false,
+              timestamp: 2,
+            },
+            parkedSubagent,
+            {
+              role: "toolResult",
+              toolCallId: subagentToolCall.id,
+              toolName: "subagent",
+              content: [{ type: "text", text: "worker pong" }],
+              isError: false,
+              timestamp: 3,
+            },
+          ],
+        },
+        { cwd: h.tmpDir, sessionId: "mcp-ns-sess" },
+      );
+
+      const subagentResult = await subagentViaDispatcher;
+      assert.equal(subagentResult.isError, false);
+      assert.equal(subagentResult.content[0].text, "worker pong");
 
       // (4) onNativeEvent suppresses pi-bridge-slack (both eager and lazy call_mcp_tool), while keeping native tools.
       const sessId = promptFrame.params.sessionId;
@@ -1184,8 +1255,21 @@ test(
         rawOutput: "file contents",
       });
 
+      h.sendUpdate(sessId, {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc-call-pi-tool",
+        name: "mcp_pi-bridge_call_pi_tool",
+        rawInput: { name: "subagent", arguments: { agent: "worker", task: "ping" } },
+      });
+      h.sendUpdate(sessId, {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tc-call-pi-tool",
+        status: "completed",
+        name: "mcp_pi-bridge_call_pi_tool",
+        rawOutput: "suppressed dispatcher",
+      });
       h.replyPrompt(promptFrame, "end_turn");
-      const finalMsg = await streamCont.result();
+      const finalMsg = await streamAfterSubagent.result();
       assert.equal(finalMsg.stopReason, "stop");
 
       const nativeEntries = appendedEntries.filter((e) => e.customType === "agy-native-event");

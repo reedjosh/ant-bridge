@@ -3,13 +3,16 @@ import test from "node:test";
 import { importBridgeModule } from "./helpers/pi-loader.mjs";
 
 const {
+  CALL_PI_TOOL_NAME,
   PI_BRIDGE_SERVER_PREFIX,
   PI_BRIDGE_SERVER_RE,
   bridgeCatalogFingerprint,
   bridgeServerPrefix,
   bridgedPiTools,
+  normalizeCallPiToolArguments,
   parseMcpBridgeToolName,
   partitionBridgeTools,
+  resolveCallPiToolTarget,
 } = await importBridgeModule("src/bridge-catalog.ts");
 
 const ALL_TOOLS = [
@@ -28,6 +31,7 @@ const ALL_TOOLS = [
   { name: "pr_work", sourceInfo: { path: "/ext/pr-tracker/index.ts", source: "local" } },
   { name: "subagent", sourceInfo: { path: "/ext/pi-subagents/index.ts", source: "npm:pi-subagents" } },
   { name: "bridge_poll_result", sourceInfo: { path: "/ext/ant-bridge/index.ts", source: "local" } },
+  { name: "call_pi_tool", sourceInfo: { path: "/ext/ant-bridge/index.ts", source: "local" } },
   { name: "activate_skill", sourceInfo: { path: "/ext/ant-bridge/index.ts", source: "local" } },
 ];
 
@@ -243,4 +247,120 @@ test("bridgeCatalogFingerprint returns deterministic SHA-256 hex invariant to in
   ]);
   const fpSingle = bridgeCatalogFingerprint([{ name: "mcp__foo_bar__run" }]);
   assert.notEqual(fpCollision, fpSingle);
+});
+
+test("resolveCallPiToolTarget resolves core, self, canonical, qualified, and bare MCP tools", () => {
+  assert.equal(CALL_PI_TOOL_NAME, "call_pi_tool");
+  const catalog = [
+    { name: "subagent" },
+    { name: "codemode" },
+    { name: "mcp__slack__slack_read_thread" },
+    { name: "mcp__linear__whoami" },
+    { name: "mcp__sentry__whoami" },
+  ];
+
+  assert.deepEqual(resolveCallPiToolTarget("subagent", catalog), {
+    kind: "tool",
+    piName: "subagent",
+    tool: catalog[0],
+  });
+  assert.deepEqual(resolveCallPiToolTarget("pi-bridge/subagent", catalog), {
+    kind: "tool",
+    piName: "subagent",
+    tool: catalog[0],
+  });
+  assert.deepEqual(resolveCallPiToolTarget("mcp_pi-bridge_codemode", catalog), {
+    kind: "tool",
+    piName: "codemode",
+    tool: catalog[1],
+  });
+  assert.deepEqual(resolveCallPiToolTarget("pi-bridge-s4242/subagent", catalog, "pi-bridge-s4242"), {
+    kind: "tool",
+    piName: "subagent",
+    tool: catalog[0],
+  });
+
+  assert.deepEqual(resolveCallPiToolTarget("activate_skill", catalog), {
+    kind: "self",
+    name: "activate_skill",
+  });
+  assert.deepEqual(resolveCallPiToolTarget("mcp_pi-bridge_bridge_poll_result", catalog), {
+    kind: "self",
+    name: "bridge_poll_result",
+  });
+  assert.deepEqual(resolveCallPiToolTarget("call_pi_tool", catalog), { kind: "recursive" });
+  assert.deepEqual(resolveCallPiToolTarget("mcp_pi-bridge_call_pi_tool", catalog), {
+    kind: "recursive",
+  });
+
+  assert.deepEqual(resolveCallPiToolTarget("slack_read_thread", catalog), {
+    kind: "tool",
+    piName: "mcp__slack__slack_read_thread",
+    tool: catalog[2],
+  });
+  assert.deepEqual(resolveCallPiToolTarget("pi-bridge-slack/slack_read_thread", catalog), {
+    kind: "tool",
+    piName: "mcp__slack__slack_read_thread",
+    tool: catalog[2],
+  });
+  assert.deepEqual(resolveCallPiToolTarget("slack/slack_read_thread", catalog), {
+    kind: "tool",
+    piName: "mcp__slack__slack_read_thread",
+    tool: catalog[2],
+  });
+  assert.deepEqual(resolveCallPiToolTarget("mcp_pi-bridge-slack_slack_read_thread", catalog), {
+    kind: "tool",
+    piName: "mcp__slack__slack_read_thread",
+    tool: catalog[2],
+  });
+  assert.deepEqual(resolveCallPiToolTarget("mcp__slack__slack_read_thread", catalog), {
+    kind: "tool",
+    piName: "mcp__slack__slack_read_thread",
+    tool: catalog[2],
+  });
+
+  assert.deepEqual(resolveCallPiToolTarget("whoami", catalog), {
+    kind: "ambiguous",
+    requested: "whoami",
+    candidates: ["pi-bridge-linear/whoami", "pi-bridge-sentry/whoami"],
+  });
+  assert.deepEqual(resolveCallPiToolTarget("pi-bridge-linear/whoami", catalog), {
+    kind: "tool",
+    piName: "mcp__linear__whoami",
+    tool: catalog[3],
+  });
+  assert.deepEqual(resolveCallPiToolTarget("sentry:whoami", catalog), {
+    kind: "tool",
+    piName: "mcp__sentry__whoami",
+    tool: catalog[4],
+  });
+  assert.deepEqual(resolveCallPiToolTarget("missing_tool", catalog), {
+    kind: "not_found",
+    requested: "missing_tool",
+  });
+});
+
+test("normalizeCallPiToolArguments accepts object or JSON string and strips undeclared toolSummary", () => {
+  assert.deepEqual(normalizeCallPiToolArguments(undefined), { ok: true, args: {} });
+  assert.deepEqual(normalizeCallPiToolArguments(""), { ok: true, args: {} });
+  assert.deepEqual(
+    normalizeCallPiToolArguments(
+      { channel: "C1", toolSummary: "Read channel" },
+      { type: "object", properties: { channel: { type: "string" } } },
+    ),
+    { ok: true, args: { channel: "C1" } },
+  );
+  assert.deepEqual(
+    normalizeCallPiToolArguments(
+      { channel: "C1", toolSummary: "Declared" },
+      { type: "object", properties: { channel: { type: "string" }, toolSummary: { type: "string" } } },
+    ),
+    { ok: true, args: { channel: "C1", toolSummary: "Declared" } },
+  );
+  assert.deepEqual(normalizeCallPiToolArguments('{"agent":"worker","task":"hi"}'), {
+    ok: true,
+    args: { agent: "worker", task: "hi" },
+  });
+  assert.equal(normalizeCallPiToolArguments("[1,2,3]").ok, false);
+  assert.equal(normalizeCallPiToolArguments("not-json").ok, false);
 });

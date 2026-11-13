@@ -38,9 +38,12 @@ import {
 	bridgeCatalogFingerprint,
 	bridgedPiTools,
 	bridgeServerPrefix,
+	CALL_PI_TOOL_NAME,
+	normalizeCallPiToolArguments,
 	partitionBridgeTools,
 	PI_BRIDGE_SERVER_PREFIX,
 	PI_BRIDGE_SERVER_RE,
+	resolveCallPiToolTarget,
 } from "../src/bridge-catalog.js";
 import {
 	configPath,
@@ -743,6 +746,28 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			}
 		}
 		tools.push({
+			name: CALL_PI_TOOL_NAME,
+			description: [
+				"Invoke any Pi or bridged MCP tool by name (for non-eager tools in",
+				"mcp/pi-bridge*/<tool>.json, such as subagent or codemode).",
+			].join(" "),
+			inputSchema: {
+				type: "object",
+				properties: {
+					name: {
+						type: "string",
+						description: "Tool name or <server>/<tool>",
+					},
+					arguments: {
+						type: "object",
+						description: "Tool arguments object",
+						additionalProperties: true,
+					},
+				},
+				required: ["name"],
+			},
+		});
+		tools.push({
 			name: POLL_TOOL_NAME,
 			description: [
 				"Fetch the result of a long-running bridge tool call that answered STILL RUNNING with a callId.",
@@ -795,6 +820,62 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			const view = roundTrips.poll(wanted);
 			if (view && view.state !== "running") roundTrips.markDelivered(wanted);
 			return Promise.resolve(formatPollAnswer(wanted, view));
+		}
+		if (name === CALL_PI_TOOL_NAME) {
+			if (loadConfig().bridgeTools === "none") {
+				const raw = typeof args.name === "string" ? args.name.trim() : "";
+				return Promise.resolve(toolNotExposedResult(raw || CALL_PI_TOOL_NAME));
+			}
+			const rawTarget = typeof args.name === "string" ? args.name : "";
+			const resolved = resolveCallPiToolTarget(
+				rawTarget,
+				getBridgeTools(),
+				bridgeServerPrefix(),
+			);
+			if (resolved.kind === "recursive") {
+				return Promise.resolve({
+					content: [{ type: "text", text: "Error: call_pi_tool cannot invoke itself" }],
+					isError: true,
+				});
+			}
+			if (resolved.kind === "ambiguous") {
+				const choices = resolved.candidates.join(", ");
+				return Promise.resolve({
+					content: [
+						{
+							type: "text",
+							text: `Tool "${resolved.requested}" exists on multiple MCP servers; specify one of: ${choices}`,
+						},
+					],
+					isError: true,
+				});
+			}
+			if (resolved.kind === "not_found") {
+				return Promise.resolve(toolNotExposedResult(resolved.requested || "(none given)"));
+			}
+			const rawNested = args.arguments !== undefined ? args.arguments : args.args;
+			const targetParams = resolved.kind === "tool" ? resolved.tool.parameters : undefined;
+			const parsedArgs = normalizeCallPiToolArguments(rawNested, targetParams);
+			if (!parsedArgs.ok) {
+				return Promise.resolve({
+					content: [{ type: "text", text: `Error: ${parsedArgs.error}` }],
+					isError: true,
+				});
+			}
+			if (resolved.kind === "self") {
+				return bridgeOnToolCall(
+					callId,
+					resolved.name,
+					parsedArgs.args,
+					signal,
+					PI_BRIDGE_SERVER_PREFIX,
+				);
+			}
+			return roundTrips.onToolCall(callId, resolved.piName, parsedArgs.args, signal).then((r) => {
+				if (!("escalated" in r)) return r;
+				mcpLog("call-tool-escalated", { name: resolved.piName, callId: r.callId });
+				return formatEscalatedAck(r);
+			});
 		}
 		if (name !== ACTIVATE_SKILL_TOOL_NAME) {
 			const { coreTools } = partitionBridgeTools(getBridgeTools());

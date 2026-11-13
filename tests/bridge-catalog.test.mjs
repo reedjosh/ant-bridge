@@ -9,6 +9,8 @@ const {
   bridgeCatalogFingerprint,
   bridgeServerPrefix,
   bridgedPiTools,
+  bridgedTranscriptTools,
+  childBridgeServerPrefix,
   normalizeCallPiToolArguments,
   parseMcpBridgeToolName,
   partitionBridgeTools,
@@ -134,6 +136,8 @@ test("bridgeServerPrefix isolates PI_SUBAGENT_CHILD=1 by PID and threads serverP
   assert.equal(bridgeServerPrefix({}, 4242), "pi-bridge");
   assert.equal(bridgeServerPrefix({ PI_SUBAGENT_CHILD: "0" }, 4242), "pi-bridge");
   assert.equal(bridgeServerPrefix({ PI_SUBAGENT_CHILD: "1" }, 4242), "pi-bridge-s4242");
+  assert.equal(bridgeServerPrefix({ PI_SUBAGENT_CHILD: "1" }, 4242, 2), "pi-bridge-s4242-i2");
+  assert.equal(PI_BRIDGE_SERVER_RE.test("pi-bridge-s4242-i2-slack"), true);
 
   const childPrefix = bridgeServerPrefix({ PI_SUBAGENT_CHILD: "1" }, 4242);
   assert.equal(PI_BRIDGE_SERVER_RE.test(childPrefix), true);
@@ -363,4 +367,66 @@ test("normalizeCallPiToolArguments accepts object or JSON string and strips unde
   });
   assert.equal(normalizeCallPiToolArguments("[1,2,3]").ok, false);
   assert.equal(normalizeCallPiToolArguments("not-json").ok, false);
+});
+
+test("childBridgeServerPrefix and bridgedTranscriptTools isolate in-process child sessions", () => {
+  const childPrefix = childBridgeServerPrefix(4242, 3);
+  assert.equal(childPrefix, "pi-bridge-s4242-c3");
+  assert.equal(PI_BRIDGE_SERVER_RE.test(childPrefix), true);
+  assert.equal(PI_BRIDGE_SERVER_RE.test(`${childPrefix}-linear`), true);
+
+  const transcriptDecls = [
+    { name: "read" },
+    { name: "bash" },
+    { name: "edit" },
+    { name: "write" },
+    { name: "grep" },
+    { name: "find" },
+    { name: "ls" },
+    { name: "powershell" },
+    { name: "contact_supervisor" },
+    { name: "structured_output" },
+    { name: "codemode" },
+    { name: "tool_search" },
+    { name: "read_mcp_resource" },
+    { name: "mcp__linear__whoami" },
+    { name: "call_pi_tool" },
+    { name: "bridge_poll_result" },
+    { name: "activate_skill" },
+  ];
+
+  assert.deepEqual(
+    bridgedTranscriptTools(transcriptDecls, "all").map((t) => t.name),
+    [
+      "contact_supervisor",
+      "structured_output",
+      "codemode",
+      "tool_search",
+      "read_mcp_resource",
+      "mcp__linear__whoami",
+    ],
+  );
+  assert.deepEqual(
+    bridgedTranscriptTools(transcriptDecls, "mcp").map((t) => t.name),
+    ["codemode", "tool_search", "read_mcp_resource", "mcp__linear__whoami"],
+  );
+  assert.deepEqual(bridgedTranscriptTools(transcriptDecls, "none"), []);
+
+  const childCatalog = bridgedTranscriptTools(transcriptDecls, "all");
+  assert.deepEqual(
+    resolveCallPiToolTarget(`mcp_${childPrefix}_call_pi_tool`, childCatalog, childPrefix),
+    { kind: "recursive" },
+  );
+  assert.deepEqual(
+    resolveCallPiToolTarget(`${childPrefix}/contact_supervisor`, childCatalog, childPrefix),
+    { kind: "tool", piName: "contact_supervisor", tool: childCatalog[0] },
+  );
+  assert.deepEqual(
+    resolveCallPiToolTarget(`${childPrefix}-linear/whoami`, childCatalog, childPrefix),
+    { kind: "tool", piName: "mcp__linear__whoami", tool: childCatalog[5] },
+  );
+  assert.deepEqual(
+    resolveCallPiToolTarget("pi-bridge-linear/whoami", childCatalog, childPrefix),
+    { kind: "tool", piName: "mcp__linear__whoami", tool: childCatalog[5] },
+  );
 });

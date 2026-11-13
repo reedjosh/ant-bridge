@@ -7,12 +7,22 @@ export const CALL_PI_TOOL_NAME = "call_pi_tool";
 
 const MCP_BRIDGE_TOOL_RE = /^mcp__([a-zA-Z0-9_-]+?)__(.+)$/;
 
-/** Compute the MCP server prefix, isolating Pi child subagent processes by PID. */
+/** Compute the MCP server prefix, isolating Pi child subagent processes by PID and instance. */
 export function bridgeServerPrefix(
 	env: NodeJS.ProcessEnv = process.env,
 	pid: number = process.pid,
+	instanceSeq: number = 1,
 ): string {
-	return env.PI_SUBAGENT_CHILD === "1" ? `pi-bridge-s${pid}` : PI_BRIDGE_SERVER_PREFIX;
+	if (env.PI_SUBAGENT_CHILD !== "1") return PI_BRIDGE_SERVER_PREFIX;
+	return instanceSeq > 1 ? `pi-bridge-s${pid}-i${instanceSeq}` : `pi-bridge-s${pid}`;
+}
+
+/** Compute an isolated MCP server prefix for an in-process child session (`async: false`). */
+export function childBridgeServerPrefix(
+	pid: number = process.pid,
+	childSeq: number = 1,
+): string {
+	return `pi-bridge-s${pid}-c${childSeq}`;
 }
 
 export interface BridgeToolInfo {
@@ -55,6 +65,13 @@ const CORE_BUILTIN_PATHS = new Set([...CORE_BUILTIN_TOOLS].map((name) => `builti
 
 /** Bridge-local pseudo-tools registered on the MCP endpoint itself (never Pi round-trips). */
 const SELF_TOOLS = new Set(["bridge_poll_result", CALL_PI_TOOL_NAME, "activate_skill"]);
+const TRANSCRIPT_MCP_HELPER_TOOLS = new Set([
+	"codemode",
+	"tool_search",
+	"list_mcp_resources",
+	"list_mcp_resource_templates",
+	"read_mcp_resource",
+]);
 
 function isCoreBuiltin(tool: BridgeToolInfo): boolean {
 	if (tool.sourceInfo?.source !== "builtin") return false;
@@ -88,6 +105,23 @@ export function bridgedPiTools(
 			!hidden.has(tool.name) &&
 			!SELF_TOOLS.has(tool.name) &&
 			(mode === "mcp" ? isMcpBridgeTool(tool) : !isCoreBuiltin(tool)),
+	);
+}
+
+/** Filter transcript tool declarations (`getCurrentTools(messages)`, where `sourceInfo` is
+ *  stripped) for an in-process child session's isolated MCP bridge. */
+export function bridgedTranscriptTools(
+	tools: BridgeToolInfo[],
+	mode: BridgeTools,
+): BridgeToolInfo[] {
+	if (mode === "none") return [];
+	return tools.filter(
+		(tool) =>
+			!SELF_TOOLS.has(tool.name) &&
+			!CORE_BUILTIN_TOOLS.has(tool.name) &&
+			(mode === "mcp"
+				? MCP_BRIDGE_TOOL_RE.test(tool.name) || TRANSCRIPT_MCP_HELPER_TOOLS.has(tool.name)
+				: true),
 	);
 }
 

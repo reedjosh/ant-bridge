@@ -7,14 +7,16 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { importBridgeModule } from "./helpers/pi-loader.mjs";
+import { importBridgeModule, jiti } from "./helpers/pi-loader.mjs";
 
+const { cleanupSessionResources } = await jiti.import("@earendil-works/pi-ai");
 const { AcpConnection } = await importBridgeModule("src/acp/connection.ts");
 const { AcpDriver } = await importBridgeModule("src/acp/driver.ts");
 const { callMcpServerArg, mapUpdate } = await importBridgeModule("src/acp/events.ts");
 const {
   acpHomeDir,
   acpHomeStagingDir,
+  removeChildMcpDirsByPrefix,
   removeStagedAcpHome,
   stageAcpHome,
   sweepStaleAcpHomes,
@@ -384,6 +386,43 @@ test("sweepStaleChildMcpDirs and stageAcpHome reap dead-PID pi-bridge-s<pid>* MC
     assert.equal(fs.existsSync(parentCore), true);
     assert.equal(fs.existsSync(parentSlack), true);
     assert.equal(fs.existsSync(selfCore), true);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("removeChildMcpDirsByPrefix cleans only matching in-process child MCP schema directories", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ant-bridge-child-prefix-"));
+  try {
+    const geminiHome = path.join(tmp, "gemini");
+    removeChildMcpDirsByPrefix("pi-bridge-s4242-c1", geminiHome);
+    removeChildMcpDirsByPrefix("pi-bridge", geminiHome);
+
+    const mcpDir = path.join(geminiHome, "antigravity-cli", "mcp");
+    const c1Core = path.join(mcpDir, "pi-bridge-s4242-c1");
+    const c1Slack = path.join(mcpDir, "pi-bridge-s4242-c1-slack");
+    const c10Core = path.join(mcpDir, "pi-bridge-s4242-c10");
+    const c2Core = path.join(mcpDir, "pi-bridge-s4242-c2");
+    const procChild = path.join(mcpDir, "pi-bridge-s4242");
+    const parentCore = path.join(mcpDir, "pi-bridge");
+    for (const dir of [c1Core, c1Slack, c10Core, c2Core, procChild, parentCore]) {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "tool.json"), "{}");
+    }
+
+    // Rejects prefixes that are not in-process child prefixes (pi-bridge-s<pid>-c<seq>).
+    removeChildMcpDirsByPrefix("pi-bridge", geminiHome);
+    removeChildMcpDirsByPrefix("pi-bridge-s4242", geminiHome);
+    assert.equal(fs.existsSync(parentCore), true);
+    assert.equal(fs.existsSync(procChild), true);
+
+    removeChildMcpDirsByPrefix("pi-bridge-s4242-c1", geminiHome);
+    assert.equal(fs.existsSync(c1Core), false);
+    assert.equal(fs.existsSync(c1Slack), false);
+    assert.equal(fs.existsSync(c10Core), true);
+    assert.equal(fs.existsSync(c2Core), true);
+    assert.equal(fs.existsSync(procChild), true);
+    assert.equal(fs.existsSync(parentCore), true);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -798,6 +837,8 @@ async function createExtensionAcpHarness() {
   const received = [];
   const waiters = [];
   const sockets = new Set();
+  const sessionSockets = new Map();
+  const frameSockets = new WeakMap();
   let activeSocket = null;
   let sessionCounter = 0;
 
@@ -807,6 +848,7 @@ async function createExtensionAcpHarness() {
   }
 
   function handleClientFrame(msg, sock) {
+    frameSockets.set(msg, sock);
     received.push(msg);
     if (msg.method === "initialize") {
       sendToClient(
@@ -819,15 +861,21 @@ async function createExtensionAcpHarness() {
       );
     } else if (msg.method === "session/new") {
       sessionCounter += 1;
+      const sessionId = `sess-${sessionCounter}`;
+      sessionSockets.set(sessionId, sock);
+      msg._assignedSessionId = sessionId;
       sendToClient(
         {
           jsonrpc: "2.0",
           id: msg.id,
-          result: { sessionId: `sess-${sessionCounter}`, configOptions: [] },
+          result: { sessionId, configOptions: [] },
         },
         sock,
       );
     } else if (msg.method === "session/load" || msg.method === "session/set_config_option") {
+      if (msg.method === "session/load" && msg.params?.sessionId) {
+        sessionSockets.set(msg.params.sessionId, sock);
+      }
       sendToClient({ jsonrpc: "2.0", id: msg.id, result: { configOptions: [] } }, sock);
     }
     for (let i = waiters.length - 1; i >= 0; i--) {
@@ -871,10 +919,17 @@ async function createExtensionAcpHarness() {
       return new Promise((resolve) => waiters.push({ pred, resolve }));
     },
     sendUpdate(sessionId, update) {
-      sendToClient({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update } });
+      sendToClient(
+        { jsonrpc: "2.0", method: "session/update", params: { sessionId, update } },
+        sessionSockets.get(sessionId) ?? activeSocket,
+      );
     },
     replyPrompt(promptFrame, stopReason = "end_turn") {
-      sendToClient({ jsonrpc: "2.0", id: promptFrame.id, result: { stopReason } });
+      const sock =
+        frameSockets.get(promptFrame) ??
+        sessionSockets.get(promptFrame.params?.sessionId) ??
+        activeSocket;
+      sendToClient({ jsonrpc: "2.0", id: promptFrame.id, result: { stopReason } }, sock);
     },
     async close() {
       for (const s of sockets) s.destroy();
@@ -1413,3 +1468,342 @@ test("AcpDriver preserves mcpServer across tool_update frames onto tool_done and
     await h.close();
   }
 });
+
+test(
+  "extension isolates concurrent in-process child sessions while parent turn is parked on subagent",
+  async () => {
+    const h = await createExtensionAcpHarness();
+    const fakeHome = path.join(h.tmpDir, "home");
+    const agentDir = path.join(h.tmpDir, "agent");
+    fs.mkdirSync(fakeHome, { recursive: true });
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    const prevHome = process.env.HOME;
+    const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const prevAgyBin = process.env.AGY_BIN;
+    const prevFakePort = process.env.FAKE_ACP_PORT;
+    const prevSubagentChild = process.env.PI_SUBAGENT_CHILD;
+    process.env.HOME = fakeHome;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    process.env.AGY_BIN = h.launcherPath;
+    process.env.FAKE_ACP_PORT = String(h.port);
+    delete process.env.PI_SUBAGENT_CHILD;
+
+    const parentTools = [
+      {
+        name: "subagent",
+        description: "Delegate work to subagent",
+        parameters: { type: "object", properties: { agent: { type: "string" }, task: { type: "string" } } },
+        sourceInfo: { source: "extension", path: "/ext/subagent.ts" },
+      },
+      {
+        name: "mcp__linear__whoami",
+        description: "Linear whoami",
+        parameters: { type: "object", properties: {} },
+        sourceInfo: { source: "builtin", path: "builtin:mcp" },
+      },
+    ];
+
+    const handlers = new Map();
+    const providers = new Map();
+    const mockPi = {
+      registerProvider(id, spec) {
+        providers.set(id, spec);
+      },
+      registerCommand() {},
+      registerTool() {},
+      registerEntryRenderer() {},
+      registerMessageRenderer() {},
+      on(event, fn) {
+        const list = handlers.get(event) ?? [];
+        list.push(fn);
+        handlers.set(event, list);
+      },
+      getAllTools() {
+        return parentTools;
+      },
+      getActiveTools() {
+        return parentTools.map((t) => t.name);
+      },
+      getCommands() {
+        return [];
+      },
+      appendEntry() {},
+      sendMessage() {},
+      events: { emit() {}, on() {} },
+    };
+
+    const sessionCtx = {
+      hasUI: false,
+      mode: "print",
+      cwd: h.tmpDir,
+      ui: {
+        theme: { fg: (_c, s) => s, bold: (s) => s },
+        notify() {},
+        setStatus() {},
+      },
+      isProjectTrusted: () => false,
+      sessionManager: {
+        getSessionId: () => "parent-sess",
+        getCwd: () => h.tmpDir,
+        getEntries: () => [],
+        getBranch: () => [],
+      },
+    };
+
+    let parentCoreClient = null;
+    let child1CoreClient = null;
+    try {
+      saveConfig({ bridgeTools: "all" });
+      await registerExtension(mockPi);
+
+      for (const fn of handlers.get("session_start") ?? []) {
+        await fn({ type: "session_start", reason: "startup" }, sessionCtx);
+      }
+
+      const providerSpec = providers.get("antigravity");
+      const model = providerSpec.models[0];
+
+      // 1. Start parent session and park it on a foreground subagent tool call.
+      const parentUserMsg = { role: "user", content: "Run two foreground scouts", timestamp: 1 };
+      const streamParent = providerSpec.streamSimple(
+        model,
+        { messages: [parentUserMsg] },
+        { cwd: h.tmpDir, sessionId: "parent-sess" },
+      );
+
+      const parentSessionNew = await h.waitForFrame(
+        (f) => f.method === "session/new" && f.params?.mcpServers?.[0]?.name === "pi-bridge",
+      );
+      const parentPrompt = await h.waitForFrame(
+        (f) => f.method === "session/prompt" && f.params?.sessionId === parentSessionNew._assignedSessionId,
+      );
+      const parentCoreSrv = parentSessionNew.params.mcpServers[0];
+      const parentHeaders = Object.fromEntries(parentCoreSrv.headers.map((hdr) => [hdr.name, hdr.value]));
+
+      parentCoreClient = new Client({ name: "parent-core", version: "1.0.0" });
+      await parentCoreClient.connect(
+        new StreamableHTTPClientTransport(new URL(parentCoreSrv.url), {
+          requestInit: { headers: parentHeaders },
+        }),
+      );
+
+      const parentSubagentCall = parentCoreClient.callTool({
+        name: "call_pi_tool",
+        arguments: {
+          name: "subagent",
+          arguments: { agent: "scout", task: "inspect repo" },
+        },
+      });
+
+      const parkedParent = await streamParent.result();
+      assert.equal(parkedParent.stopReason, "toolUse");
+      const subagentTc = parkedParent.content.find((c) => c.type === "toolCall");
+      assert.equal(subagentTc?.name, "subagent");
+
+      // 2. While parent is parked (acpDriver.#queueTail locked), start TWO concurrent in-process children.
+      const childSysMsg = {
+        role: "system",
+        content: "You are an in-process foreground scout.",
+        toolsAdded: [
+          { name: "read", description: "Read file" },
+          { name: "bash", description: "Run shell" },
+          {
+            name: "contact_supervisor",
+            description: "Ask parent supervisor",
+            parameters: { type: "object", properties: { reason: { type: "string" } } },
+          },
+          {
+            name: "mcp__linear__whoami",
+            description: "Linear whoami",
+            parameters: { type: "object", properties: {} },
+          },
+        ],
+        timestamp: 0,
+      };
+      const child1UserMsg = { role: "user", content: "Scout slice 1", timestamp: 2 };
+      const child2UserMsg = { role: "user", content: "Scout slice 2", timestamp: 2 };
+
+      const childFrameStart = h.received.length;
+      const streamChild1 = providerSpec.streamSimple(
+        model,
+        { messages: [childSysMsg, child1UserMsg] },
+        { cwd: h.tmpDir, sessionId: "child-1" },
+      );
+      const streamChild2 = providerSpec.streamSimple(
+        model,
+        { messages: [childSysMsg, child2UserMsg] },
+        { cwd: h.tmpDir, sessionId: "child-2" },
+      );
+
+      const c1Prefix = `pi-bridge-s${process.pid}-c1`;
+      const c2Prefix = `pi-bridge-s${process.pid}-c2`;
+      const child1New = await h.waitForFrame(
+        (f) => f.method === "session/new" && f.params?.mcpServers?.[0]?.name === c1Prefix,
+        childFrameStart,
+      );
+      const child2New = await h.waitForFrame(
+        (f) => f.method === "session/new" && f.params?.mcpServers?.[0]?.name === c2Prefix,
+        childFrameStart,
+      );
+      const child1Prompt = await h.waitForFrame(
+        (f) => f.method === "session/prompt" && f.params?.sessionId === child1New._assignedSessionId,
+        childFrameStart,
+      );
+      const child2Prompt = await h.waitForFrame(
+        (f) => f.method === "session/prompt" && f.params?.sessionId === child2New._assignedSessionId,
+        childFrameStart,
+      );
+
+      assert.deepEqual(
+        child1New.params.mcpServers.map((s) => s.name),
+        [c1Prefix, `${c1Prefix}-linear`],
+      );
+      assert.deepEqual(
+        child2New.params.mcpServers.map((s) => s.name),
+        [c2Prefix, `${c2Prefix}-linear`],
+      );
+      assert.notEqual(child1New.params.mcpServers[0].url, parentCoreSrv.url);
+      assert.notEqual(child1New.params.mcpServers[0].url, child2New.params.mcpServers[0].url);
+
+      // 3. Verify child-1's isolated MCP bridge exposes only child tools (no read/bash, no parent subagent).
+      const c1CoreSrv = child1New.params.mcpServers[0];
+      const c1Headers = Object.fromEntries(c1CoreSrv.headers.map((hdr) => [hdr.name, hdr.value]));
+      child1CoreClient = new Client({ name: "child1-core", version: "1.0.0" });
+      await child1CoreClient.connect(
+        new StreamableHTTPClientTransport(new URL(c1CoreSrv.url), {
+          requestInit: { headers: c1Headers },
+        }),
+      );
+      const c1Tools = (await child1CoreClient.listTools()).tools.map((t) => t.name);
+      assert.deepEqual(c1Tools, ["contact_supervisor", "call_pi_tool", "bridge_poll_result"]);
+
+      const forbiddenSubagent = await child1CoreClient.callTool({
+        name: "call_pi_tool",
+        arguments: { name: "subagent", arguments: { agent: "scout", task: "recurse" } },
+      });
+      assert.equal(forbiddenSubagent.isError, true);
+      assert.match(forbiddenSubagent.content[0].text, /not active or not exposed/);
+
+      // 4. Round-trip contact_supervisor on child-1 while parent and child-2 remain active.
+      const supCallPromise = child1CoreClient.callTool({
+        name: "call_pi_tool",
+        arguments: {
+          name: "contact_supervisor",
+          arguments: { reason: "progress_update", toolSummary: "Update supervisor" },
+        },
+      });
+      const parkedChild1 = await streamChild1.result();
+      assert.equal(parkedChild1.stopReason, "toolUse");
+      const supTc = parkedChild1.content.find((c) => c.type === "toolCall");
+      assert.equal(supTc?.name, "contact_supervisor");
+      assert.deepEqual(supTc?.arguments, { reason: "progress_update" });
+
+      const streamChild1Cont = providerSpec.streamSimple(
+        model,
+        {
+          messages: [
+            childSysMsg,
+            child1UserMsg,
+            parkedChild1,
+            {
+              role: "toolResult",
+              toolCallId: supTc.id,
+              toolName: "contact_supervisor",
+              content: [{ type: "text", text: "ack from supervisor" }],
+              isError: false,
+              timestamp: 3,
+            },
+          ],
+        },
+        { cwd: h.tmpDir, sessionId: "child-1" },
+      );
+
+      const supRes = await supCallPromise;
+      assert.equal(supRes.isError, false);
+      assert.equal(supRes.content[0].text, "ack from supervisor");
+      await child1CoreClient.close();
+      child1CoreClient = null;
+
+      // 5. Complete both child turns while parent is still parked.
+      h.sendUpdate(child1New._assignedSessionId, {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "child-1 summary" },
+      });
+      h.replyPrompt(child1Prompt, "end_turn");
+      h.sendUpdate(child2New._assignedSessionId, {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "child-2 summary" },
+      });
+      h.replyPrompt(child2Prompt, "end_turn");
+
+      const [child1Final, child2Final] = await Promise.all([
+        streamChild1Cont.result(),
+        streamChild2.result(),
+      ]);
+      assert.equal(child1Final.stopReason, "stop");
+      assert.equal(child2Final.stopReason, "stop");
+
+      // 6. Verify cleanupSessionResources tears down child runtimes and child MCP schema directories.
+      const mcpRoot = path.join(fakeHome, ".gemini", "antigravity-cli", "mcp");
+      for (const dir of ["pi-bridge", c1Prefix, `${c1Prefix}-linear`, c2Prefix]) {
+        fs.mkdirSync(path.join(mcpRoot, dir), { recursive: true });
+      }
+      cleanupSessionResources("child-1");
+      cleanupSessionResources("child-2");
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(fs.existsSync(path.join(mcpRoot, c1Prefix)), false);
+      assert.equal(fs.existsSync(path.join(mcpRoot, `${c1Prefix}-linear`)), false);
+      assert.equal(fs.existsSync(path.join(mcpRoot, c2Prefix)), false);
+      assert.equal(fs.existsSync(path.join(mcpRoot, "pi-bridge")), true);
+
+      // 7. Resume parent with the foreground subagents' result and finish cleanly.
+      const streamParentCont = providerSpec.streamSimple(
+        model,
+        {
+          messages: [
+            parentUserMsg,
+            parkedParent,
+            {
+              role: "toolResult",
+              toolCallId: subagentTc.id,
+              toolName: "subagent",
+              content: [{ type: "text", text: "child-1 summary + child-2 summary" }],
+              isError: false,
+              timestamp: 4,
+            },
+          ],
+        },
+        { cwd: h.tmpDir, sessionId: "parent-sess" },
+      );
+
+      const parentSubagentRes = await parentSubagentCall;
+      assert.equal(parentSubagentRes.isError, false);
+      assert.equal(parentSubagentRes.content[0].text, "child-1 summary + child-2 summary");
+      h.replyPrompt(parentPrompt, "end_turn");
+      const parentFinal = await streamParentCont.result();
+      assert.equal(parentFinal.stopReason, "stop");
+    } finally {
+      try {
+        await child1CoreClient?.close();
+      } catch {}
+      try {
+        await parentCoreClient?.close();
+      } catch {}
+      for (const fn of handlers.get("session_shutdown") ?? []) {
+        await fn({ type: "session_shutdown" }, sessionCtx);
+      }
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+      if (prevAgyBin === undefined) delete process.env.AGY_BIN;
+      else process.env.AGY_BIN = prevAgyBin;
+      if (prevFakePort === undefined) delete process.env.FAKE_ACP_PORT;
+      else process.env.FAKE_ACP_PORT = prevFakePort;
+      if (prevSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = prevSubagentChild;
+      await h.close();
+    }
+  },
+);

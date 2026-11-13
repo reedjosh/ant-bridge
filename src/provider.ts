@@ -163,8 +163,13 @@ export const PI_BRIDGE_INSTRUCTIONS: string = [
 	"  larger MCP tools) from `Eager:` without registering `Lazy:` or `call_mcp_tool`, even though",
 	"  every tool's `<tool>.json` schema is written to `<appDataDir>/mcp/pi-bridge*/` on disk.",
 	"- To use any non-eager Pi or MCP tool, read `<appDataDir>/mcp/<serverName>/<tool>.json` for its",
-	"  parameters and invoke `mcp_pi-bridge_call_pi_tool` with `{ name, arguments }` (for example",
-	"  `name: \"subagent\"`, `name: \"codemode\"`, or `name: \"pi-bridge-slack/slack_read_thread\"`).",
+	"  parameters and invoke `mcp_pi-bridge_call_pi_tool` (or `mcp_pi-bridge-s*_call_pi_tool` in",
+	"  child sessions) with `{ name, arguments }` (for example `name: \"subagent\"`,",
+	"  `name: \"codemode\"`, or `name: \"pi-bridge-slack/slack_read_thread\"`).",
+	"- Launch `subagent` runs asynchronously (`async: true`, the default, especially for",
+	"  `workflow: \"parallel\"`) and end your turn immediately without calling `bg_wait` or polling:",
+	"  the main thread stays free for user chat while subagents run, and Pi wakes the session when",
+	"  they finish. Use `async: false` only when blocking the turn is explicitly required.",
 	"- If any bridged call answers `STILL RUNNING` with a `callId`, poll `bridge_poll_result` on",
 	"  `pi-bridge` until it settles before ending your turn.",
 	"- Inside `codemode` scripts, MCP tools resolve to `{ content, structuredContent, isError }`",
@@ -183,7 +188,8 @@ export const TOOL_PRIORITY_NOTE: string = [
 	"subagent, codemode, activate_skill, and larger MCP tools) without registering Lazy: or",
 	"call_mcp_tool, every tool's <tool>.json schema is still written under <appDataDir>/mcp/pi-bridge*/",
 	"on disk: read <appDataDir>/mcp/<serverName>/<tool>.json and invoke any non-eager tool via",
-	"mcp_pi-bridge_call_pi_tool with { name, arguments }. Servers marked (codemode) in Pi's",
+	"mcp_pi-bridge_call_pi_tool (or mcp_pi-bridge-s*_call_pi_tool in child sessions) with",
+	"{ name, arguments }. Servers marked (codemode) in Pi's",
 	"<mcp_servers> section (such as Slack, Linear, Sentry, or Figma) do not appear as separate agy MCP",
 	"servers; reach them via mcp_pi-bridge_codemode (or mcp_pi-bridge_call_pi_tool with name",
 	"\"codemode\" when non-eager, using searchTools / describeNamespace) and never inspect local ~/.pi",
@@ -200,7 +206,11 @@ export const TOOL_PRIORITY_NOTE: string = [
 	"swarm; native invoke_subagent and swarm background workers run inside agy invisible to pi, lose",
 	"access to pi-bridge* tools as soon as the parent turn ends, and never wake pi on completion (even",
 	"if no pi delegation tool is listed, never leave native subagents running across turn boundaries or",
-	"expect them to call pi-bridge* tools). Never call the native schedule tool and end your turn to",
+	"expect them to call pi-bridge* tools). Keep subagent launches asynchronous (async: true, the",
+	"default, especially for parallel workflows) and return control immediately without calling",
+	"bg_wait or polling so the user can keep chatting on the main thread until pi natively wakes the",
+	"session on completion; pass async: false only when blocking is explicitly required. Never call",
+	"the native schedule tool and end your turn to",
 	"wait for a timer or cron: ending your turn closes the active pi prompt, so a later native schedule",
 	"wakeup runs with no active pi turn, drops its output, cannot call pi-bridge* tools, and races with",
 	"subsequent prompts; keep polling bounded inside the active turn or use Pi Bridge tools instead.",
@@ -381,7 +391,7 @@ function newAssistant(model: Model<Api>): AssistantMessage {
 }
 
 /** Session key scoped with `@acp` for backward compatibility with existing sessions.json stores. */
-function sessionKey(options: SimpleStreamOptions | undefined, cwd: string): string {
+export function sessionKey(options: SimpleStreamOptions | undefined, cwd: string): string {
 	const sid = (options as { sessionId?: string } | undefined)?.sessionId;
 	const base = sid && sid.length > 0 ? `sid:${sid}` : `cwd:${cwd}`;
 	return `${base}@acp`;
@@ -418,6 +428,12 @@ export interface StreamSimpleDeps {
 	onNativeBackground?: (info: { conversationId: string; turnStartMs: number }) => void;
 	onTurnFinished?: () => void;
 	roster?: SubagentRoster;
+	resolveSessionDeps?: (
+		key: string,
+		context: TranscriptContext,
+		options: SimpleStreamOptions | undefined,
+		isSummarization: boolean,
+	) => DriverDeps | undefined;
 	log?: (event: string, data?: unknown, level?: "debug" | "info" | "warn" | "error") => void;
 }
 
@@ -1193,6 +1209,7 @@ async function runTurnDriver(
 		const userPrompt = extractUserPrompt(context, 0);
 		if (!userPrompt) {
 			deps.log?.("turn-error", { reason: "no-user-message" }, "error");
+			deps.onTurnFinished?.();
 			finalize(stream, blocks, "error", "No user message to send to agy.");
 			return;
 		}
@@ -1220,6 +1237,7 @@ async function runTurnDriver(
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			deps.log?.("turn-error", { reason: "driver-start-failed", error: msg }, "error");
+			deps.onTurnFinished?.();
 			finalize(stream, blocks, "error", `agy failed to start: ${msg}`);
 			return;
 		}
@@ -1237,10 +1255,12 @@ async function runTurnDriver(
 		}
 		const summaryOutcome = await summaryHandle.outcome;
 		if (summaryOutcome.aborted) {
+			deps.onTurnFinished?.();
 			finalize(stream, blocks, "aborted", "Operation aborted");
 			return;
 		}
 		if (summaryOutcome.status === "ERROR") {
+			deps.onTurnFinished?.();
 			finalize(stream, blocks, "error", summaryOutcome.error ?? "agy turn failed");
 			return;
 		}
@@ -1250,6 +1270,7 @@ async function runTurnDriver(
 		if (blocks.textIdx === null && blocks.thinkingIdx === null) {
 			ensureTextOpen(stream, blocks);
 		}
+		deps.onTurnFinished?.();
 		finalize(stream, blocks, "stop");
 		return;
 	}
@@ -1610,6 +1631,14 @@ export function createStreamSimple(
 				"error",
 				"Plan mode cannot be enforced on ACP provider turns. Run /agy mode accept-edits and enforce review-only in the host.",
 			);
+			return stream;
+		}
+		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+		const key = sessionKey(options, cwd);
+		const isSummarization = isStandaloneSummarizationTurn(context, options);
+		const sessionDeps = deps.resolveSessionDeps?.(key, context, options, isSummarization);
+		if (sessionDeps) {
+			void runTurnDriver(stream, model, context, options, entries, store, sessionDeps);
 			return stream;
 		}
 		if (selected && roundTrips) {

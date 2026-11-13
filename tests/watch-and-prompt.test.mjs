@@ -526,6 +526,10 @@ test("TOOL_PRIORITY_NOTE and PI_BRIDGE_INSTRUCTIONS are plain ASCII and cover MC
     "describeNamespace",
     "~/.pi",
     "<server>/<tool>",
+    "swarm",
+    "pi-bridge* tools",
+    "parent turn ends",
+    "never wake pi",
   ]) {
     assert.ok(TOOL_PRIORITY_NOTE.includes(preserved), `TOOL_PRIORITY_NOTE must include ${preserved}`);
   }

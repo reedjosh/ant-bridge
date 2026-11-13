@@ -4,7 +4,15 @@ import type { BridgeTools } from "./config.js";
 export const PI_BRIDGE_SERVER_PREFIX = "pi-bridge";
 export const PI_BRIDGE_SERVER_RE = /^pi-bridge(?:-[a-zA-Z0-9-]+)?$/;
 
-const MCP_BRIDGE_TOOL_RE = /^mcp__([a-zA-Z0-9_-]+)__(.+)$/;
+const MCP_BRIDGE_TOOL_RE = /^mcp__([a-zA-Z0-9_-]+?)__(.+)$/;
+
+/** Compute the MCP server prefix, isolating Pi child subagent processes by PID. */
+export function bridgeServerPrefix(
+	env: NodeJS.ProcessEnv = process.env,
+	pid: number = process.pid,
+): string {
+	return env.PI_SUBAGENT_CHILD === "1" ? `pi-bridge-s${pid}` : PI_BRIDGE_SERVER_PREFIX;
+}
 
 export interface BridgeToolInfo {
 	name: string;
@@ -83,7 +91,10 @@ export function bridgedPiTools(
 }
 
 /** Parse a `mcp__<namespace>__<tool>` Pi tool name into its bridge route and server identifiers. */
-export function parseMcpBridgeToolName(piToolName: string): ParsedMcpBridgeTool | null {
+export function parseMcpBridgeToolName(
+	piToolName: string,
+	serverPrefix: string = PI_BRIDGE_SERVER_PREFIX,
+): ParsedMcpBridgeTool | null {
 	const match = MCP_BRIDGE_TOOL_RE.exec(piToolName);
 	if (!match) return null;
 	const rawNamespace = match[1]!;
@@ -96,13 +107,16 @@ export function parseMcpBridgeToolName(piToolName: string): ParsedMcpBridgeTool 
 	return {
 		rawNamespace,
 		routeName,
-		serverName: `${PI_BRIDGE_SERVER_PREFIX}-${routeName}`,
+		serverName: `${serverPrefix}-${routeName}`,
 		shortToolName,
 	};
 }
 
 /** Partition bridged Pi tools into `pi-bridge` core tools and sorted per-namespace groups. */
-export function partitionBridgeTools(tools: BridgeToolInfo[]): PartitionedBridgeTools {
+export function partitionBridgeTools(
+	tools: BridgeToolInfo[],
+	serverPrefix: string = PI_BRIDGE_SERVER_PREFIX,
+): PartitionedBridgeTools {
 	const coreTools: BridgeToolInfo[] = [];
 	const groups = new Map<
 		string,
@@ -113,7 +127,7 @@ export function partitionBridgeTools(tools: BridgeToolInfo[]): PartitionedBridge
 	>();
 
 	for (const tool of tools) {
-		const parsed = parseMcpBridgeToolName(tool.name);
+		const parsed = parseMcpBridgeToolName(tool.name, serverPrefix);
 		if (!parsed) {
 			coreTools.push(tool);
 			continue;
@@ -154,9 +168,10 @@ export function partitionBridgeTools(tools: BridgeToolInfo[]): PartitionedBridge
 export function bridgeCatalogFingerprint(
 	tools: BridgeToolInfo[],
 	extraTokens: readonly string[] = [],
+	serverPrefix: string = PI_BRIDGE_SERVER_PREFIX,
 ): string {
-	const { coreTools, namespaces } = partitionBridgeTools(tools);
-	const toolEntries = coreTools.map((tool) => `${PI_BRIDGE_SERVER_PREFIX}:${tool.name}`);
+	const { coreTools, namespaces } = partitionBridgeTools(tools, serverPrefix);
+	const toolEntries = coreTools.map((tool) => `${serverPrefix}:${tool.name}`);
 	for (const ns of namespaces) {
 		for (const item of ns.tools) {
 			toolEntries.push(`${ns.serverName}:${item.exposedName}`);

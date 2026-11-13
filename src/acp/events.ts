@@ -221,7 +221,7 @@ function isCallMcpTool(
 	return title ? /^(?:(?:Run|Running|Call|Calling)\s+)?call_mcp_tool\??$/i.test(title) : false;
 }
 
-function callMcpServerArg(args: Record<string, unknown>): string | undefined {
+export function callMcpServerArg(args: Record<string, unknown>): string | undefined {
 	const candidate =
 		stringField(args.ServerName) ?? stringField(args.serverName) ?? stringField(args.server);
 	return candidate && PI_BRIDGE_SERVER_RE.test(candidate) ? candidate : undefined;

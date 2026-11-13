@@ -17,6 +17,15 @@
 - **Refined tool-priority and codemode output guidance:** Update `TOOL_PRIORITY_NOTE` and `README.md` to cover
   `direct`, `codemode`, and `deferred` MCP server exposure and guide `codemode` scripts to emit readable multi-line
   `text(...)` strings instead of returning raw or nested JSON objects.
+- **Child subagent MCP isolation and non-greedy namespace routing:** Scope child subagent MCP server prefixes to
+  `pi-bridge-s<pid>` (`PI_SUBAGENT_CHILD=1`) so `agy acp` schema writes in shared `acp-home` never collide with the
+  parent session, reap stale dead-PID `pi-bridge-s<pid>*` directories on startup, split `mcp__<server>__<tool>` names
+  non-greedily when upstream tool names contain `__`, and record `lastSyncedCatalogFingerprint` on initial ACP spawn.
+- **Out-of-turn permission, bridge failure, and native status hardening:** Honor `skipPermissions` for out-of-turn
+  `session/request_permission` requests, preserve `call_mcp_tool` `mcpServer` metadata across `tool_call_update` frames
+  while balancing `pendingNativeTools` on late suppression, format `call-tool-fail` TUI notices as readable prose with
+  per-turn deduplication when no Antigravity turn is active, and warn against native background subagents across turns
+  in `TOOL_PRIORITY_NOTE`.
 
 ## 2.3.0 - 2026-11-12
 

@@ -37,6 +37,7 @@ import {
 import {
 	bridgeCatalogFingerprint,
 	bridgedPiTools,
+	bridgeServerPrefix,
 	partitionBridgeTools,
 	PI_BRIDGE_SERVER_PREFIX,
 	PI_BRIDGE_SERVER_RE,
@@ -123,15 +124,30 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const FAIL_REASON_TURN_END = "antigravity turn ended with an unresolved pi tool call";
 	const FAIL_REASON_SHUTDOWN = "antigravity session shut down";
 
+	const mcpFailures = new Set([
+		"http-error",
+		"call-tool-fail",
+		"transport-error",
+		"handleRequest-error",
+		"request-error",
+		"request-handler-error",
+		"unauthorized",
+	]);
+	let outOfTurnWarned = false;
 	let logClosed = false;
 	const fileLog = createDailyLogger({ dir: logsDir() });
 	const rawFileLog = fileLog.log.bind(fileLog);
 	fileLog.log = (event, data, level) => {
-		if (event === "turn-start") logClosed = false;
+		if (event === "turn-start") {
+			logClosed = false;
+			outOfTurnWarned = false;
+		}
 		if (logClosed) return;
 		rawFileLog(event, data, level);
 		if (level !== "warn") return;
-		if (event.startsWith("abort:") || event === "connection-exited") return;
+		if (event.startsWith("abort:") || event === "connection-exited" || mcpFailures.has(event)) {
+			return;
+		}
 		const d = (data ?? {}) as Record<string, unknown>;
 		let text: string;
 		if (event === "round-trip-fail") {
@@ -158,6 +174,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	const store = new SessionStore();
 	let mcpHandle: McpServerHandle | null = null;
+	let activeSessionCtx: ExtensionContext | null = null;
+	let activeSessionCwd: string | undefined;
+	let activeSessionKey: string | undefined;
+	let mcpStartPromise: Promise<number | null> | null = null;
+	let mcpEpoch = 0;
+	let lastSyncedCatalogFingerprint: string | null = null;
 	const hiddenBridgeTools = new Set<string>();
 	const getBridgeTools = () =>
 		bridgedPiTools(
@@ -165,6 +187,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			pi.getActiveTools(),
 			loadConfig().bridgeTools,
 			hiddenBridgeTools,
+		);
+	const resolveSkills = (): SkillLite[] =>
+		skillsFromCommands(
+			typeof pi.getCommands === "function" ? pi.getCommands() : [],
+			() => scanSkills(activeSessionCwd),
 		);
 
 	let agySetupOffer: (() => Promise<void>) | null = null;
@@ -204,7 +231,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		binArgs: ["acp"],
 		isolateHome: true,
 		usageEstimate: () => loadConfig().acp.usageEstimate,
-		permissionPolicy: () => (loadConfig().permissionMode === "allow" ? "auto" : "deny"),
+		permissionPolicy: () => {
+			const cfg = loadConfig();
+			return cfg.skipPermissions || cfg.permissionMode === "allow" ? "auto" : "deny";
+		},
 		onPermissionRequest: async (req) => {
 			const ui = activeUi;
 			if (loadConfig().permissionMode === "deny" || !ui) return undefined;
@@ -221,12 +251,25 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		},
 		log: acpLog,
 		mcpServers: () => {
+			if (loadConfig().bridgeTools === "none") {
+				if (lastSyncedCatalogFingerprint === null) lastSyncedCatalogFingerprint = "none";
+				return [];
+			}
 			const handle = mcpHandle;
-			if (!handle || loadConfig().bridgeTools === "none") return [];
-			const { namespaces } = partitionBridgeTools(getBridgeTools());
+			if (!handle) return [];
+			const serverPrefix = bridgeServerPrefix();
+			const tools = getBridgeTools();
+			const { namespaces } = partitionBridgeTools(tools, serverPrefix);
+			if (lastSyncedCatalogFingerprint === null) {
+				lastSyncedCatalogFingerprint = bridgeCatalogFingerprint(
+					tools,
+					resolveSkills().map((s) => `skill:${s.name}`),
+					serverPrefix,
+				);
+			}
 			return [
 				{
-					name: PI_BRIDGE_SERVER_PREFIX,
+					name: serverPrefix,
 					type: "http",
 					url: `http://127.0.0.1:${handle.port}/mcp`,
 					headers: [{ name: TOKEN_HEADER, value: handle.token }],
@@ -257,6 +300,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	pi.registerEntryRenderer<PollRunData>("agy-poll-run", createPollRunEntryRenderer());
 
 	let pendingNativeTools = 0;
+	const activeNativeToolIds = new Set<string>();
 	const pollRuns = new PollRunFolder();
 	const setDimStatus = (key: string, text: string | undefined): void => {
 		const ui = activeUi;
@@ -286,8 +330,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			return;
 		}
 		closePollRun();
-		if (PI_BRIDGE_SERVER_RE.test(event.mcpServer ?? "")) return;
+		if (PI_BRIDGE_SERVER_RE.test(event.mcpServer ?? "")) {
+			if (
+				event.status !== "started" &&
+				event.toolCallId &&
+				activeNativeToolIds.delete(event.toolCallId)
+			) {
+				pendingNativeTools = Math.max(0, pendingNativeTools - 1);
+				if (pendingNativeTools === 0) activeUi?.setStatus("agy-native", undefined);
+			}
+			return;
+		}
 		if (event.status === "started") {
+			if (event.toolCallId) activeNativeToolIds.add(event.toolCallId);
 			pendingNativeTools++;
 			const detail = formatNativeEventDetail(event);
 			const snippet = detail
@@ -298,6 +353,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			setDimStatus("agy-native", `agy ${event.name}${snippet}${ellipsis}${count}`);
 			return;
 		}
+		if (event.toolCallId) activeNativeToolIds.delete(event.toolCallId);
 		pendingNativeTools = Math.max(0, pendingNativeTools - 1);
 		if (pendingNativeTools === 0) activeUi?.setStatus("agy-native", undefined);
 		pi.appendEntry<NativeDisplayEvent>("agy-native-event", {
@@ -372,9 +428,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		lastUsageStatus = "";
 		if (ctx.hasUI) ctx.ui.setStatus("agy-usage", undefined);
 	};
+	pi.on("turn_start", () => {
+		outOfTurnWarned = false;
+	});
 	pi.on("agent_end", (event, ctx) => {
 		clearUsageStatus(event, ctx);
 		pendingNativeTools = 0;
+		activeNativeToolIds.clear();
 		closePollRun();
 		if (ctx.hasUI) ctx.ui.setStatus("agy-native", undefined);
 	});
@@ -463,13 +523,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		backgroundWatchers.set(conversationId, slot);
 	};
 
-	let activeSessionCtx: ExtensionContext | null = null;
-	let activeSessionCwd: string | undefined;
-	let activeSessionKey: string | undefined;
-	let mcpStartPromise: Promise<number | null> | null = null;
-	let mcpEpoch = 0;
-	let lastSyncedCatalogFingerprint: string | null = null;
-
 	const syncSessionContext = (ctx: ExtensionContext): void => {
 		activeSessionCtx = ctx;
 		if (typeof ctx.isProjectTrusted === "function") {
@@ -478,19 +531,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		activeSessionKey = currentSessionKey(ctx);
 	};
 
-	const resolveSkills = (): SkillLite[] =>
-		skillsFromCommands(
-			typeof pi.getCommands === "function" ? pi.getCommands() : [],
-			() => scanSkills(activeSessionCwd),
-		);
-
 	const syncBridgeCatalog = async (reason: string): Promise<void> => {
+		const serverPrefix = bridgeServerPrefix();
 		const nextFp =
 			loadConfig().bridgeTools === "none"
 				? "none"
 				: bridgeCatalogFingerprint(
 						getBridgeTools(),
 						resolveSkills().map((s) => `skill:${s.name}`),
+						serverPrefix,
 					);
 		if (acpDriver.state === "idle" || acpDriver.state === "dead") {
 			lastSyncedCatalogFingerprint = nextFp;
@@ -513,12 +562,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		store,
 		acpDriver,
 		roundTrips,
-		beforeTurn: () => syncBridgeCatalog("bridge tool catalog updated"),
+		beforeTurn: () => {
+			outOfTurnWarned = false;
+			return syncBridgeCatalog("bridge tool catalog updated");
+		},
 		onNativeEvent,
 		onNativeBackground: (info) => armConversationWatcher(info.conversationId, info.turnStartMs),
 		onTurnFinished: () => {
-			if (pendingNativeTools > 0) {
+			if (pendingNativeTools > 0 || activeNativeToolIds.size > 0) {
 				pendingNativeTools = 0;
+				activeNativeToolIds.clear();
 				activeUi?.setStatus("agy-native", undefined);
 			}
 			closePollRun();
@@ -594,31 +647,46 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	}
 
 	const mcpLog = (s: string, d?: unknown) => {
-		const failures = new Set([
-			"http-error",
-			"call-tool-fail",
-			"transport-error",
-			"handleRequest-error",
-			"request-error",
-			"request-handler-error",
-			"unauthorized",
-		]);
-		const detail = (d as { msg?: string } | undefined)?.msg ?? "";
+		const rec =
+			typeof d === "object" && d !== null && !Array.isArray(d)
+				? (d as Record<string, unknown>)
+				: undefined;
+		const detail =
+			typeof rec?.msg === "string" ? rec.msg : typeof d === "string" ? d : "";
+		const toolName =
+			typeof rec?.name === "string" && rec.name.length > 0 ? rec.name : "tool";
 		const routineAbort =
 			s === "call-tool-fail" &&
 			(detail.includes(FAIL_REASON_TURN_END) || detail.includes(FAIL_REASON_SHUTDOWN));
-		const level = !failures.has(s)
+		const outOfTurn =
+			s === "call-tool-fail" && detail.includes("no active antigravity turn");
+		const level = !mcpFailures.has(s)
 			? s === "call-tool" || s === "call-tool-ok"
 				? "info"
 				: "debug"
 			: routineAbort
 				? "debug"
-				: s === "call-tool-fail"
-					? "error"
-					: "warn";
+				: outOfTurn
+					? "warn"
+					: s === "call-tool-fail"
+						? "error"
+						: "warn";
 		fileLog.log(s, d, level);
-		if (routineAbort || !failures.has(s)) return;
-		const msg = `[ant-bridge mcp] ${s}${d !== undefined ? " " + JSON.stringify(d) : ""}`;
+		if (routineAbort || !mcpFailures.has(s)) return;
+		let msg: string;
+		if (outOfTurn) {
+			if (outOfTurnWarned) return;
+			outOfTurnWarned = true;
+			msg = `[ant-bridge] Ignored bridged tool call (${toolName}) because no Antigravity turn is active.`;
+		} else if (s === "call-tool-fail") {
+			msg = `[ant-bridge] Bridge tool ${toolName} failed: ${detail || "unknown error"}`;
+		} else if (s === "unauthorized") {
+			const url = typeof rec?.url === "string" && rec.url ? ` (${rec.url})` : "";
+			msg = `[ant-bridge] Rejected unauthorized MCP bridge request${url}.`;
+		} else {
+			const summary = detail || (typeof rec?.url === "string" ? rec.url : "");
+			msg = `[ant-bridge] MCP bridge ${s.replace(/-/g, " ")}${summary ? `: ${summary}` : ""}`;
+		}
 		if (activeSessionCtx?.hasUI) activeSessionCtx.ui.notify(msg, "warning");
 		else if (activeUi) activeUi.notify(msg, "warning");
 		else console.error(msg);
@@ -798,6 +866,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	pi.on("session_start", async (_event, ctx) => {
 		logClosed = false;
+		outOfTurnWarned = false;
 		backgroundWatchDisposed = false;
 		if (ctx.hasUI) activeUi = ctx.ui;
 		syncSessionContext(ctx);
@@ -846,6 +915,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	pi.on("session_shutdown", async (event, ctx) => {
 		clearUsageStatus(event, ctx);
 		pendingNativeTools = 0;
+		activeNativeToolIds.clear();
+		outOfTurnWarned = false;
 		if (ctx.hasUI) ctx.ui.setStatus("agy-native", undefined);
 		backgroundWatchDisposed = true;
 		for (const slot of backgroundWatchers.values()) slot.handle.stop();

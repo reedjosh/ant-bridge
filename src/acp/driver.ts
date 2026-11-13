@@ -28,6 +28,7 @@ import {
 } from "./connection.js";
 import type { AcpPermissionHandler } from "./connection.js";
 import {
+	callMcpServerArg,
 	mapStopReason,
 	mapUpdate,
 	TextAccumulator,
@@ -591,6 +592,10 @@ export class AcpDriver implements TurnDriver {
 				if (entry) {
 					if (mapped.args) entry.args = { ...entry.args, ...mapped.args };
 					if (mapped.location) entry.location = mapped.location;
+					entry.mcpServer =
+						mapped.mcpServer ??
+						entry.mcpServer ??
+						(entry.name === "call_mcp_tool" ? callMcpServerArg(entry.args) : undefined);
 				}
 				return;
 			}
@@ -611,6 +616,10 @@ export class AcpDriver implements TurnDriver {
 					? { ...(entry?.args ?? {}), ...mapped.args }
 					: (entry?.args ?? {});
 				const location = mapped.location ?? entry?.location;
+				const mcpServer =
+					mapped.mcpServer ??
+					entry?.mcpServer ??
+					(name === "call_mcp_tool" && args ? callMcpServerArg(args) : undefined);
 				// Native diff from the stored tool_call frame; the update's own
 				// diff (future builds) wins when present.
 				this.#emit(turn, {
@@ -620,7 +629,7 @@ export class AcpDriver implements TurnDriver {
 					...(location ? { location } : {}),
 					output: mapped.output,
 					diff: mapped.diff ?? entry?.diff,
-					mcpServer: mapped.mcpServer ?? entry?.mcpServer,
+					mcpServer,
 					toolCallId: mapped.toolCallId,
 				});
 				if (turn.steered && !turn.steerCancelSent && turn.promptStarted && turn.toolCalls.size === 0) {
@@ -636,13 +645,17 @@ export class AcpDriver implements TurnDriver {
 					? { ...(entry?.args ?? {}), ...mapped.args }
 					: entry?.args;
 				const location = mapped.location ?? entry?.location;
+				const mcpServer =
+					mapped.mcpServer ??
+					entry?.mcpServer ??
+					(name === "call_mcp_tool" && args ? callMcpServerArg(args) : undefined);
 				this.#emit(turn, {
 					type: "tool_error",
 					name,
 					message: mapped.message,
 					...(args ? { args } : {}),
 					...(location ? { location } : {}),
-					mcpServer: mapped.mcpServer ?? entry?.mcpServer,
+					mcpServer,
 					toolCallId: mapped.toolCallId,
 				});
 				if (turn.steered && !turn.steerCancelSent && turn.promptStarted && turn.toolCalls.size === 0) {

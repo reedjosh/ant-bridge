@@ -6,6 +6,7 @@ const {
   PI_BRIDGE_SERVER_PREFIX,
   PI_BRIDGE_SERVER_RE,
   bridgeCatalogFingerprint,
+  bridgeServerPrefix,
   bridgedPiTools,
   parseMcpBridgeToolName,
   partitionBridgeTools,
@@ -108,6 +109,66 @@ test("parseMcpBridgeToolName normalizes mcp__<ns>__<tool> names and falls back t
     serverName: "pi-bridge-mcp",
     shortToolName: "ping",
   });
+
+  // Non-greedy split keeps embedded "__" inside shortToolName rather than the namespace.
+  assert.deepEqual(parseMcpBridgeToolName("mcp__slack__users__list"), {
+    rawNamespace: "slack",
+    routeName: "slack",
+    serverName: "pi-bridge-slack",
+    shortToolName: "users__list",
+  });
+
+  assert.deepEqual(parseMcpBridgeToolName("mcp__github__repos__pulls__get"), {
+    rawNamespace: "github",
+    routeName: "github",
+    serverName: "pi-bridge-github",
+    shortToolName: "repos__pulls__get",
+  });
+});
+
+test("bridgeServerPrefix isolates PI_SUBAGENT_CHILD=1 by PID and threads serverPrefix cleanly", () => {
+  assert.equal(bridgeServerPrefix({}, 4242), "pi-bridge");
+  assert.equal(bridgeServerPrefix({ PI_SUBAGENT_CHILD: "0" }, 4242), "pi-bridge");
+  assert.equal(bridgeServerPrefix({ PI_SUBAGENT_CHILD: "1" }, 4242), "pi-bridge-s4242");
+
+  const childPrefix = bridgeServerPrefix({ PI_SUBAGENT_CHILD: "1" }, 4242);
+  assert.equal(PI_BRIDGE_SERVER_RE.test(childPrefix), true);
+  assert.equal(PI_BRIDGE_SERVER_RE.test(`${childPrefix}-slack`), true);
+
+  assert.deepEqual(parseMcpBridgeToolName("mcp__slack__users__list", childPrefix), {
+    rawNamespace: "slack",
+    routeName: "slack",
+    serverName: "pi-bridge-s4242-slack",
+    shortToolName: "users__list",
+  });
+
+  const tools = [
+    { name: "codemode" },
+    { name: "mcp__slack__users__list" },
+    { name: "mcp__linear__issues_list" },
+  ];
+  const partitioned = partitionBridgeTools(tools, childPrefix);
+  assert.deepEqual(
+    partitioned.coreTools.map((t) => t.name),
+    ["codemode"],
+  );
+  assert.deepEqual(
+    partitioned.namespaces.map((ns) => ({
+      routeName: ns.routeName,
+      serverName: ns.serverName,
+      exposed: ns.tools.map((t) => t.exposedName),
+    })),
+    [
+      { routeName: "linear", serverName: "pi-bridge-s4242-linear", exposed: ["issues_list"] },
+      { routeName: "slack", serverName: "pi-bridge-s4242-slack", exposed: ["users__list"] },
+    ],
+  );
+
+  const fpParent = bridgeCatalogFingerprint(tools, ["skill:pdf"]);
+  const fpChild1 = bridgeCatalogFingerprint(tools, ["skill:pdf"], childPrefix);
+  const fpChild2 = bridgeCatalogFingerprint([...tools].reverse(), ["skill:pdf"], childPrefix);
+  assert.notEqual(fpChild1, fpParent);
+  assert.equal(fpChild1, fpChild2);
 });
 
 test("partitionBridgeTools separates coreTools, sorts namespaces, and resolves shortToolName collisions", () => {

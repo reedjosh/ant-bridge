@@ -10,13 +10,15 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { importBridgeModule } from "./helpers/pi-loader.mjs";
 
 const { AcpConnection } = await importBridgeModule("src/acp/connection.ts");
-const { mapUpdate } = await importBridgeModule("src/acp/events.ts");
+const { AcpDriver } = await importBridgeModule("src/acp/driver.ts");
+const { callMcpServerArg, mapUpdate } = await importBridgeModule("src/acp/events.ts");
 const {
   acpHomeDir,
   acpHomeStagingDir,
   removeStagedAcpHome,
   stageAcpHome,
   sweepStaleAcpHomes,
+  sweepStaleChildMcpDirs,
 } = await importBridgeModule("src/acp/home.ts");
 const { saveConfig } = await importBridgeModule("src/config.ts");
 const { TOKEN_HEADER, startMcpServer } = await importBridgeModule("src/mcp-server.ts");
@@ -318,6 +320,70 @@ test("sweepStaleAcpHomes cleans dead-PID acp-homes/* and agy-mcp-* while preserv
     sweepStaleAcpHomes(directHomes, (pid) => pid === 33333);
     assert.equal(fs.existsSync(directDead), false);
     assert.equal(fs.existsSync(directLive), true);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("sweepStaleChildMcpDirs and stageAcpHome reap dead-PID pi-bridge-s<pid>* MCP schema directories", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ant-bridge-child-mcp-"));
+  try {
+    // Missing mcpDir returns quietly without throwing.
+    sweepStaleChildMcpDirs(path.join(tmp, "missing-mcp"));
+
+    const geminiHome = path.join(tmp, "gemini");
+    const mcpDir = path.join(geminiHome, "antigravity-cli", "mcp");
+    const deadCore = path.join(mcpDir, "pi-bridge-s77771");
+    const deadNs = path.join(mcpDir, "pi-bridge-s77771-slack");
+    const liveCore = path.join(mcpDir, "pi-bridge-s88882");
+    const liveNs = path.join(mcpDir, "pi-bridge-s88882-linear");
+    const selfCore = path.join(mcpDir, `pi-bridge-s${process.pid}`);
+    const selfNs = path.join(mcpDir, `pi-bridge-s${process.pid}-slack`);
+    const parentCore = path.join(mcpDir, "pi-bridge");
+    const parentSlack = path.join(mcpDir, "pi-bridge-slack");
+    const parentSentry = path.join(mcpDir, "pi-bridge-sentry");
+    const nonNumeric = path.join(mcpDir, "pi-bridge-s99abc");
+    for (const dir of [
+      deadCore,
+      deadNs,
+      liveCore,
+      liveNs,
+      selfCore,
+      selfNs,
+      parentCore,
+      parentSlack,
+      parentSentry,
+      nonNumeric,
+    ]) {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "tool.json"), "{}");
+    }
+    const plainFile = path.join(mcpDir, "pi-bridge-s77772");
+    fs.writeFileSync(plainFile, "not-a-directory");
+
+    sweepStaleChildMcpDirs(mcpDir, (pid) => pid === 88882);
+
+    assert.equal(fs.existsSync(deadCore), false);
+    assert.equal(fs.existsSync(deadNs), false);
+    assert.equal(fs.existsSync(liveCore), true);
+    assert.equal(fs.existsSync(liveNs), true);
+    assert.equal(fs.existsSync(selfCore), true);
+    assert.equal(fs.existsSync(selfNs), true);
+    assert.equal(fs.existsSync(parentCore), true);
+    assert.equal(fs.existsSync(parentSlack), true);
+    assert.equal(fs.existsSync(parentSentry), true);
+    assert.equal(fs.existsSync(nonNumeric), true);
+    assert.equal(fs.existsSync(plainFile), true);
+
+    // stageAcpHome runs sweepStaleChildMcpDirs(appData/mcp) automatically for dead PIDs.
+    // PID 2147483640 is a safe integer far above kernel pid_max so isPidAlive returns false.
+    const orphanByStage = path.join(mcpDir, "pi-bridge-s2147483640-github");
+    fs.mkdirSync(orphanByStage, { recursive: true });
+    stageAcpHome({ geminiHome, parentDir: path.join(tmp, "state") });
+    assert.equal(fs.existsSync(orphanByStage), false);
+    assert.equal(fs.existsSync(parentCore), true);
+    assert.equal(fs.existsSync(parentSlack), true);
+    assert.equal(fs.existsSync(selfCore), true);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -831,10 +897,12 @@ test(
     const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
     const prevAgyBin = process.env.AGY_BIN;
     const prevFakePort = process.env.FAKE_ACP_PORT;
+    const prevSubagentChild = process.env.PI_SUBAGENT_CHILD;
     process.env.HOME = fakeHome;
     process.env.PI_CODING_AGENT_DIR = agentDir;
     process.env.AGY_BIN = h.launcherPath;
     process.env.FAKE_ACP_PORT = String(h.port);
+    delete process.env.PI_SUBAGENT_CHILD;
 
     const mockTools = [
       {
@@ -1081,6 +1149,27 @@ test(
         rawInput: { ServerName: "pi-bridge-slack", ToolName: "slack_read_channel" },
         rawOutput: "suppressed lazy",
       });
+      // Late-suppressed call_mcp_tool: tool_call starts with empty rawInput (sets agy-native status),
+      // in_progress tool_call_update supplies ServerName (omitting name), and completed clears status.
+      h.sendUpdate(sessId, {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc-late-lazy",
+        name: "call_mcp_tool",
+        rawInput: {},
+      });
+      h.sendUpdate(sessId, {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tc-late-lazy",
+        status: "in_progress",
+        rawInput: { ServerName: "pi-bridge-slack", ToolName: "slack_read_channel" },
+      });
+      h.sendUpdate(sessId, {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tc-late-lazy",
+        status: "completed",
+        rawOutput: "suppressed after late ServerName",
+      });
+
       h.sendUpdate(sessId, {
         sessionUpdate: "tool_call",
         toolCallId: "tc-native-read",
@@ -1106,6 +1195,36 @@ test(
         statusUpdates.some((s) => s.key === "agy-native" && (s.text ?? "").includes("slack")),
         false,
       );
+      const nativeTexts = statusUpdates
+        .filter((s) => s.key === "agy-native")
+        .map((s) => s.text);
+      // tc-late-lazy started ("agy call_mcp_tool..."), then cleared on late-suppressed completion (undefined),
+      // so tc-native-read started at count 1 ("agy read_file README.md...", NOT "(2)") and cleared (undefined).
+      assert.deepEqual(nativeTexts.slice(0, 4), [
+        "agy call_mcp_tool...",
+        undefined,
+        "agy read_file README.md...",
+        undefined,
+      ]);
+
+      // (5) Subagent child mode (PI_SUBAGENT_CHILD=1) isolates MCP server names under pi-bridge-s<pid>*.
+      process.env.PI_SUBAGENT_CHILD = "1";
+      const startIdx = h.received.length;
+      const childTurnMsg = { role: "user", content: "Subagent turn", timestamp: 3 };
+      const streamChild = providerSpec.streamSimple(
+        model,
+        { messages: [userMsg, parkedMsg, finalMsg, childTurnMsg] },
+        { cwd: h.tmpDir, sessionId: "mcp-ns-sess" },
+      );
+      const childLoad = await h.waitForFrame((f) => f.method === "session/load", startIdx);
+      const childPrompt = await h.waitForFrame((f) => f.method === "session/prompt", startIdx);
+      assert.deepEqual(
+        childLoad.params.mcpServers.map((s) => s.name),
+        [`pi-bridge-s${process.pid}`, `pi-bridge-s${process.pid}-slack`],
+      );
+      h.replyPrompt(childPrompt, "end_turn");
+      const childRes = await streamChild.result();
+      assert.equal(childRes.stopReason, "stop");
     } finally {
       try {
         await coreClient?.close();
@@ -1124,9 +1243,89 @@ test(
       else process.env.AGY_BIN = prevAgyBin;
       if (prevFakePort === undefined) delete process.env.FAKE_ACP_PORT;
       else process.env.FAKE_ACP_PORT = prevFakePort;
+      if (prevSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = prevSubagentChild;
       await h.close();
     }
     await new Promise((r) => setTimeout(r, 25));
     assert.equal(fs.existsSync(h.tmpDir), false);
   },
 );
+
+test("AcpDriver preserves mcpServer across tool_update frames onto tool_done and tool_error", async () => {
+  assert.equal(callMcpServerArg({ ServerName: "pi-bridge-s42-slack" }), "pi-bridge-s42-slack");
+  assert.equal(callMcpServerArg({ ServerName: "external-mcp" }), undefined);
+
+  const h = await createExtensionAcpHarness();
+  try {
+    const driver = new AcpDriver({
+      bin: process.execPath,
+      binArgs: [path.join(h.tmpDir, "fake-acp-relay.mjs")],
+      extraEnv: { FAKE_ACP_PORT: String(h.port) },
+      log: () => {},
+    });
+    const handle = await driver.run({
+      cwd: h.tmpDir,
+      model: "gemini-4-carbon-high",
+      mode: "accept-edits",
+      skipPermissions: true,
+      conversationId: null,
+      prompt: "test tool_update mcpServer preservation",
+    });
+    const promptFrame = await h.waitForFrame((f) => f.method === "session/prompt");
+    const sid = promptFrame.params.sessionId;
+
+    // 1. tool_call without args -> in_progress tool_call_update with ServerName -> completed without args/name.
+    h.sendUpdate(sid, {
+      sessionUpdate: "tool_call",
+      toolCallId: "tc-upd-done",
+      name: "call_mcp_tool",
+      rawInput: {},
+    });
+    h.sendUpdate(sid, {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc-upd-done",
+      status: "in_progress",
+      rawInput: { ServerName: "pi-bridge-slack", ToolName: "users__list" },
+    });
+    h.sendUpdate(sid, {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc-upd-done",
+      status: "completed",
+      rawOutput: "ok",
+    });
+
+    // 2. tool_call without args -> failed tool_call_update carrying serverName without name/title.
+    h.sendUpdate(sid, {
+      sessionUpdate: "tool_call",
+      toolCallId: "tc-upd-err",
+      name: "call_mcp_tool",
+      rawInput: {},
+    });
+    h.sendUpdate(sid, {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc-upd-err",
+      status: "failed",
+      rawInput: { serverName: "pi-bridge" },
+      rawOutput: "failed call",
+    });
+
+    h.replyPrompt(promptFrame, "end_turn");
+
+    const activities = [];
+    for (;;) {
+      const act = await handle.next();
+      if (!act) break;
+      activities.push(act);
+    }
+    await handle.outcome;
+    await driver.close("shutdown", "test");
+
+    const doneAct = activities.find((a) => a.type === "tool_done" && a.toolCallId === "tc-upd-done");
+    assert.equal(doneAct?.mcpServer, "pi-bridge-slack");
+    const errAct = activities.find((a) => a.type === "tool_error" && a.toolCallId === "tc-upd-err");
+    assert.equal(errAct?.mcpServer, "pi-bridge");
+  } finally {
+    await h.close();
+  }
+});

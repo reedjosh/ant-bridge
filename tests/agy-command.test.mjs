@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -973,6 +974,9 @@ async function createRecycleAcpHarness() {
     sendUpdate(sessionId, update) {
       sendToClient({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update } });
     },
+    sendServerFrame(frame) {
+      sendToClient(frame);
+    },
     replyPrompt(promptFrame, text = "ok") {
       const sid = promptFrame.params.sessionId;
       sendToClient({
@@ -1007,11 +1011,13 @@ test(
     const prevAgyBin = process.env.AGY_BIN;
     const prevFakePort = process.env.FAKE_ACP_PORT;
     const prevDebug = process.env.AGY_DEBUG;
+    const prevSubagentChild = process.env.PI_SUBAGENT_CHILD;
     process.env.HOME = fakeHome;
     process.env.PI_CODING_AGENT_DIR = agentDir;
     process.env.AGY_BIN = h.launcherPath;
     process.env.FAKE_ACP_PORT = String(h.port);
     process.env.AGY_DEBUG = "1";
+    delete process.env.PI_SUBAGENT_CHILD;
 
     const allTools = [
       {
@@ -1334,6 +1340,391 @@ test(
       else process.env.FAKE_ACP_PORT = prevFakePort;
       if (prevDebug === undefined) delete process.env.AGY_DEBUG;
       else process.env.AGY_DEBUG = prevDebug;
+      if (prevSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = prevSubagentChild;
+      await h.close();
+    }
+    await waitForDiskFlush();
+    assert.equal(fs.existsSync(h.tmpDir), false);
+  },
+);
+
+test(
+  "mcpServers records warm-up fingerprint, idle permissionPolicy honors skipPermissions, and mcpLog dedupes",
+  async () => {
+    const h = await createRecycleAcpHarness();
+    const fakeHome = path.join(h.tmpDir, "home");
+    const agentDir = path.join(h.tmpDir, "agent");
+    fs.mkdirSync(fakeHome, { recursive: true });
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    const prevHome = process.env.HOME;
+    const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const prevAgyBin = process.env.AGY_BIN;
+    const prevFakePort = process.env.FAKE_ACP_PORT;
+    const prevDebug = process.env.AGY_DEBUG;
+    const prevSubagentChild = process.env.PI_SUBAGENT_CHILD;
+    process.env.HOME = fakeHome;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    process.env.AGY_BIN = h.launcherPath;
+    process.env.FAKE_ACP_PORT = String(h.port);
+    process.env.AGY_DEBUG = "1";
+    delete process.env.PI_SUBAGENT_CHILD;
+
+    const allTools = [
+      {
+        name: "codemode",
+        description: "Run codemode batch",
+        parameters: { type: "object", properties: {} },
+        sourceInfo: { source: "builtin", path: "builtin:codemode" },
+      },
+      {
+        name: "mcp__slack__users__list",
+        description: "List Slack users",
+        parameters: { type: "object", properties: {} },
+        sourceInfo: { source: "builtin", path: "builtin:mcp" },
+      },
+    ];
+    let activeToolNames = ["codemode"];
+
+    const handlers = new Map();
+    const providers = new Map();
+    const uiNotifications = [];
+    let selectCalls = 0;
+    const mockPi = {
+      registerProvider(id, spec) {
+        providers.set(id, spec);
+      },
+      registerCommand() {},
+      registerTool() {},
+      registerEntryRenderer() {},
+      registerMessageRenderer() {},
+      on(event, fn) {
+        const list = handlers.get(event) ?? [];
+        list.push(fn);
+        handlers.set(event, list);
+      },
+      getAllTools() {
+        return allTools;
+      },
+      getActiveTools() {
+        return activeToolNames;
+      },
+      appendEntry() {},
+      sendMessage() {},
+      events: { emit() {}, on() {} },
+    };
+
+    const sessionCtx = {
+      hasUI: true,
+      mode: "tui",
+      cwd: h.tmpDir,
+      ui: {
+        theme: { fg: (_c, s) => s, bold: (s) => s },
+        notify(message, type) {
+          uiNotifications.push({ message, type });
+        },
+        setStatus() {},
+        async select() {
+          selectCalls += 1;
+          return undefined;
+        },
+      },
+      isProjectTrusted: () => false,
+      sessionManager: {
+        getSessionId: () => "hardening-sess",
+        getCwd: () => h.tmpDir,
+        getEntries: () => [],
+        getBranch: () => [],
+      },
+    };
+
+    let mcpClient = null;
+    try {
+      saveConfig({ bridgeTools: "all", skipPermissions: true, permissionMode: "ask" });
+      await registerExtension(mockPi);
+      const providerSpec = providers.get("antigravity");
+      const model = providerSpec.models[0];
+
+      for (const fn of handlers.get("session_start") ?? []) {
+        await fn({ type: "session_start", reason: "startup" }, sessionCtx);
+      }
+
+      // 1. Pre-turn standalone summarization warm-up spawns agy acp (initCount = 1) and records
+      //    lastSyncedCatalogFingerprint via mcpServers().
+      let idx = h.received.length;
+      const sumStream = providerSpec.streamSimple(
+        model,
+        {
+          messages: [
+            {
+              role: "system",
+              content: "You are a context summarization assistant.",
+              timestamp: 0,
+            },
+            { role: "user", content: "Summarize history.", timestamp: 1 },
+          ],
+        },
+        { cwd: h.tmpDir, sessionId: "hardening-sess", cacheRetention: "none" },
+      );
+      const sumSessionNew = await h.waitForFrame((f) => f.method === "session/new", idx);
+      assert.deepEqual(
+        sumSessionNew.params.mcpServers.map((s) => s.name),
+        ["pi-bridge"],
+      );
+      const sumPrompt = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+      h.replyPrompt(sumPrompt, "summary");
+      const sumRes = await sumStream.result();
+      assert.equal(sumRes.stopReason, "stop");
+      assert.equal(h.initCount(), 1);
+
+      // Mutate active tools BEFORE Turn 1: because mcpServers() recorded the warm-up fingerprint,
+      // Turn 1's beforeTurn recycles the warm driver (initCount -> 2) and exposes pi-bridge-slack.
+      activeToolNames = ["codemode", "mcp__slack__users__list"];
+      const u1 = { role: "user", content: "First real turn", timestamp: 2 };
+      idx = h.received.length;
+      const t1Stream = providerSpec.streamSimple(
+        model,
+        { messages: [u1] },
+        { cwd: h.tmpDir, sessionId: "hardening-sess" },
+      );
+      const t1New = await h.waitForFrame((f) => f.method === "session/new", idx);
+      assert.equal(h.initCount(), 2);
+      assert.deepEqual(
+        t1New.params.mcpServers.map((s) => s.name),
+        ["pi-bridge", "pi-bridge-slack"],
+      );
+      const p1 = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+      h.replyPrompt(p1, "first reply");
+      const a1 = await t1Stream.result();
+      assert.equal(a1.stopReason, "stop");
+
+      // 2. Out-of-turn session/request_permission while idle honors skipPermissions=true without prompting UI.
+      idx = h.received.length;
+      h.sendServerFrame({
+        jsonrpc: "2.0",
+        id: "perm-idle-allow",
+        method: "session/request_permission",
+        params: {
+          sessionId: t1New.params.sessionId ?? "sess-2",
+          toolCall: { toolCallId: "bg-1", kind: "execute", title: "Run background check" },
+          options: [
+            { optionId: "allow_once", kind: "allow_once", name: "Allow once" },
+            { optionId: "reject_once", kind: "reject_once", name: "Reject" },
+          ],
+        },
+      });
+      const permAllowReply = await h.waitForFrame((f) => f.id === "perm-idle-allow", idx);
+      assert.deepEqual(permAllowReply.result, {
+        outcome: { outcome: "selected", optionId: "allow_once" },
+      });
+      assert.equal(selectCalls, 0);
+
+      // When skipPermissions=false and permissionMode="deny", idle permission requests reject cleanly.
+      saveConfig({ skipPermissions: false, permissionMode: "deny" });
+      idx = h.received.length;
+      h.sendServerFrame({
+        jsonrpc: "2.0",
+        id: "perm-idle-deny",
+        method: "session/request_permission",
+        params: {
+          sessionId: "sess-2",
+          toolCall: { toolCallId: "bg-2", kind: "execute", title: "Run denied check" },
+          options: [
+            { optionId: "allow_once", kind: "allow_once", name: "Allow once" },
+            { optionId: "reject_once", kind: "reject_once", name: "Reject" },
+          ],
+        },
+      });
+      const permDenyReply = await h.waitForFrame((f) => f.id === "perm-idle-deny", idx);
+      assert.deepEqual(permDenyReply.result, {
+        outcome: { outcome: "selected", optionId: "reject_once" },
+      });
+      assert.equal(selectCalls, 0);
+      saveConfig({ skipPermissions: true, permissionMode: "ask" });
+
+      // 3. Out-of-turn bridged tool calls return actionable guidance, notify once in readable prose,
+      //    deduplicate repeats, and reset on the next turn.
+      const coreSrv = t1New.params.mcpServers[0];
+      const authHeaders = Object.fromEntries(coreSrv.headers.map((hdr) => [hdr.name, hdr.value]));
+      mcpClient = new Client({ name: "idle-test-client", version: "1.0.0" });
+      await mcpClient.connect(
+        new StreamableHTTPClientTransport(new URL(coreSrv.url), {
+          requestInit: { headers: authHeaders },
+        }),
+      );
+
+      uiNotifications.length = 0;
+      const idleRes1 = await mcpClient.callTool({ name: "codemode", arguments: {} });
+      assert.equal(idleRes1.isError, true);
+      assert.match(
+        idleRes1.content[0].text,
+        /no active antigravity turn; the pi tool bridge only works while an antigravity model is streaming/,
+      );
+      assert.match(
+        idleRes1.content[0].text,
+        /background native agy subagents cannot call pi-bridge\* tools/,
+      );
+      assert.deepEqual(uiNotifications, [
+        {
+          message:
+            "[ant-bridge] Ignored bridged tool call (codemode) because no Antigravity turn is active.",
+          type: "warning",
+        },
+      ]);
+
+      // Second out-of-turn call while still idle is deduplicated in UI notifications.
+      const idleRes2 = await mcpClient.callTool({ name: "codemode", arguments: {} });
+      assert.equal(idleRes2.isError, true);
+      assert.equal(uiNotifications.length, 1);
+
+      // Starting Turn 2 resets outOfTurnWarned; test non-out-of-turn call-tool-fail formatting mid-turn
+      // by aborting an in-flight tools/call HTTP request, then verify out-of-turn warns once again after Turn 2.
+      const u2 = { role: "user", content: "Second real turn", timestamp: 3 };
+      idx = h.received.length;
+      const t2Stream = providerSpec.streamSimple(
+        model,
+        { messages: [u1, a1, u2] },
+        { cwd: h.tmpDir, sessionId: "hardening-sess" },
+      );
+      const p2 = await h.waitForFrame((f) => f.method === "session/prompt", idx);
+
+      const mcpUrl = new URL(coreSrv.url);
+      const payload = JSON.stringify({
+        jsonrpc: "2.0",
+        id: 99,
+        method: "tools/call",
+        params: { name: "codemode", arguments: {} },
+      });
+      const rawReq = http.request({
+        hostname: mcpUrl.hostname,
+        port: Number(mcpUrl.port),
+        path: mcpUrl.pathname,
+        method: "POST",
+        headers: {
+          ...authHeaders,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          "content-length": Buffer.byteLength(payload),
+        },
+      });
+      rawReq.on("error", () => {});
+      rawReq.end(payload);
+
+      const parkedA2 = await t2Stream.result();
+      assert.equal(parkedA2.stopReason, "toolUse");
+      rawReq.destroy();
+
+      // Wait briefly for server socket close -> call-tool-fail notification.
+      for (let i = 0; i < 30; i++) {
+        if (uiNotifications.some((n) => n.message.startsWith("[ant-bridge] Bridge tool codemode failed:"))) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.equal(
+        uiNotifications.some(
+          (n) =>
+            n.message ===
+            "[ant-bridge] Bridge tool codemode failed: agy disconnected before the tool result arrived",
+        ),
+        true,
+      );
+
+      const logDir = path.join(agentDir, "antigravity-bridge", "logs");
+      const countTurnEnds = () => {
+        if (!fs.existsSync(logDir)) return 0;
+        return fs
+          .readdirSync(logDir)
+          .filter((n) => n.endsWith(".ndjson"))
+          .map((n) => fs.readFileSync(path.join(logDir, n), "utf8"))
+          .join("\n")
+          .split("\n")
+          .filter((l) => l.includes('"event":"turn-end"')).length;
+      };
+      const turnEndsBefore = countTurnEnds();
+      h.replyPrompt(p2, "second reply");
+      for (let i = 0; i < 60 && countTurnEnds() <= turnEndsBefore; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+
+      const beforePostTurnIdle = uiNotifications.length;
+      const idleAfterTurn2 = await mcpClient.callTool({ name: "codemode", arguments: {} });
+      assert.equal(idleAfterTurn2.isError, true);
+      assert.equal(uiNotifications.length, beforePostTurnIdle + 1);
+      assert.equal(
+        uiNotifications.at(-1)?.message,
+        "[ant-bridge] Ignored bridged tool call (codemode) because no Antigravity turn is active.",
+      );
+
+      // Unauthorized request formats as clean prose without JSON.stringify.
+      const unauthRes = await fetch(coreSrv.url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      assert.equal(unauthRes.status, 403);
+      assert.equal(
+        uiNotifications.at(-1)?.message,
+        "[ant-bridge] Rejected unauthorized MCP bridge request (/mcp).",
+      );
+      assert.equal(
+        uiNotifications.some((n) => n.message.includes('{"')),
+        false,
+      );
+
+      // Verify structured NDJSON log still records call-tool-fail entries at warn and error levels.
+      let logContent = "";
+      for (let i = 0; i < 20; i++) {
+        if (fs.existsSync(logDir)) {
+          const logFiles = fs.readdirSync(logDir).filter((n) => n.endsWith(".ndjson"));
+          logContent = logFiles
+            .map((n) => fs.readFileSync(path.join(logDir, n), "utf8"))
+            .join("\n");
+          if (logContent.includes('"event":"unauthorized"')) break;
+        }
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      const parsedLogs = logContent
+        .split("\n")
+        .filter((l) => l.trim().startsWith("{"))
+        .map((l) => JSON.parse(l));
+      const outOfTurnLogs = parsedLogs.filter(
+        (e) =>
+          e.event === "call-tool-fail" &&
+          String(e.data?.msg ?? "").includes("no active antigravity turn"),
+      );
+      assert.equal(outOfTurnLogs.length, 3);
+      assert.equal(
+        outOfTurnLogs.every((e) => e.level === "warn"),
+        true,
+      );
+      const disconnectLogs = parsedLogs.filter(
+        (e) =>
+          e.event === "call-tool-fail" &&
+          String(e.data?.msg ?? "").includes("agy disconnected"),
+      );
+      assert.equal(disconnectLogs.length, 1);
+      assert.equal(disconnectLogs[0].level, "error");
+    } finally {
+      try {
+        await mcpClient?.close();
+      } catch {}
+      for (const fn of handlers.get("session_shutdown") ?? []) {
+        await fn({ type: "session_shutdown" }, sessionCtx);
+      }
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+      if (prevAgyBin === undefined) delete process.env.AGY_BIN;
+      else process.env.AGY_BIN = prevAgyBin;
+      if (prevFakePort === undefined) delete process.env.FAKE_ACP_PORT;
+      else process.env.FAKE_ACP_PORT = prevFakePort;
+      if (prevDebug === undefined) delete process.env.AGY_DEBUG;
+      else process.env.AGY_DEBUG = prevDebug;
+      if (prevSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = prevSubagentChild;
       await h.close();
     }
     await waitForDiskFlush();

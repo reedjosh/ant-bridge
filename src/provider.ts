@@ -183,8 +183,10 @@ export const TOOL_PRIORITY_NOTE: string = [
 	"any image) stays undelivered to you. Delegate subagent work through Pi Bridge: when pi's tool list",
 	"includes a delegation tool (for example subagent, Agent, agent_spawn, agent_wait, or",
 	"subagent_run), always delegate through it and never through the native invoke_subagent,",
-	"run_subagent, or manage_subagents; use native ones only if no pi delegation tool is listed,",
-	"because native subagents run inside agy and are invisible to pi and anything watching it.",
+	"run_subagent, manage_subagents, or swarm; native invoke_subagent and swarm background workers run",
+	"inside agy invisible to pi, lose access to pi-bridge* tools as soon as the parent turn ends, and",
+	"never wake pi on completion (even if no pi delegation tool is listed, never leave native subagents",
+	"running across turn boundaries or expect them to call pi-bridge* tools).",
 	"Long-running bridge calls do not fail: after ~20 seconds (120 seconds for subagent and codemode",
 	"calls) the bridge answers STILL RUNNING with a callId; fetch the result with bridge_poll_result",
 	"and poll until it lands.]",
@@ -378,6 +380,7 @@ export interface BlockState {
 export interface NativeDisplayEvent {
 	name: string;
 	mcpServer?: string;
+	toolCallId?: string;
 	status: "started" | "completed" | "failed";
 	callId?: string;
 	path?: string;
@@ -698,7 +701,8 @@ export class ToolRoundTrips {
 		if (!handle) {
 			return Promise.reject(
 				new Error(
-					"no active antigravity turn; the pi tool bridge only works while an antigravity model is streaming",
+					"no active antigravity turn; the pi tool bridge only works while an antigravity model is streaming " +
+						"(parent turn already ended; background native agy subagents cannot call pi-bridge* tools)",
 				),
 			);
 		}
@@ -1044,6 +1048,7 @@ export function consumeActivity(
 					feats.onNativeEvent({
 						name: activity.name,
 						mcpServer: activity.mcpServer,
+						...(activity.toolCallId ? { toolCallId: activity.toolCallId } : {}),
 						status: "started",
 						...(targetPath ? { path: targetPath } : {}),
 						...(detail ? { detail } : {}),
@@ -1085,6 +1090,7 @@ export function consumeActivity(
 					feats.onNativeEvent({
 						name: activity.name,
 						mcpServer: activity.mcpServer,
+						...(activity.toolCallId ? { toolCallId: activity.toolCallId } : {}),
 						status: "completed",
 						path: file,
 						...(detail ? { detail } : {}),
@@ -1121,6 +1127,7 @@ export function consumeActivity(
 					feats.onNativeEvent({
 						name: activity.name,
 						mcpServer: activity.mcpServer,
+						...(activity.toolCallId ? { toolCallId: activity.toolCallId } : {}),
 						status: "failed",
 						...(targetPath ? { path: targetPath } : {}),
 						...(detail ? { detail } : {}),

@@ -162,6 +162,7 @@ export function stageAcpHome(opts: StageAcpHomeOptions = {}): string {
 	// install always writes conversations and auth state inside ~/.gemini/antigravity-cli.
 	const appData = path.join(geminiHome, "antigravity-cli");
 	fs.mkdirSync(appData, { recursive: true, mode: 0o700 });
+	sweepStaleChildMcpDirs(path.join(appData, "mcp"));
 	ensureDirectoryLink(appData, path.join(staged, "antigravity-cli"));
 
 	const instructions = path.join(geminiHome, "GEMINI.md");
@@ -224,6 +225,31 @@ function sweepLegacyAcpHomesDir(homesDir: string, alive: (pid: number) => boolea
 		const pid = Number(match[1]);
 		if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid || alive(pid)) continue;
 		removeStagedAcpHome(path.join(homesDir, name));
+	}
+}
+
+export function sweepStaleChildMcpDirs(
+	mcpDir: string,
+	alive: (pid: number) => boolean = isPidAlive,
+): void {
+	let entries: string[];
+	try {
+		entries = fs.readdirSync(mcpDir);
+	} catch {
+		return;
+	}
+	for (const name of entries) {
+		const match = /^pi-bridge-s(\d+)(?:-|$)/.exec(name);
+		if (!match) continue;
+		const pid = Number(match[1]);
+		if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid || alive(pid)) continue;
+		const target = path.join(mcpDir, name);
+		try {
+			if (!fs.lstatSync(target).isDirectory()) continue;
+			fs.rmSync(target, { recursive: true, force: true });
+		} catch {
+			// Best-effort sweep of dead child subagent MCP schema directory.
+		}
 	}
 }
 

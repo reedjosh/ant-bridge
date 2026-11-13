@@ -1,6 +1,6 @@
 {
   "name": "ant-bridge",
-  "version": "2.4.3",
+  "version": "2.4.4",
   "description": "ACP model provider and MCP/skill bridge for Pi.",
   "license": "MIT",
   "type": "module",

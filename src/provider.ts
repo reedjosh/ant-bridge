@@ -393,6 +393,7 @@ export interface StreamSimpleDeps {
 	driver?: TurnDriver;
 	acpDriver?: TurnDriver;
 	roundTrips?: ToolRoundTrips;
+	beforeTurn?: () => Promise<void>;
 	onNativeEvent?: (event: NativeDisplayEvent) => void;
 	onNativeBackground?: (info: { conversationId: string; turnStartMs: number }) => void;
 	onTurnFinished?: () => void;
@@ -829,6 +830,7 @@ export function buildLateResultPrompt(late: LateToolResult[], userPrompt?: strin
 export interface DriverDeps {
 	driver: TurnDriver;
 	roundTrips: ToolRoundTrips;
+	beforeTurn?: () => Promise<void>;
 	onNativeEvent?: (event: NativeDisplayEvent) => void;
 	onNativeBackground?: (info: { conversationId: string; turnStartMs: number }) => void;
 	onTurnFinished?: () => void;
@@ -1381,6 +1383,7 @@ async function runTurnDriver(
 				? buildLateResultPrompt(late, prompt || undefined)
 				: buildFullPrompt(sysPrompt, "", prompt ?? "");
 		try {
+			await deps.beforeTurn?.();
 			handle = await deps.driver.run({
 				cwd,
 				model: agyModel,
@@ -1589,6 +1592,7 @@ export function createStreamSimple(
 			void runTurnDriver(stream, model, context, options, entries, store, {
 				driver: selected,
 				roundTrips,
+				beforeTurn: deps.beforeTurn,
 				onNativeEvent: deps.onNativeEvent,
 				onNativeBackground: deps.onNativeBackground,
 				onTurnFinished: deps.onTurnFinished,

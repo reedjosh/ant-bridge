@@ -34,7 +34,13 @@ import {
 	type BackgroundWatchEntry,
 	type BackgroundWatchHandle,
 } from "../src/background-watch.js";
-import { bridgedPiTools } from "../src/bridge-catalog.js";
+import {
+	bridgeCatalogFingerprint,
+	bridgedPiTools,
+	partitionBridgeTools,
+	PI_BRIDGE_SERVER_PREFIX,
+	PI_BRIDGE_SERVER_RE,
+} from "../src/bridge-catalog.js";
 import {
 	configPath,
 	loadConfig,
@@ -71,6 +77,7 @@ import {
 	defaultEscalateAfterMs,
 	formatEscalatedAck,
 	formatPollAnswer,
+	PI_BRIDGE_INSTRUCTIONS,
 	POLL_TOOL_NAME,
 	ToolRoundTrips,
 	type NativeDisplayEvent,
@@ -215,14 +222,21 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		log: acpLog,
 		mcpServers: () => {
 			const handle = mcpHandle;
-			if (!handle) return [];
+			if (!handle || loadConfig().bridgeTools === "none") return [];
+			const { namespaces } = partitionBridgeTools(getBridgeTools());
 			return [
 				{
-					name: "pi-bridge",
+					name: PI_BRIDGE_SERVER_PREFIX,
 					type: "http",
 					url: `http://127.0.0.1:${handle.port}/mcp`,
 					headers: [{ name: TOKEN_HEADER, value: handle.token }],
 				},
+				...namespaces.map((ns) => ({
+					name: ns.serverName,
+					type: "http" as const,
+					url: `http://127.0.0.1:${handle.port}/mcp/ns/${ns.routeName}`,
+					headers: [{ name: TOKEN_HEADER, value: handle.token }],
+				})),
 			];
 		},
 	});
@@ -272,7 +286,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			return;
 		}
 		closePollRun();
-		if (/^pi-bridge(?:-\d+)?$/.test(event.mcpServer ?? "")) return;
+		if (PI_BRIDGE_SERVER_RE.test(event.mcpServer ?? "")) return;
 		if (event.status === "started") {
 			pendingNativeTools++;
 			const detail = formatNativeEventDetail(event);
@@ -449,11 +463,57 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		backgroundWatchers.set(conversationId, slot);
 	};
 
+	let activeSessionCtx: ExtensionContext | null = null;
+	let activeSessionCwd: string | undefined;
+	let activeSessionKey: string | undefined;
+	let mcpStartPromise: Promise<number | null> | null = null;
+	let mcpEpoch = 0;
+	let lastSyncedCatalogFingerprint: string | null = null;
+
+	const syncSessionContext = (ctx: ExtensionContext): void => {
+		activeSessionCtx = ctx;
+		if (typeof ctx.isProjectTrusted === "function") {
+			activeSessionCwd = ctx.isProjectTrusted() ? ctx.cwd : undefined;
+		}
+		activeSessionKey = currentSessionKey(ctx);
+	};
+
+	const resolveSkills = (): SkillLite[] =>
+		skillsFromCommands(
+			typeof pi.getCommands === "function" ? pi.getCommands() : [],
+			() => scanSkills(activeSessionCwd),
+		);
+
+	const syncBridgeCatalog = async (reason: string): Promise<void> => {
+		const nextFp =
+			loadConfig().bridgeTools === "none"
+				? "none"
+				: bridgeCatalogFingerprint(
+						getBridgeTools(),
+						resolveSkills().map((s) => `skill:${s.name}`),
+					);
+		if (acpDriver.state === "idle" || acpDriver.state === "dead") {
+			lastSyncedCatalogFingerprint = nextFp;
+		} else if (
+			lastSyncedCatalogFingerprint !== null &&
+			nextFp !== lastSyncedCatalogFingerprint &&
+			acpDriver.state !== "running" &&
+			!acpDriver.activeHandle
+		) {
+			fileLog.log("bridge-catalog-recycle", { reason }, "info");
+			await acpDriver.close("recycle", reason);
+			lastSyncedCatalogFingerprint = nextFp;
+		} else if (lastSyncedCatalogFingerprint === null) {
+			lastSyncedCatalogFingerprint = nextFp;
+		}
+	};
+
 	const streamSimple = createStreamSimple({
 		entries,
 		store,
 		acpDriver,
 		roundTrips,
+		beforeTurn: () => syncBridgeCatalog("bridge tool catalog updated"),
 		onNativeEvent,
 		onNativeBackground: (info) => armConversationWatcher(info.conversationId, info.turnStartMs),
 		onTurnFinished: () => {
@@ -533,26 +593,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		}
 	}
 
-	let activeSessionCtx: ExtensionContext | null = null;
-	let activeSessionCwd: string | undefined;
-	let activeSessionKey: string | undefined;
-	let mcpStartPromise: Promise<number | null> | null = null;
-	let mcpEpoch = 0;
-
-	const syncSessionContext = (ctx: ExtensionContext): void => {
-		activeSessionCtx = ctx;
-		if (typeof ctx.isProjectTrusted === "function") {
-			activeSessionCwd = ctx.isProjectTrusted() ? ctx.cwd : undefined;
-		}
-		activeSessionKey = currentSessionKey(ctx);
-	};
-
-	const resolveSkills = (): SkillLite[] =>
-		skillsFromCommands(
-			typeof pi.getCommands === "function" ? pi.getCommands() : [],
-			() => scanSkills(activeSessionCwd),
-		);
-
 	const mcpLog = (s: string, d?: unknown) => {
 		const failures = new Set([
 			"http-error",
@@ -584,7 +624,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		else console.error(msg);
 	};
 
-	const listTools = () => {
+	const toMcpInputSchema = (parameters: object | undefined): object => {
+		let inputSchema: object = { type: "object", properties: {}, additionalProperties: true };
+		try {
+			if (parameters) inputSchema = JSON.parse(JSON.stringify(parameters)) as object;
+		} catch {
+			// Keep permissive fallback schema.
+		}
+		return inputSchema;
+	};
+
+	const listTools = (route = PI_BRIDGE_SERVER_PREFIX) => {
 		const liveDescriptions = new Map<string, string>();
 		try {
 			const branch = activeSessionCtx?.sessionManager?.getBranch?.() ?? [];
@@ -597,19 +647,23 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		} catch {
 			// Fall back to static tool descriptions.
 		}
-		const tools = getBridgeTools().map((t) => {
-			let inputSchema: object = { type: "object", properties: {}, additionalProperties: true };
-			try {
-				if (t.parameters) inputSchema = JSON.parse(JSON.stringify(t.parameters)) as object;
-			} catch {
-				// Keep permissive fallback schema.
-			}
-			return {
-				name: t.name,
-				description: liveDescriptions.get(t.name) ?? t.description ?? t.name,
-				inputSchema,
-			};
-		});
+		const { coreTools, namespaces } = partitionBridgeTools(getBridgeTools());
+		if (route.startsWith("ns:")) {
+			const routeName = route.slice(3);
+			const ns = namespaces.find((entry) => entry.routeName === routeName);
+			if (!ns) return [];
+			return ns.tools.map((item) => ({
+				name: item.exposedName,
+				description: liveDescriptions.get(item.piName) ?? item.tool.description ?? item.exposedName,
+				inputSchema: toMcpInputSchema(item.tool.parameters),
+			}));
+		}
+		if (route !== PI_BRIDGE_SERVER_PREFIX) return [];
+		const tools = coreTools.map((t) => ({
+			name: t.name,
+			description: liveDescriptions.get(t.name) ?? t.description ?? t.name,
+			inputSchema: toMcpInputSchema(t.parameters),
+		}));
 		if (loadConfig().bridgeTools !== "none") {
 			const skills = resolveSkills();
 			if (skills.length > 0) {
@@ -637,12 +691,36 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		return tools;
 	};
 
+	const toolNotExposedResult = (name: string) => ({
+		content: [
+			{
+				type: "text",
+				text: `Pi tool ${name} is not active or not exposed to Antigravity`,
+			},
+		],
+		isError: true,
+	});
+
 	const bridgeOnToolCall = (
 		callId: string,
 		name: string,
 		args: Record<string, unknown>,
 		signal: AbortSignal,
+		route = PI_BRIDGE_SERVER_PREFIX,
 	) => {
+		if (route.startsWith("ns:")) {
+			const routeName = route.slice(3);
+			const { namespaces } = partitionBridgeTools(getBridgeTools());
+			const ns = namespaces.find((entry) => entry.routeName === routeName);
+			const item = ns?.tools.find((entry) => entry.exposedName === name || entry.piName === name);
+			if (!item) return Promise.resolve(toolNotExposedResult(name));
+			return roundTrips.onToolCall(callId, item.piName, args, signal).then((r) => {
+				if (!("escalated" in r)) return r;
+				mcpLog("call-tool-escalated", { name: item.piName, callId: r.callId });
+				return formatEscalatedAck(r);
+			});
+		}
+		if (route !== PI_BRIDGE_SERVER_PREFIX) return Promise.resolve(toolNotExposedResult(name));
 		if (name === POLL_TOOL_NAME) {
 			const wanted = typeof args.callId === "string" ? args.callId : "";
 			mcpLog("poll-tool", { callId: wanted });
@@ -651,16 +729,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			return Promise.resolve(formatPollAnswer(wanted, view));
 		}
 		if (name !== ACTIVATE_SKILL_TOOL_NAME) {
-			if (!getBridgeTools().some((tool) => tool.name === name)) {
-				return Promise.resolve({
-					content: [
-						{
-							type: "text",
-							text: `Pi tool ${name} is not active or not exposed to Antigravity`,
-						},
-					],
-					isError: true,
-				});
+			const { coreTools } = partitionBridgeTools(getBridgeTools());
+			if (!coreTools.some((tool) => tool.name === name)) {
+				return Promise.resolve(toolNotExposedResult(name));
 			}
 			return roundTrips.onToolCall(callId, name, args, signal).then((r) => {
 				if (!("escalated" in r)) return r;
@@ -688,7 +759,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		if (mcpStartPromise) return mcpStartPromise;
 		const startEpoch = mcpEpoch;
 		mcpStartPromise = (async () => {
-			const r = await startMcpServer({ listTools, onToolCall: bridgeOnToolCall }, { log: mcpLog });
+			const r = await startMcpServer(
+				{ listTools, onToolCall: bridgeOnToolCall, instructions: PI_BRIDGE_INSTRUCTIONS },
+				{ log: mcpLog },
+			);
 			if (r.ok && r.handle) {
 				if (startEpoch !== mcpEpoch) {
 					await r.handle.close();
@@ -712,6 +786,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		acpDriver,
 		getMcpPort: () => mcpHandle?.port ?? null,
 		ensureMcpServer,
+		syncBridgeCatalog,
 		getActiveSessionKey: () => activeSessionKey,
 		onSessionContext: syncSessionContext,
 		bridgeTools: getBridgeTools,
@@ -780,6 +855,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		activeSessionCtx = null;
 		activeSessionCwd = undefined;
 		activeSessionKey = undefined;
+		lastSyncedCatalogFingerprint = null;
 		mcpEpoch++;
 		const h = mcpHandle;
 		mcpHandle = null;
@@ -800,6 +876,7 @@ interface AgyCommandCtx {
 	acpDriver: AcpDriver;
 	getMcpPort: () => number | null;
 	ensureMcpServer?: () => Promise<number | null>;
+	syncBridgeCatalog?: (reason: string) => Promise<void>;
 	getActiveSessionKey?: () => string | undefined;
 	onSessionContext?: (ctx: ExtensionContext) => void;
 	bridgeTools: () => Array<{ name: string }>;
@@ -1308,6 +1385,7 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 					if ((val === "all" || val === "mcp") && port === null && ctx.ensureMcpServer) {
 						port = await ctx.ensureMcpServer();
 					}
+					await ctx.syncBridgeCatalog?.(`/agy bridge ${val}`);
 					if ((val === "all" || val === "mcp") && port === null) {
 						ui?.notify(
 							`bridge set to ${next.bridgeTools}, but the MCP bridge server failed to start.`,
@@ -1343,6 +1421,7 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 				const name = parts.slice(2).join(" ");
 				if (val === "reset") {
 					ctx.hiddenBridgeTools.clear();
+					await ctx.syncBridgeCatalog?.("/agy tools reset");
 					ui?.notify("Tool visibility reset for this Pi session.", "info");
 				} else if ((val === "hide" || val === "show") && name) {
 					if (!pi.getAllTools().some((tool) => tool.name === name)) {
@@ -1351,6 +1430,7 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 					}
 					if (val === "hide") ctx.hiddenBridgeTools.add(name);
 					else ctx.hiddenBridgeTools.delete(name);
+					await ctx.syncBridgeCatalog?.(`/agy tools ${val} ${name}`);
 					ui?.notify(
 						`${name}: ${val === "hide" ? "hidden from Antigravity" : "visible if active in Pi"}.`,
 						"info",
@@ -1653,6 +1733,9 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx?: AgyCommandCtx): Promi
 			ctx.ensureMcpServer
 		) {
 			await ctx.ensureMcpServer();
+		}
+		if (pending.bridgeTools !== undefined) {
+			await ctx?.syncBridgeCatalog?.(`/agy picker bridge=${next.bridgeTools}`);
 		}
 		const changed = [
 			pending.readOnly !== undefined ? `readOnly=${next.readOnly ? "on" : "off"}` : null,

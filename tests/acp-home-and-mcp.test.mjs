@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -17,7 +18,10 @@ const {
   stageAcpHome,
   sweepStaleAcpHomes,
 } = await importBridgeModule("src/acp/home.ts");
+const { saveConfig } = await importBridgeModule("src/config.ts");
 const { TOKEN_HEADER, startMcpServer } = await importBridgeModule("src/mcp-server.ts");
+const { PI_BRIDGE_INSTRUCTIONS } = await importBridgeModule("src/provider.ts");
+const { default: registerExtension } = await importBridgeModule("extensions/index.ts");
 
 test(
   "stageAcpHome stages persistent acp-home in place, refreshes config idempotently, and cleans up explicitly",
@@ -661,3 +665,468 @@ test("mapUpdate tags native mcp_pi-bridge* tools and call_mcp_tool targeting pi-
   });
   assert.equal(unrelatedWithServerArg.mcpServer, undefined);
 });
+
+const EXT_RELAY_SCRIPT = `
+import net from "node:net";
+
+if (process.argv[2] === "models") {
+  process.stdout.write("gemini-4-carbon-high  Gemini 4 Carbon (High)\\n");
+  process.exit(0);
+}
+if (process.argv[2] === "--version") {
+  process.stdout.write("1.5.4\\n");
+  process.exit(0);
+}
+
+const port = Number(process.env.FAKE_ACP_PORT);
+const sock = net.createConnection({ host: "127.0.0.1", port });
+sock.setEncoding("utf8");
+process.stdin.setEncoding("utf8");
+
+let connected = false;
+const queued = [];
+let stdinBuf = "";
+
+process.stdin.on("data", (chunk) => {
+  stdinBuf += chunk;
+  const lines = stdinBuf.split("\\n");
+  stdinBuf = lines.pop() ?? "";
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    if (connected) sock.write(line + "\\n");
+    else queued.push(line);
+  }
+});
+
+sock.on("connect", () => {
+  connected = true;
+  while (queued.length > 0) sock.write(queued.shift() + "\\n");
+});
+
+let sockBuf = "";
+sock.on("data", (chunk) => {
+  sockBuf += chunk;
+  const lines = sockBuf.split("\\n");
+  sockBuf = lines.pop() ?? "";
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    process.stdout.write(line + "\\n");
+  }
+});
+
+sock.on("close", () => process.exit(0));
+sock.on("error", () => process.exit(1));
+`;
+
+async function createExtensionAcpHarness() {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ant-mcp-ns-int-"));
+  const relayPath = path.join(tmpDir, "fake-acp-relay.mjs");
+  const launcherPath = path.join(tmpDir, "fake-agy.sh");
+  fs.writeFileSync(relayPath, EXT_RELAY_SCRIPT, "utf8");
+  fs.writeFileSync(
+    launcherPath,
+    `#!/bin/sh\nexec "${process.execPath}" "${relayPath}" "$@"\n`,
+    { mode: 0o755 },
+  );
+
+  const received = [];
+  const waiters = [];
+  const sockets = new Set();
+  let activeSocket = null;
+  let sessionCounter = 0;
+
+  function sendToClient(frame, sock = activeSocket) {
+    if (!sock || sock.destroyed) return;
+    sock.write(JSON.stringify(frame) + "\n");
+  }
+
+  function handleClientFrame(msg, sock) {
+    received.push(msg);
+    if (msg.method === "initialize") {
+      sendToClient(
+        {
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: { protocolVersion: 1, agentInfo: { name: "fake-agy", version: "1.5.4" } },
+        },
+        sock,
+      );
+    } else if (msg.method === "session/new") {
+      sessionCounter += 1;
+      sendToClient(
+        {
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: { sessionId: `sess-${sessionCounter}`, configOptions: [] },
+        },
+        sock,
+      );
+    } else if (msg.method === "session/load" || msg.method === "session/set_config_option") {
+      sendToClient({ jsonrpc: "2.0", id: msg.id, result: { configOptions: [] } }, sock);
+    }
+    for (let i = waiters.length - 1; i >= 0; i--) {
+      if (waiters[i].pred(msg)) {
+        const w = waiters.splice(i, 1)[0];
+        w.resolve(msg);
+      }
+    }
+  }
+
+  const server = net.createServer((sock) => {
+    sock.setEncoding("utf8");
+    sockets.add(sock);
+    activeSocket = sock;
+    let buf = "";
+    sock.on("data", (chunk) => {
+      buf += chunk;
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        handleClientFrame(JSON.parse(line), sock);
+      }
+    });
+    sock.on("close", () => sockets.delete(sock));
+  });
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+
+  return {
+    tmpDir,
+    launcherPath,
+    port,
+    received,
+    waitForFrame(pred, startIndex = 0) {
+      for (let i = startIndex; i < received.length; i++) {
+        if (pred(received[i])) return Promise.resolve(received[i]);
+      }
+      return new Promise((resolve) => waiters.push({ pred, resolve }));
+    },
+    sendUpdate(sessionId, update) {
+      sendToClient({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update } });
+    },
+    replyPrompt(promptFrame, stopReason = "end_turn") {
+      sendToClient({ jsonrpc: "2.0", id: promptFrame.id, result: { stopReason } });
+    },
+    async close() {
+      for (const s of sockets) s.destroy();
+      await new Promise((resolve) => server.close(resolve));
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    },
+  };
+}
+
+test(
+  "extension exposes pi-bridge + pi-bridge-slack, partitions tools, routes tools/call, and suppresses pi-bridge-slack",
+  async () => {
+    const h = await createExtensionAcpHarness();
+    const fakeHome = path.join(h.tmpDir, "home");
+    const agentDir = path.join(h.tmpDir, "agent");
+    fs.mkdirSync(fakeHome, { recursive: true });
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    const prevHome = process.env.HOME;
+    const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const prevAgyBin = process.env.AGY_BIN;
+    const prevFakePort = process.env.FAKE_ACP_PORT;
+    process.env.HOME = fakeHome;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    process.env.AGY_BIN = h.launcherPath;
+    process.env.FAKE_ACP_PORT = String(h.port);
+
+    const mockTools = [
+      {
+        name: "codemode",
+        description: "Execute codemode batch script",
+        parameters: { type: "object", properties: { code: { type: "string" } } },
+        sourceInfo: { source: "builtin", path: "builtin:codemode" },
+      },
+      {
+        name: "subagent",
+        description: "Delegate work to subagent",
+        parameters: { type: "object", properties: { task: { type: "string" } } },
+        sourceInfo: { source: "extension", path: "/ext/subagent.ts" },
+      },
+      {
+        name: "mcp__slack__slack_read_channel",
+        description: "Read Slack channel messages",
+        parameters: {
+          type: "object",
+          properties: { channel: { type: "string" } },
+          required: ["channel"],
+        },
+        sourceInfo: { source: "builtin", path: "builtin:mcp" },
+      },
+    ];
+
+    const handlers = new Map();
+    const providers = new Map();
+    const appendedEntries = [];
+    const statusUpdates = [];
+    const mockPi = {
+      registerProvider(id, spec) {
+        providers.set(id, spec);
+      },
+      registerCommand() {},
+      registerTool() {},
+      registerEntryRenderer() {},
+      registerMessageRenderer() {},
+      on(event, fn) {
+        const list = handlers.get(event) ?? [];
+        list.push(fn);
+        handlers.set(event, list);
+      },
+      getAllTools() {
+        return mockTools;
+      },
+      getActiveTools() {
+        return mockTools.map((t) => t.name);
+      },
+      getCommands() {
+        return [
+          {
+            name: "skill:demo",
+            description: "Demo skill",
+            source: "skill",
+            sourceInfo: { path: path.join(h.tmpDir, "SKILL.md") },
+          },
+        ];
+      },
+      appendEntry(customType, data) {
+        appendedEntries.push({ customType, data });
+      },
+      sendMessage() {},
+      events: { emit() {}, on() {} },
+    };
+
+    let coreClient = null;
+    let slackClient = null;
+    const sessionCtx = {
+      hasUI: true,
+      mode: "tui",
+      cwd: h.tmpDir,
+      ui: {
+        theme: { fg: (_c, s) => s, bold: (s) => s },
+        notify() {},
+        setStatus(key, text) {
+          statusUpdates.push({ key, text });
+        },
+      },
+      isProjectTrusted: () => false,
+      sessionManager: {
+        getSessionId: () => "mcp-ns-sess",
+        getCwd: () => h.tmpDir,
+        getEntries: () => [],
+        getBranch: () => [
+          {
+            type: "message",
+            message: {
+              role: "system",
+              content: "",
+              toolsAdded: [
+                {
+                  name: "mcp__slack__slack_read_channel",
+                  description: "Live Slack channel reader",
+                },
+              ],
+            },
+          },
+        ],
+      },
+    };
+
+    try {
+      saveConfig({ bridgeTools: "all" });
+      await registerExtension(mockPi);
+
+      for (const fn of handlers.get("session_start") ?? []) {
+        await fn({ type: "session_start", reason: "startup" }, sessionCtx);
+      }
+
+      const providerSpec = providers.get("antigravity");
+      const model = providerSpec.models[0];
+      const userMsg = { role: "user", content: "Read Slack #general", timestamp: 1 };
+      const stream1 = providerSpec.streamSimple(
+        model,
+        { messages: [userMsg] },
+        { cwd: h.tmpDir, sessionId: "mcp-ns-sess" },
+      );
+
+      const sessionNewFrame = await h.waitForFrame((f) => f.method === "session/new");
+      const promptFrame = await h.waitForFrame((f) => f.method === "session/prompt");
+
+      // (1) mcpServers exposes pi-bridge (/mcp) and pi-bridge-slack (/mcp/ns/slack).
+      const mcpServers = sessionNewFrame.params.mcpServers;
+      assert.deepEqual(
+        mcpServers.map((s) => s.name),
+        ["pi-bridge", "pi-bridge-slack"],
+      );
+      const coreSrv = mcpServers[0];
+      const slackSrv = mcpServers[1];
+      assert.match(coreSrv.url, /^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
+      assert.match(slackSrv.url, /^http:\/\/127\.0\.0\.1:\d+\/mcp\/ns\/slack$/);
+      assert.equal(coreSrv.type, "http");
+      assert.equal(slackSrv.type, "http");
+
+      const authHeaders = Object.fromEntries(coreSrv.headers.map((hdr) => [hdr.name, hdr.value]));
+
+      // (2) /mcp lists core tools + bridge_poll_result without mcp__slack__* and serves instructions.
+      coreClient = new Client({ name: "core-client", version: "1.0.0" });
+      await coreClient.connect(
+        new StreamableHTTPClientTransport(new URL(coreSrv.url), {
+          requestInit: { headers: authHeaders },
+        }),
+      );
+      assert.equal(coreClient.getServerVersion()?.name, "pi-bridge");
+      assert.equal(coreClient.getInstructions(), PI_BRIDGE_INSTRUCTIONS);
+      const coreToolsList = (await coreClient.listTools()).tools.map((t) => t.name);
+      assert.equal(coreToolsList.includes("codemode"), true);
+      assert.equal(coreToolsList.includes("subagent"), true);
+      assert.equal(coreToolsList.includes("activate_skill"), true);
+      assert.equal(coreToolsList.includes("bridge_poll_result"), true);
+      assert.equal(
+        coreToolsList.some((n) => n.includes("slack")),
+        false,
+      );
+      const rejectedOnCore = await coreClient.callTool({
+        name: "mcp__slack__slack_read_channel",
+        arguments: { channel: "C123" },
+      });
+      assert.equal(rejectedOnCore.isError, true);
+
+      // (3) /mcp/ns/slack lists ONLY slack_read_channel and routes tools/call to Pi's mcp__slack__slack_read_channel.
+      slackClient = new Client({ name: "slack-client", version: "1.0.0" });
+      await slackClient.connect(
+        new StreamableHTTPClientTransport(new URL(slackSrv.url), {
+          requestInit: { headers: authHeaders },
+        }),
+      );
+      assert.equal(slackClient.getServerVersion()?.name, "pi-bridge-slack");
+      assert.equal(slackClient.getInstructions(), PI_BRIDGE_INSTRUCTIONS);
+      const slackToolsList = await slackClient.listTools();
+      assert.deepEqual(
+        slackToolsList.tools.map((t) => t.name),
+        ["slack_read_channel"],
+      );
+      assert.equal(slackToolsList.tools[0].description, "Live Slack channel reader");
+
+      const rejectedOnSlack = await slackClient.callTool({
+        name: "unknown_slack_tool",
+        arguments: {},
+      });
+      assert.equal(rejectedOnSlack.isError, true);
+
+      const callPromise = slackClient.callTool({
+        name: "slack_read_channel",
+        arguments: { channel: "C123" },
+      });
+
+      const parkedMsg = await stream1.result();
+      assert.equal(parkedMsg.stopReason, "toolUse");
+      const toolCall = parkedMsg.content.find((c) => c.type === "toolCall");
+      assert.equal(toolCall?.name, "mcp__slack__slack_read_channel");
+      assert.deepEqual(toolCall?.arguments, { channel: "C123" });
+
+      const streamCont = providerSpec.streamSimple(
+        model,
+        {
+          messages: [
+            userMsg,
+            parkedMsg,
+            {
+              role: "toolResult",
+              toolCallId: toolCall.id,
+              toolName: "mcp__slack__slack_read_channel",
+              content: [{ type: "text", text: "deploy succeeded in #general" }],
+              isError: false,
+              timestamp: 2,
+            },
+          ],
+        },
+        { cwd: h.tmpDir, sessionId: "mcp-ns-sess" },
+      );
+
+      const slackResult = await callPromise;
+      assert.equal(slackResult.isError, false);
+      assert.equal(slackResult.content[0].text, "deploy succeeded in #general");
+
+      // (4) onNativeEvent suppresses pi-bridge-slack (both eager and lazy call_mcp_tool), while keeping native tools.
+      const sessId = promptFrame.params.sessionId;
+      h.sendUpdate(sessId, {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc-slack-eager",
+        name: "mcp_pi-bridge-slack_slack_read_channel",
+        rawInput: { arguments: { channel: "C123" } },
+      });
+      h.sendUpdate(sessId, {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tc-slack-eager",
+        status: "completed",
+        name: "mcp_pi-bridge-slack_slack_read_channel",
+        rawOutput: "suppressed",
+      });
+      h.sendUpdate(sessId, {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc-slack-lazy",
+        name: "call_mcp_tool",
+        rawInput: { ServerName: "pi-bridge-slack", ToolName: "slack_read_channel" },
+      });
+      h.sendUpdate(sessId, {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tc-slack-lazy",
+        status: "completed",
+        name: "call_mcp_tool",
+        rawInput: { ServerName: "pi-bridge-slack", ToolName: "slack_read_channel" },
+        rawOutput: "suppressed lazy",
+      });
+      h.sendUpdate(sessId, {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc-native-read",
+        name: "read_file",
+        rawInput: { Path: "README.md" },
+      });
+      h.sendUpdate(sessId, {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tc-native-read",
+        status: "completed",
+        name: "read_file",
+        rawOutput: "file contents",
+      });
+
+      h.replyPrompt(promptFrame, "end_turn");
+      const finalMsg = await streamCont.result();
+      assert.equal(finalMsg.stopReason, "stop");
+
+      const nativeEntries = appendedEntries.filter((e) => e.customType === "agy-native-event");
+      assert.equal(nativeEntries.length, 1);
+      assert.equal(nativeEntries[0].data.name, "read_file");
+      assert.equal(
+        statusUpdates.some((s) => s.key === "agy-native" && (s.text ?? "").includes("slack")),
+        false,
+      );
+    } finally {
+      try {
+        await coreClient?.close();
+      } catch {}
+      try {
+        await slackClient?.close();
+      } catch {}
+      for (const fn of handlers.get("session_shutdown") ?? []) {
+        await fn({ type: "session_shutdown" }, sessionCtx);
+      }
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+      if (prevAgyBin === undefined) delete process.env.AGY_BIN;
+      else process.env.AGY_BIN = prevAgyBin;
+      if (prevFakePort === undefined) delete process.env.FAKE_ACP_PORT;
+      else process.env.FAKE_ACP_PORT = prevFakePort;
+      await h.close();
+    }
+    await new Promise((r) => setTimeout(r, 25));
+    assert.equal(fs.existsSync(h.tmpDir), false);
+  },
+);

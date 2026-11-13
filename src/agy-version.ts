@@ -1,20 +1,14 @@
 // agy CLI version gate.
 //
-// An agy older than MIN_AGY_VERSION fails stream-json turns with raw stream
-// errors that look like bridge bugs, so we detect it once per process and
-// say so plainly (session-start warning + /agy doctor) instead of letting
-// users debug parse noise. Pure functions here; the only subprocess is
+// An agy older than MIN_AGY_ACP_VERSION lacks a compatible `agy acp` subcommand,
+// so we detect it once per process and surface a plain warning (session-start
+// check + /agy doctor). Pure functions here; the only subprocess is
 // `agy --version`, memoized per binary because discovery already spawns agy
 // once per load and the version will not change mid-process.
-//
-// The ACP server reports the CLI version at initialize. agy acp has its own
-// floor because older CLI releases do not ship the subcommand.
 
 import { spawn } from "node:child_process";
 
-/** Floor for the stream-json CLI. Matches the protocol grammar our driver
- *  and the event mapping rely on; older agy predates verified fields. */
-export const MIN_AGY_VERSION = "1.1.22";
+/** Minimum agy CLI release supporting the verified ACP transport. */
 export const MIN_AGY_ACP_VERSION = "1.5.3";
 
 const VERSION_TIMEOUT_MS = 5_000;
@@ -56,7 +50,7 @@ export function compareVersionTuples(a: string, b: string): number {
  *  every status; checkAgyCliVersion wraps this with the subprocess. */
 export function agyVersionVerdict(
 	raw: string,
-	floor: string = MIN_AGY_VERSION,
+	floor: string = MIN_AGY_ACP_VERSION,
 ): AgyVersionCheck {
 	// Development builds (agy from source) self-identify as dev, HEAD, or the
 	// spelled-out word; never gate any of them.

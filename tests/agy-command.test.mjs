@@ -6,8 +6,11 @@ import test from "node:test";
 import { importBridgeModule, jiti } from "./helpers/pi-loader.mjs";
 
 const { CombinedAutocompleteProvider } = await jiti.import("@earendil-works/pi-tui");
+const { AcpDriver } = await importBridgeModule("src/acp/driver.ts");
+const { saveConfig } = await importBridgeModule("src/config.ts");
 const { SessionStore } = await importBridgeModule("src/sessions.ts");
 const { SubagentRoster } = await importBridgeModule("src/subagent-roster.ts");
+const { showTasksBrowser, taskItems } = await importBridgeModule("src/tasks-ui.ts");
 const extMod = await importBridgeModule("extensions/index.ts");
 const registerExtension = extMod.default;
 const { registerAgyCommand } = extMod;
@@ -86,22 +89,23 @@ test("/agy clear removes only the current session binding while /agy clear all w
   try {
     const storePath = path.join(tmpDir, "antigravity-bridge", "sessions.json");
     const store = new SessionStore(storePath);
-    store.set("sid:session-a@acp", { conversationId: "conv-a", lastStepIdx: 1, lastMessageCount: 2 });
-    store.set("sid:session-b@acp", { conversationId: "conv-b", lastStepIdx: 3, lastMessageCount: 4 });
+    store.set("sid:session-a@acp", { conversationId: "conv-a", lastMessageCount: 2 });
+    store.set("sid:session-b@acp", { conversationId: "conv-b", lastMessageCount: 4 });
     store.set("cwd:/workspace/proj-c@acp", {
       conversationId: "conv-c",
-      lastStepIdx: 0,
       lastMessageCount: 1,
     });
     await waitForDiskFlush();
 
     const agyCmd = createMockSetup({ store });
 
-    // Status output advertises /agy clear [all].
+    // Status output advertises /agy clear [all], /agy mode accept-edits, and bound conversation.
     const statusRun = makeCmdCtx({ sessionId: "session-a", mode: "rpc" });
     await agyCmd.handler("", statusRun.cmdCtx);
     assert.equal(statusRun.notifications.length, 1);
     assert.match(statusRun.notifications[0].message, /\/agy clear \[all\]/);
+    assert.match(statusRun.notifications[0].message, /\/agy mode accept-edits(?!\|plan)/);
+    assert.match(statusRun.notifications[0].message, /bound conversation:\s+conv-a/);
 
     // Clearing session-a leaves session-b and cwd fallback intact.
     const clearA = makeCmdCtx({ sessionId: "session-a" });
@@ -151,7 +155,7 @@ test("/agy clear removes only the current session binding while /agy clear all w
     assert.match(clearAll.notifications[0]?.message ?? "", /Cleared all antigravity session bindings/i);
 
     // /agy clear --all alias also wipes all bindings.
-    store.set("sid:session-d@acp", { conversationId: "conv-d", lastStepIdx: 0, lastMessageCount: 1 });
+    store.set("sid:session-d@acp", { conversationId: "conv-d", lastMessageCount: 1 });
     await waitForDiskFlush();
     const clearDashAll = makeCmdCtx({ sessionId: "session-z" });
     await agyCmd.handler("clear --all", clearDashAll.cmdCtx);
@@ -186,7 +190,6 @@ test("/agy tasks and /agy artifacts resolve conversationId from SessionStore on 
     const store = new SessionStore(path.join(agentDir, "antigravity-bridge", "sessions.json"));
     store.set("sid:resumed-sess@acp", {
       conversationId: "conv-resumed",
-      lastStepIdx: 2,
       lastMessageCount: 4,
     });
     await waitForDiskFlush();
@@ -355,5 +358,470 @@ test("/agy getArgumentCompletions completes subcommands, arguments, and pi.getAl
     if (prevAgyBin === undefined) delete process.env.AGY_BIN;
     else process.env.AGY_BIN = prevAgyBin;
     fs.rmSync(tmpAgentDir, { recursive: true, force: true });
+  }
+});
+
+test("/agy getArgumentCompletions completes task IDs and artifact names from bound conversation", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ant-bridge-agy-dyncomp-"));
+  const fakeHome = path.join(tmpDir, "home");
+  const agentDir = path.join(tmpDir, "agent");
+  const prevHome = process.env.HOME;
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const prevAgyBin = process.env.AGY_BIN;
+  process.env.HOME = fakeHome;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  process.env.AGY_BIN = path.join(tmpDir, "missing-agy");
+
+  try {
+    saveConfig({ bridgeTools: "none" });
+    const convDir = path.join(fakeHome, ".gemini", "antigravity-cli", "brain", "conv-comp");
+    const tasksDir = path.join(convDir, ".system_generated", "tasks");
+    const mediaDir = path.join(convDir, ".tempmediaStorage");
+    fs.mkdirSync(tasksDir, { recursive: true });
+    fs.mkdirSync(mediaDir, { recursive: true });
+    fs.writeFileSync(path.join(tasksDir, "task-17.log"), "seventeen\n", "utf8");
+    fs.writeFileSync(path.join(tasksDir, "task-3.log"), "three\n", "utf8");
+    fs.writeFileSync(path.join(tasksDir, "notes.txt"), "ignored\n", "utf8");
+    fs.writeFileSync(path.join(convDir, "summary.md"), "# Summary\n", "utf8");
+    fs.writeFileSync(path.join(convDir, "summary.md.metadata.json"), "{}\n", "utf8");
+    fs.writeFileSync(path.join(convDir, ".hidden.md"), "hidden\n", "utf8");
+    fs.writeFileSync(path.join(mediaDir, "chart.png"), "png", "utf8");
+
+    const storePath = path.join(agentDir, "antigravity-bridge", "sessions.json");
+    const seededStore = new SessionStore(storePath);
+    seededStore.set("sid:sess-comp@acp", { conversationId: "conv-comp", lastMessageCount: 2 });
+    await waitForDiskFlush();
+
+    const commands = new Map();
+    const handlers = new Map();
+    const mockPi = {
+      registerProvider() {},
+      registerCommand(name, spec) {
+        commands.set(name, spec);
+      },
+      registerTool() {},
+      registerEntryRenderer() {},
+      registerMessageRenderer() {},
+      on(event, fn) {
+        const list = handlers.get(event) ?? [];
+        list.push(fn);
+        handlers.set(event, list);
+      },
+      getAllTools() {
+        return [];
+      },
+      getActiveTools() {
+        return [];
+      },
+      appendEntry() {},
+      sendMessage() {},
+      events: { emit() {}, on() {} },
+    };
+
+    await registerExtension(mockPi);
+    const agyCmd = commands.get("agy");
+    const valuesOf = (prefix) =>
+      agyCmd.getArgumentCompletions(prefix)?.map((item) => item.value) ?? null;
+
+    // Before session_start, no active session is bound.
+    assert.equal(valuesOf("tasks tail "), null);
+    assert.equal(valuesOf("artifacts open "), null);
+
+    const sessionCtx = {
+      hasUI: false,
+      mode: "rpc",
+      cwd: tmpDir,
+      ui: { notify() {}, setStatus() {} },
+      isProjectTrusted: () => true,
+      sessionManager: {
+        getSessionId: () => "sess-comp",
+        getCwd: () => tmpDir,
+        getEntries: () => [],
+        getBranch: () => [],
+      },
+    };
+    for (const fn of handlers.get("session_start") ?? []) {
+      await fn({ type: "session_start", reason: "startup" }, sessionCtx);
+    }
+
+    assert.deepEqual(valuesOf("tasks tail "), ["tasks tail 3", "tasks tail 17"]);
+    assert.deepEqual(valuesOf("tasks tail 1"), ["tasks tail 17"]);
+    assert.equal(valuesOf("tasks tail 99"), null);
+
+    assert.deepEqual(valuesOf("artifacts open "), [
+      "artifacts open chart.png",
+      "artifacts open summary.md",
+    ]);
+    assert.deepEqual(valuesOf("artifacts open sum"), ["artifacts open summary.md"]);
+    assert.equal(valuesOf("artifacts open summary.md "), null);
+
+    // After session_shutdown, active session state is cleared cleanly.
+    for (const fn of handlers.get("session_shutdown") ?? []) {
+      await fn({ type: "session_shutdown" }, sessionCtx);
+    }
+    assert.equal(valuesOf("tasks tail "), null);
+    assert.equal(valuesOf("artifacts open "), null);
+  } finally {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    if (prevAgyBin === undefined) delete process.env.AGY_BIN;
+    else process.env.AGY_BIN = prevAgyBin;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("tasks browser uses plain ASCII, Enter resolves tail, and /agy tasks formats 40-line tail", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ant-bridge-tasks-tail-"));
+  const fakeHome = path.join(tmpDir, "home");
+  const agentDir = path.join(tmpDir, "agent");
+  const prevHome = process.env.HOME;
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.HOME = fakeHome;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+
+  try {
+    const sampleTasks = [
+      {
+        id: 42,
+        logPath: "/tmp/task-42.log",
+        bytes: 2048,
+        modifiedMs: new Date("2026-11-12T10:05:00Z").getTime(),
+        active: true,
+        livenessKnown: true,
+      },
+    ];
+    const items = taskItems(sampleTasks);
+    assert.equal(items.length, 1);
+    assert.equal(/^[\x00-\x7F]*$/.test(items[0].label), true);
+    assert.equal(/^[\x00-\x7F]*$/.test(items[0].description ?? ""), true);
+    assert.match(items[0].label, /#42 - ACTIVE/);
+
+    let renderedLines = [];
+    const selectedAction = await showTasksBrowser(
+      {
+        async custom(factory) {
+          return new Promise((resolve) => {
+            const theme = {
+              fg: (_c, s) => s,
+              bold: (s) => s,
+            };
+            const comp = factory({ requestRender() {} }, theme, {}, resolve);
+            renderedLines = comp.render(72);
+            comp.handleInput("\r");
+          });
+        },
+      },
+      sampleTasks,
+      true,
+    );
+    assert.equal(selectedAction.type, "tail");
+    assert.equal(selectedAction.task.id, 42);
+    const footerLine = renderedLines.find((l) => l.includes("enter tail")) ?? "";
+    assert.notEqual(footerLine, "");
+    assert.equal(/^[\x00-\x7F]*$/.test(footerLine), true);
+
+    const convDir = path.join(fakeHome, ".gemini", "antigravity-cli", "brain", "conv-tail-ui");
+    const tasksDir = path.join(convDir, ".system_generated", "tasks");
+    fs.mkdirSync(tasksDir, { recursive: true });
+    const fiftyLines = Array.from({ length: 50 }, (_, i) => `line-${i + 1}`).join("\n");
+    fs.writeFileSync(path.join(tasksDir, "task-9.log"), fiftyLines, "utf8");
+
+    const store = new SessionStore(path.join(agentDir, "antigravity-bridge", "sessions.json"));
+    store.set("sid:tail-ui-sess@acp", { conversationId: "conv-tail-ui", lastMessageCount: 1 });
+    await waitForDiskFlush();
+
+    const agyCmd = createMockSetup({ store });
+    const notifications = [];
+    const ui = {
+      notify(message, type) {
+        notifications.push({ message, type });
+      },
+      setStatus() {},
+      async custom(factory) {
+        return new Promise((resolve) => {
+          const theme = { fg: (_c, s) => s, bold: (s) => s };
+          const comp = factory({ requestRender() {} }, theme, {}, resolve);
+          comp.handleInput("\r");
+        });
+      },
+    };
+    const { cmdCtx } = makeCmdCtx({ sessionId: "tail-ui-sess", ui });
+    await agyCmd.handler("tasks", cmdCtx);
+
+    assert.equal(notifications.length, 1);
+    const msg = notifications[0].message;
+    assert.match(msg, /^task #9 tail:\n\.\.\.\nline-11\n/);
+    assert.match(msg, /\nline-50$/);
+    assert.equal(msg.includes("\nline-10\n"), false);
+  } finally {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("/agy doctor reports bound conversation and concise driver stats, and /agy bridge starts MCP live", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ant-bridge-dyn-mcp-"));
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const prevAgyBin = process.env.AGY_BIN;
+  process.env.PI_CODING_AGENT_DIR = tmpDir;
+  process.env.AGY_BIN = path.join(tmpDir, "missing-agy");
+
+  try {
+    saveConfig({ bridgeTools: "none" });
+    const storePath = path.join(tmpDir, "antigravity-bridge", "sessions.json");
+    const seeded = new SessionStore(storePath);
+    seeded.set("sid:doc-sess@acp", { conversationId: "conv-doctor-123", lastMessageCount: 1 });
+    await waitForDiskFlush();
+
+    const commands = new Map();
+    const handlers = new Map();
+    const mockPi = {
+      registerProvider() {},
+      registerCommand(name, spec) {
+        commands.set(name, spec);
+      },
+      registerTool() {},
+      registerEntryRenderer() {},
+      registerMessageRenderer() {},
+      on(event, fn) {
+        const list = handlers.get(event) ?? [];
+        list.push(fn);
+        handlers.set(event, list);
+      },
+      getAllTools() {
+        return [];
+      },
+      getActiveTools() {
+        return [];
+      },
+      appendEntry() {},
+      sendMessage() {},
+      events: { emit() {}, on() {} },
+    };
+
+    await registerExtension(mockPi);
+    const agyCmd = commands.get("agy");
+
+    const sessionCtx = {
+      hasUI: false,
+      mode: "rpc",
+      cwd: tmpDir,
+      ui: { notify() {}, setStatus() {} },
+      isProjectTrusted: () => false,
+      sessionManager: {
+        getSessionId: () => "doc-sess",
+        getCwd: () => tmpDir,
+        getEntries: () => [],
+        getBranch: () => [],
+      },
+    };
+    for (const fn of handlers.get("session_start") ?? []) {
+      await fn({ type: "session_start", reason: "startup" }, sessionCtx);
+    }
+
+    // Initially bridgeTools is "none": MCP server was not started on session_start.
+    const docBefore = makeCmdCtx({ sessionId: "doc-sess" });
+    await agyCmd.handler("doctor", docBefore.cmdCtx);
+    const beforeMsg = docBefore.notifications[0]?.message ?? "";
+    assert.match(beforeMsg, /bridge:\s+none \(not running\)/);
+    assert.match(beforeMsg, /bound conversation:\s+conv-doctor-123/);
+    assert.match(beforeMsg, /driver stats:\s+spawns=0 turns=0 recycles=0\n/);
+    assert.equal(beforeMsg.includes("reused="), false);
+    assert.equal(beforeMsg.includes("last:"), false);
+
+    // Switching to /agy bridge all starts the MCP server dynamically without /reload.
+    const bridgeSwitch = makeCmdCtx({ sessionId: "doc-sess" });
+    await agyCmd.handler("bridge all", bridgeSwitch.cmdCtx);
+    assert.equal(bridgeSwitch.notifications.length, 1);
+    assert.equal(bridgeSwitch.notifications[0].message.includes("/reload"), false);
+    assert.match(bridgeSwitch.notifications[0].message, /bridge set to all\./);
+
+    const docAfter = makeCmdCtx({ sessionId: "doc-sess" });
+    await agyCmd.handler("doctor", docAfter.cmdCtx);
+    assert.match(docAfter.notifications[0]?.message ?? "", /bridge:\s+all \(port \d+\)/);
+
+    for (const fn of handlers.get("session_shutdown") ?? []) {
+      await fn({ type: "session_shutdown" }, sessionCtx);
+    }
+
+    // Also verify the /agy interactive picker starts MCP dynamically when switching none -> mcp.
+    saveConfig({ bridgeTools: "none" });
+    for (const fn of handlers.get("session_start") ?? []) {
+      await fn({ type: "session_start", reason: "startup" }, sessionCtx);
+    }
+    const pickerNotifications = [];
+    const pickerUi = {
+      notify(message, type) {
+        pickerNotifications.push({ message, type });
+      },
+      setStatus() {},
+      async custom(factory) {
+        return new Promise((resolve) => {
+          const theme = { fg: (_c, s) => s, bold: (s) => s };
+          const comp = factory({ requestRender() {} }, theme, {}, resolve);
+          // Navigate to "Bridge tools" (4th item: down x3), cycle none -> all -> mcp via Enter, Esc to save.
+          comp.handleInput("\x1b[B");
+          comp.handleInput("\x1b[B");
+          comp.handleInput("\x1b[B");
+          comp.handleInput("\r");
+          comp.handleInput("\r");
+          comp.handleInput("\x1b");
+        });
+      },
+    };
+    const pickerCtx = makeCmdCtx({ sessionId: "doc-sess", mode: "tui", ui: pickerUi });
+    await agyCmd.handler("", pickerCtx.cmdCtx);
+    assert.match(pickerNotifications[0]?.message ?? "", /bridge=mcp/);
+
+    const docAfterPicker = makeCmdCtx({ sessionId: "doc-sess" });
+    await agyCmd.handler("doctor", docAfterPicker.cmdCtx);
+    assert.match(docAfterPicker.notifications[0]?.message ?? "", /bridge:\s+mcp \(port \d+\)/);
+
+    const prevFlush = SessionStore.prototype.flush;
+    let flushAwaited = false;
+    SessionStore.prototype.flush = async () => {
+      await new Promise((r) => setTimeout(r, 15));
+      flushAwaited = true;
+    };
+    try {
+      for (const fn of handlers.get("session_shutdown") ?? []) {
+        await fn({ type: "session_shutdown" }, sessionCtx);
+      }
+      assert.equal(flushAwaited, true);
+    } finally {
+      if (prevFlush === undefined) delete SessionStore.prototype.flush;
+      else SessionStore.prototype.flush = prevFlush;
+    }
+  } finally {
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    if (prevAgyBin === undefined) delete process.env.AGY_BIN;
+    else process.env.AGY_BIN = prevAgyBin;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("message_update suppresses 0 in / 0 out and renders exact vs estimated ACP token counts", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ant-bridge-usage-footer-"));
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const prevAgyBin = process.env.AGY_BIN;
+  process.env.PI_CODING_AGENT_DIR = tmpDir;
+  process.env.AGY_BIN = path.join(tmpDir, "missing-agy");
+
+  try {
+    saveConfig({ bridgeTools: "none", acp: { usageEstimate: "estimate" } });
+
+    const handlers = new Map();
+    const mockPi = {
+      registerProvider() {},
+      registerCommand() {},
+      registerTool() {},
+      registerEntryRenderer() {},
+      registerMessageRenderer() {},
+      on(event, fn) {
+        const list = handlers.get(event) ?? [];
+        list.push(fn);
+        handlers.set(event, list);
+      },
+      getAllTools() {
+        return [];
+      },
+      getActiveTools() {
+        return [];
+      },
+      appendEntry() {},
+      sendMessage() {},
+      events: { emit() {}, on() {} },
+    };
+
+    await registerExtension(mockPi);
+    const onMessageUpdate = handlers.get("message_update")?.[0];
+    assert.equal(typeof onMessageUpdate, "function");
+
+    const statuses = [];
+    const uiCtx = {
+      hasUI: true,
+      ui: {
+        theme: { fg: (_color, text) => text },
+        setStatus(key, text) {
+          statuses.push({ key, text });
+        },
+      },
+    };
+
+    // 1. All-zero streaming frame must NOT render "ACP ~ 0 in / 0 out".
+    onMessageUpdate(
+      {
+        message: {
+          role: "assistant",
+          provider: "antigravity",
+          usage: { input: 0, output: 0, cacheRead: 0 },
+        },
+      },
+      uiCtx,
+    );
+    assert.deepEqual(statuses, []);
+
+    // 2. Non-zero client-side estimate renders with "~".
+    onMessageUpdate(
+      {
+        message: {
+          role: "assistant",
+          provider: "antigravity",
+          usage: { input: 120, output: 45, cacheRead: 0 },
+        },
+      },
+      uiCtx,
+    );
+    assert.deepEqual(statuses, [{ key: "agy-usage", text: "ACP ~ 120 in / 45 out" }]);
+
+    // 3. Exact usage with cacheRead > 0 omits "~" and renders "(+N cached)".
+    onMessageUpdate(
+      {
+        message: {
+          role: "assistant",
+          provider: "antigravity",
+          usage: { input: 120, output: 45, cacheRead: 80 },
+        },
+      },
+      uiCtx,
+    );
+    assert.equal(statuses.at(-1)?.text, "ACP 120 in (+80 cached) / 45 out");
+
+    // 4. Exact usage via snapshot().acp.exactUsageSeen with cacheRead === 0 omits "~" and "(+0 cached)".
+    const origSnapshot = AcpDriver.prototype.snapshot;
+    AcpDriver.prototype.snapshot = function () {
+      const snap = origSnapshot.call(this);
+      return {
+        ...snap,
+        acp: { ...(snap.acp ?? {}), usageSeen: true, exactUsageSeen: true },
+      };
+    };
+    try {
+      onMessageUpdate(
+        {
+          message: {
+            role: "assistant",
+            provider: "antigravity",
+            usage: { input: 95, output: 30, cacheRead: 0 },
+          },
+        },
+        uiCtx,
+      );
+      assert.equal(statuses.at(-1)?.text, "ACP 95 in / 30 out");
+    } finally {
+      AcpDriver.prototype.snapshot = origSnapshot;
+    }
+  } finally {
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    if (prevAgyBin === undefined) delete process.env.AGY_BIN;
+    else process.env.AGY_BIN = prevAgyBin;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });

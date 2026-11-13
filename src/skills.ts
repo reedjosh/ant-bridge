@@ -21,18 +21,132 @@ export interface SkillLite {
 	dir: string;
 }
 
-/** Parse `name:` / `description:` out of SKILL.md frontmatter. Deliberately
- *  line-based, not YAML: multi-line block scalars (`description: >-`) keep
- *  only their first line. */
-function parseFrontmatter(raw: string): { name?: string; description?: string } {
-	const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+export interface SkillCommandLike {
+	name?: string;
+	description?: string;
+	source?: string;
+	sourceInfo?: {
+		path?: string;
+		baseDir?: string;
+	};
+}
+
+/** Build the skill catalog from Pi's live `pi.getCommands()` entries, falling
+ *  back to `fallback()` when no valid skill commands are present. */
+export function skillsFromCommands(
+	commands: readonly SkillCommandLike[],
+	fallback?: () => SkillLite[],
+): SkillLite[] {
+	const seen = new Set<string>();
+	const out: SkillLite[] = [];
+	for (const c of commands ?? []) {
+		if (!c || c.source !== "skill") continue;
+		const filePath = typeof c.sourceInfo?.path === "string" ? c.sourceInfo.path : "";
+		if (!filePath.trim()) continue;
+		const rawName = typeof c.name === "string" ? c.name : "";
+		const name = (rawName.startsWith("skill:") ? rawName.slice("skill:".length) : rawName).trim();
+		if (!name || seen.has(name)) continue;
+		const normalizedDesc =
+			typeof c.description === "string" ? c.description.replace(/\s+/g, " ").trim() : "";
+		if (!normalizedDesc) continue;
+		const baseDir = typeof c.sourceInfo?.baseDir === "string" ? c.sourceInfo.baseDir.trim() : "";
+		seen.add(name);
+		out.push({
+			name,
+			description: normalizedDesc.slice(0, 160),
+			filePath,
+			dir: baseDir || path.dirname(filePath),
+		});
+	}
+	return out.length > 0 ? out : (fallback?.() ?? []);
+}
+
+function stripYamlQuotes(value: string): string {
+	if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+		return value.slice(1, -1).replace(/\\(["\\nrt])/g, (_m, ch: string) => {
+			if (ch === "n") return "\n";
+			if (ch === "r") return "\r";
+			if (ch === "t") return "\t";
+			return ch;
+		});
+	}
+	if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+		return value.slice(1, -1).replace(/''/g, "'");
+	}
+	return value;
+}
+
+/** Parse `name:` / `description:` out of SKILL.md YAML frontmatter, including
+ *  block scalars (`>`, `>-`, `|`, `|-`) and quoted strings. */
+export function parseFrontmatter(raw: string): { name?: string; description?: string } {
+	const cleaned = raw.replace(/^\uFEFF/, "");
+	const m = cleaned.match(/^---\r?\n([\s\S]*?)\r?\n---/);
 	if (!m) return {};
 	const out: { name?: string; description?: string } = {};
-	for (const line of m[1].split(/\r?\n/)) {
-		const name = line.match(/^name:\s*(.+)$/);
-		if (name && !out.name) out.name = name[1].trim();
-		const desc = line.match(/^description:\s*(.+)$/);
-		if (desc && !out.description) out.description = desc[1].trim();
+	const lines = m[1].split(/\r?\n/);
+	for (let i = 0; i < lines.length; i++) {
+		const kv = lines[i].match(/^(name|description):[ \t]*(.*)$/);
+		if (!kv) continue;
+		const key = kv[1] as "name" | "description";
+		if (out[key]) continue;
+		const rest = kv[2].trim();
+
+		const cont: string[] = [];
+		let j = i + 1;
+		while (j < lines.length) {
+			const next = lines[j];
+			if (next.trim() === "" || /^[ \t]+/.test(next)) {
+				cont.push(next);
+				j++;
+			} else {
+				break;
+			}
+		}
+		while (cont.length > 0 && cont[0].trim() === "") cont.shift();
+		while (cont.length > 0 && cont[cont.length - 1].trim() === "") cont.pop();
+
+		const blockMatch = rest.match(/^([>|])([+-]?\d*)?(?:\s+#.*)?$/);
+		let value = "";
+		if (blockMatch) {
+			if (cont.length > 0) {
+				const style = blockMatch[1];
+				const nonEmpty = cont.filter((l) => l.trim().length > 0);
+				const minIndent = Math.min(
+					...nonEmpty.map((l) => l.match(/^[ \t]*/)?.[0].length ?? 0),
+				);
+				const dedented = cont.map((l) => (l.length >= minIndent ? l.slice(minIndent) : ""));
+				if (style === "|") {
+					value = dedented.join("\n");
+				} else {
+					const paragraphs: string[] = [];
+					let cur: string[] = [];
+					for (const dl of dedented) {
+						if (dl.trim() === "") {
+							if (cur.length > 0) {
+								paragraphs.push(cur.join(" "));
+								cur = [];
+							}
+						} else {
+							cur.push(dl.trim());
+						}
+					}
+					if (cur.length > 0) paragraphs.push(cur.join(" "));
+					value = paragraphs.join("\n");
+				}
+			}
+		} else if (rest === "") {
+			if (cont.length > 0) {
+				value = stripYamlQuotes(cont.map((l) => l.trim()).filter(Boolean).join(" ")).trim();
+			}
+		} else if (cont.length > 0) {
+			const joined = [rest, ...cont.map((l) => l.trim()).filter(Boolean)].join(" ");
+			value = stripYamlQuotes(joined).trim();
+		} else {
+			value = stripYamlQuotes(rest).trim();
+		}
+
+		if (value) out[key] = value;
+		i = j - 1;
 	}
 	return out;
 }

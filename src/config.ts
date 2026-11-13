@@ -198,6 +198,8 @@ export function loadConfig(filePath: string = configPath()): AgyConfig {
 	};
 }
 
+let tmpSeq = 0;
+
 function writeConfigJson(filePath: string, value: unknown): void {
 	let target = filePath;
 	try {
@@ -207,7 +209,7 @@ function writeConfigJson(filePath: string, value: unknown): void {
 	}
 	const dir = path.dirname(target);
 	fs.mkdirSync(dir, { recursive: true });
-	const tmp = `${target}.${process.pid}.tmp`;
+	const tmp = `${target}.${process.pid}.${++tmpSeq}.tmp`;
 	try {
 		fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
 		fs.renameSync(tmp, target);

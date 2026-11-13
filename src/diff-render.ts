@@ -59,45 +59,10 @@ export interface EditDiffOutcome {
 	text: string;
 }
 
-/** A parsed agy edit-tool invocation: a file path plus its full new content.
- *  Detected generically by key name so future agy edit-tool variants work
- *  without hardcoding tool names. */
-export interface ParsedEdit {
-	/** File path as agy wrote it (absolute or cwd-relative). */
-	file: string;
-	content: string;
-	description?: string;
-}
-
 /** True if the string looks like binary (contains a NUL byte). Mirrors git's
  *  own heuristic; avoids feeding binary into the line differ. */
 function isBinary(s: string): boolean {
 	return s.includes("\u0000");
-}
-
-/** Parse an agy tool-call inputJson into an edit if it carries both a
- *  file-path-like and a content-like string field. Returns null for non-edits
- *  (reads, greps, malformed JSON, missing fields). */
-export function parseEditToolInput(inputJson: string): ParsedEdit | null {
-	if (!inputJson) return null;
-	let obj: Record<string, unknown>;
-	try {
-		obj = JSON.parse(inputJson);
-	} catch {
-		return null;
-	}
-	if (!obj || typeof obj !== "object") return null;
-	let file = "";
-	let content = "";
-	let description: string | undefined;
-	for (const [k, v] of Object.entries(obj)) {
-		if (typeof v !== "string") continue;
-		if (!file && /(^|_)?(file|path)$/i.test(k)) file = v;
-		else if (!content && /content|code/i.test(k)) content = v;
-		else if (!description && /description|toolaction|toolsummary/i.test(k)) description = v;
-	}
-	if (!file || !content) return null;
-	return { file, content, description };
 }
 
 /** Turn-scoped diff context. Holds the OLD-content cache (so the 2nd edit to
@@ -192,8 +157,8 @@ function capLines(diff: string, max: number): string {
 /** Format an in-memory before/after pair as a line-numbered diff with pi's
  *  own generateDiffString. No git subprocess: the ACP engine supplies
  *  oldText/newText directly in tool_call content[] (Gate C), so the provider
- *  renders the native diff without touching the repo. Exported for the
- *  provider; TurnDiffContext keeps the git-sourced path for stream-json. */
+ *  renders the native diff without touching the repo; TurnDiffContext covers
+ *  edit completions that omit inline diff blocks. */
 export function formatInlineDiff(
 	oldContent: string,
 	newContent: string,

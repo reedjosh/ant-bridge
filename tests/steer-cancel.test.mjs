@@ -319,7 +319,6 @@ test(
     const saved = store.get("sid:pi-1@acp");
     assert.deepEqual(saved, {
       conversationId: "sess-1",
-      lastStepIdx: -1,
       lastMessageCount: 1,
     });
 
@@ -352,7 +351,6 @@ test(
     assert.equal(outcomes[1].steered, undefined);
     assert.deepEqual(store.get("sid:pi-1@acp"), {
       conversationId: "sess-1",
-      lastStepIdx: -1,
       lastMessageCount: 3,
     });
   } finally {

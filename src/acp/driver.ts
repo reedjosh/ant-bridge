@@ -1178,10 +1178,7 @@ export class AcpDriver implements TurnDriver {
 			stats: {
 				spawns: this.#stats.spawns,
 				turns: this.#stats.turns,
-				reused: 0,
 				recycles: this.#stats.kills,
-				lastRecycleReason: undefined,
-				recycleReasons: {},
 			},
 			lifecycle: [...this.#lifecycle],
 			engine: "acp",
@@ -1198,6 +1195,7 @@ export class AcpDriver implements TurnDriver {
 				agentName: this.#agentInfo?.name,
 				agentTitle: this.#agentInfo?.title,
 				usageSeen: this.#conn?.usageSeen ?? false,
+				exactUsageSeen: this.#conn?.exactUsageSeen ?? false,
 			},
 		};
 	}

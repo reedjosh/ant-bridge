@@ -1,9 +1,12 @@
 // ant-bridge - focused ACP model provider and Pi MCP/skill bridge.
 
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
+	ExtensionContext,
 	ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import { getCurrentTools } from "@earendil-works/pi-ai";
@@ -82,6 +85,7 @@ import {
 	findSkillByName,
 	readSkillBody,
 	scanSkills,
+	skillsFromCommands,
 	type SkillLite,
 } from "../src/skills.js";
 import { formatSubagentRoster, SubagentRoster } from "../src/subagent-roster.js";
@@ -333,8 +337,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		) {
 			return;
 		}
-		const { input, output } = event.message.usage;
-		const status = ctx.ui.theme.fg("dim", `ACP ~ ${input} in / ${output} out`);
+		const { input = 0, output = 0, cacheRead = 0 } = event.message.usage ?? {};
+		if (input === 0 && output === 0 && cacheRead === 0) {
+			return;
+		}
+		const exact = Boolean(acpDriver.snapshot().acp?.exactUsageSeen || cacheRead > 0);
+		const label = exact
+			? `ACP ${input} in${cacheRead > 0 ? ` (+${cacheRead} cached)` : ""} / ${output} out`
+			: `ACP ~ ${input} in / ${output} out`;
+		const status = ctx.ui.theme.fg("dim", label);
 		if (status !== lastUsageStatus) {
 			lastUsageStatus = status;
 			ctx.ui.setStatus("agy-usage", status);
@@ -522,12 +533,187 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		}
 	}
 
+	let activeSessionCtx: ExtensionContext | null = null;
+	let activeSessionCwd: string | undefined;
+	let activeSessionKey: string | undefined;
+	let mcpStartPromise: Promise<number | null> | null = null;
+	let mcpEpoch = 0;
+
+	const syncSessionContext = (ctx: ExtensionContext): void => {
+		activeSessionCtx = ctx;
+		if (typeof ctx.isProjectTrusted === "function") {
+			activeSessionCwd = ctx.isProjectTrusted() ? ctx.cwd : undefined;
+		}
+		activeSessionKey = currentSessionKey(ctx);
+	};
+
+	const resolveSkills = (): SkillLite[] =>
+		skillsFromCommands(
+			typeof pi.getCommands === "function" ? pi.getCommands() : [],
+			() => scanSkills(activeSessionCwd),
+		);
+
+	const mcpLog = (s: string, d?: unknown) => {
+		const failures = new Set([
+			"http-error",
+			"call-tool-fail",
+			"transport-error",
+			"handleRequest-error",
+			"request-error",
+			"request-handler-error",
+			"unauthorized",
+		]);
+		const detail = (d as { msg?: string } | undefined)?.msg ?? "";
+		const routineAbort =
+			s === "call-tool-fail" &&
+			(detail.includes(FAIL_REASON_TURN_END) || detail.includes(FAIL_REASON_SHUTDOWN));
+		const level = !failures.has(s)
+			? s === "call-tool" || s === "call-tool-ok"
+				? "info"
+				: "debug"
+			: routineAbort
+				? "debug"
+				: s === "call-tool-fail"
+					? "error"
+					: "warn";
+		fileLog.log(s, d, level);
+		if (routineAbort || !failures.has(s)) return;
+		const msg = `[ant-bridge mcp] ${s}${d !== undefined ? " " + JSON.stringify(d) : ""}`;
+		if (activeSessionCtx?.hasUI) activeSessionCtx.ui.notify(msg, "warning");
+		else if (activeUi) activeUi.notify(msg, "warning");
+		else console.error(msg);
+	};
+
+	const listTools = () => {
+		const liveDescriptions = new Map<string, string>();
+		try {
+			const branch = activeSessionCtx?.sessionManager?.getBranch?.() ?? [];
+			const msgs = branch
+				.filter((e): e is typeof e & { type: "message" } => e.type === "message")
+				.map((e) => e.message);
+			for (const t of getCurrentTools(msgs)) {
+				if (t.description) liveDescriptions.set(t.name, t.description);
+			}
+		} catch {
+			// Fall back to static tool descriptions.
+		}
+		const tools = getBridgeTools().map((t) => {
+			let inputSchema: object = { type: "object", properties: {}, additionalProperties: true };
+			try {
+				if (t.parameters) inputSchema = JSON.parse(JSON.stringify(t.parameters)) as object;
+			} catch {
+				// Keep permissive fallback schema.
+			}
+			return {
+				name: t.name,
+				description: liveDescriptions.get(t.name) ?? t.description ?? t.name,
+				inputSchema,
+			};
+		});
+		if (loadConfig().bridgeTools !== "none") {
+			const skills = resolveSkills();
+			if (skills.length > 0) {
+				tools.push({
+					name: ACTIVATE_SKILL_TOOL_NAME,
+					description: `Activate a pi Agent Skill by name. Catalog:\n${catalogSummary(skills)}`,
+					inputSchema: activateSkillSchema(skills) as object,
+				});
+			}
+		}
+		tools.push({
+			name: POLL_TOOL_NAME,
+			description: [
+				"Fetch the result of a long-running bridge tool call that answered STILL RUNNING with a callId.",
+				"Poll again if it still reports running; the result or an error arrives here.",
+			].join(" "),
+			inputSchema: {
+				type: "object",
+				properties: {
+					callId: { type: "string", description: "callId from the STILL RUNNING answer" },
+				},
+				required: ["callId"],
+			},
+		});
+		return tools;
+	};
+
+	const bridgeOnToolCall = (
+		callId: string,
+		name: string,
+		args: Record<string, unknown>,
+		signal: AbortSignal,
+	) => {
+		if (name === POLL_TOOL_NAME) {
+			const wanted = typeof args.callId === "string" ? args.callId : "";
+			mcpLog("poll-tool", { callId: wanted });
+			const view = roundTrips.poll(wanted);
+			if (view && view.state !== "running") roundTrips.markDelivered(wanted);
+			return Promise.resolve(formatPollAnswer(wanted, view));
+		}
+		if (name !== ACTIVATE_SKILL_TOOL_NAME) {
+			if (!getBridgeTools().some((tool) => tool.name === name)) {
+				return Promise.resolve({
+					content: [
+						{
+							type: "text",
+							text: `Pi tool ${name} is not active or not exposed to Antigravity`,
+						},
+					],
+					isError: true,
+				});
+			}
+			return roundTrips.onToolCall(callId, name, args, signal).then((r) => {
+				if (!("escalated" in r)) return r;
+				mcpLog("call-tool-escalated", { name, callId: r.callId });
+				return formatEscalatedAck(r);
+			});
+		}
+		const wanted = typeof args.name === "string" ? args.name : "";
+		const skills = loadConfig().bridgeTools !== "none" ? resolveSkills() : [];
+		const skill = findSkillByName(skills, wanted);
+		const body = skill ? readSkillBody(skill) : `unknown skill: ${wanted || "(none given)"}`;
+		return Promise.resolve({
+			content: [
+				{
+					type: "text",
+					text: skill ? `${body}\n\n[skill resources dir: ${skill.dir}]` : `Error: ${body}`,
+				},
+			],
+			isError: !skill,
+		});
+	};
+
+	const ensureMcpServer = async (): Promise<number | null> => {
+		if (mcpHandle) return mcpHandle.port;
+		if (mcpStartPromise) return mcpStartPromise;
+		const startEpoch = mcpEpoch;
+		mcpStartPromise = (async () => {
+			const r = await startMcpServer({ listTools, onToolCall: bridgeOnToolCall }, { log: mcpLog });
+			if (r.ok && r.handle) {
+				if (startEpoch !== mcpEpoch) {
+					await r.handle.close();
+					return null;
+				}
+				mcpHandle = r.handle;
+				return r.handle.port;
+			}
+			console.error(`[ant-bridge] MCP tool bridge disabled: ${r.reason}`);
+			return null;
+		})().finally(() => {
+			mcpStartPromise = null;
+		});
+		return mcpStartPromise;
+	};
+
 	registerAgyCommand(pi, {
 		entries,
 		store,
 		usingFallback,
 		acpDriver,
 		getMcpPort: () => mcpHandle?.port ?? null,
+		ensureMcpServer,
+		getActiveSessionKey: () => activeSessionKey,
+		onSessionContext: syncSessionContext,
 		bridgeTools: getBridgeTools,
 		hiddenBridgeTools,
 		fileLog,
@@ -539,6 +725,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		logClosed = false;
 		backgroundWatchDisposed = false;
 		if (ctx.hasUI) activeUi = ctx.ui;
+		syncSessionContext(ctx);
 
 		try {
 			const records: Array<{ customType: string; data: unknown }> = [];
@@ -576,138 +763,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		sweepStaleAcpHomes();
 
 		const bridgeMode: BridgeTools = loadConfig().bridgeTools;
-		if (bridgeMode === "none" || mcpHandle) return;
-
-		const skills: SkillLite[] = scanSkills(ctx.isProjectTrusted() ? process.cwd() : undefined);
-		const mcpLog = (s: string, d?: unknown) => {
-			const failures = new Set([
-				"http-error",
-				"call-tool-fail",
-				"transport-error",
-				"handleRequest-error",
-				"request-error",
-				"request-handler-error",
-				"unauthorized",
-			]);
-			const detail = (d as { msg?: string } | undefined)?.msg ?? "";
-			const routineAbort =
-				s === "call-tool-fail" &&
-				(detail.includes(FAIL_REASON_TURN_END) || detail.includes(FAIL_REASON_SHUTDOWN));
-			const level = !failures.has(s)
-				? s === "call-tool" || s === "call-tool-ok"
-					? "info"
-					: "debug"
-				: routineAbort
-					? "debug"
-					: s === "call-tool-fail"
-						? "error"
-						: "warn";
-			fileLog.log(s, d, level);
-			if (routineAbort || !failures.has(s)) return;
-			const msg = `[ant-bridge mcp] ${s}${d !== undefined ? " " + JSON.stringify(d) : ""}`;
-			if (ctx.hasUI) ctx.ui.notify(msg, "warning");
-			else console.error(msg);
-		};
-
-		const listTools = () => {
-			const liveDescriptions = new Map<string, string>();
-			try {
-				const msgs = ctx.sessionManager
-					.getBranch()
-					.filter((e): e is typeof e & { type: "message" } => e.type === "message")
-					.map((e) => e.message);
-				for (const t of getCurrentTools(msgs)) {
-					if (t.description) liveDescriptions.set(t.name, t.description);
-				}
-			} catch {
-				// Fall back to static tool descriptions.
-			}
-			const tools = getBridgeTools().map((t) => {
-				let inputSchema: object = { type: "object", properties: {}, additionalProperties: true };
-				try {
-					if (t.parameters) inputSchema = JSON.parse(JSON.stringify(t.parameters)) as object;
-				} catch {
-					// Keep permissive fallback schema.
-				}
-				return {
-					name: t.name,
-					description: liveDescriptions.get(t.name) ?? t.description ?? t.name,
-					inputSchema,
-				};
-			});
-			if (skills.length > 0 && loadConfig().bridgeTools !== "none") {
-				tools.push({
-					name: ACTIVATE_SKILL_TOOL_NAME,
-					description: `Activate a pi Agent Skill by name. Catalog:\n${catalogSummary(skills)}`,
-					inputSchema: activateSkillSchema(skills) as object,
-				});
-			}
-			tools.push({
-				name: POLL_TOOL_NAME,
-				description:
-					"Fetch the result of a long-running bridge tool call that answered STILL RUNNING with a callId. Poll again if it still reports running; the result or an error arrives here.",
-				inputSchema: {
-					type: "object",
-					properties: {
-						callId: { type: "string", description: "callId from the STILL RUNNING answer" },
-					},
-					required: ["callId"],
-				},
-			});
-			return tools;
-		};
-
-		const bridgeOnToolCall = (
-			callId: string,
-			name: string,
-			args: Record<string, unknown>,
-			signal: AbortSignal,
-		) => {
-			if (name === POLL_TOOL_NAME) {
-				const wanted = typeof args.callId === "string" ? args.callId : "";
-				mcpLog("poll-tool", { callId: wanted });
-				const view = roundTrips.poll(wanted);
-				if (view && view.state !== "running") roundTrips.markDelivered(wanted);
-				return Promise.resolve(formatPollAnswer(wanted, view));
-			}
-			if (name !== ACTIVATE_SKILL_TOOL_NAME) {
-				if (!getBridgeTools().some((tool) => tool.name === name)) {
-					return Promise.resolve({
-						content: [
-							{
-								type: "text",
-								text: `Pi tool ${name} is not active or not exposed to Antigravity`,
-							},
-						],
-						isError: true,
-					});
-				}
-				return roundTrips.onToolCall(callId, name, args, signal).then((r) => {
-					if (!("escalated" in r)) return r;
-					mcpLog("call-tool-escalated", { name, callId: r.callId });
-					return formatEscalatedAck(r);
-				});
-			}
-			const wanted = typeof args.name === "string" ? args.name : "";
-			const skill =
-				loadConfig().bridgeTools !== "none" ? findSkillByName(skills, wanted) : undefined;
-			const body = skill ? readSkillBody(skill) : `unknown skill: ${wanted || "(none given)"}`;
-			return Promise.resolve({
-				content: [
-					{
-						type: "text",
-						text: skill ? `${body}\n\n[skill resources dir: ${skill.dir}]` : `Error: ${body}`,
-					},
-				],
-				isError: !skill,
-			});
-		};
-
-		const r = await startMcpServer({ listTools, onToolCall: bridgeOnToolCall }, { log: mcpLog });
-		if (r.ok && r.handle) {
-			mcpHandle = r.handle;
-		} else {
-			console.error(`[ant-bridge] MCP tool bridge disabled: ${r.reason}`);
+		if (bridgeMode !== "none") {
+			await ensureMcpServer();
 		}
 	});
 
@@ -720,12 +777,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		backgroundWatchers.clear();
 
 		activeUi = null;
+		activeSessionCtx = null;
+		activeSessionCwd = undefined;
+		activeSessionKey = undefined;
+		mcpEpoch++;
 		const h = mcpHandle;
 		mcpHandle = null;
 		await acpDriver.close("recycle", "session shutdown");
 		roundTrips.failAll(FAIL_REASON_SHUTDOWN);
 		await h?.close();
 		hiddenBridgeTools.clear();
+		await store.flush();
 		logClosed = true;
 		await fileLog.flush();
 	});
@@ -737,6 +799,9 @@ interface AgyCommandCtx {
 	usingFallback: boolean;
 	acpDriver: AcpDriver;
 	getMcpPort: () => number | null;
+	ensureMcpServer?: () => Promise<number | null>;
+	getActiveSessionKey?: () => string | undefined;
+	onSessionContext?: (ctx: ExtensionContext) => void;
 	bridgeTools: () => Array<{ name: string }>;
 	hiddenBridgeTools: Set<string>;
 	fileLog: DailyLogger;
@@ -765,13 +830,15 @@ function settingsRows(): string[] {
 	];
 }
 
-function statusText(ctx: AgyCommandCtx): string {
+function statusText(ctx: AgyCommandCtx, cmdCtx?: ExtensionCommandContext): string {
 	const source = ctx.usingFallback ? "fallback (agy models failed)" : "discovered";
+	const key = cmdCtx ? currentSessionKey(cmdCtx) : ctx.getActiveSessionKey?.();
+	const boundConversation = (key ? ctx.store.get(key)?.conversationId : undefined) ?? "(none)";
 	const subcommands = [
 		"/agy doctor",
 		"/agy auth",
 		"/agy auth-manual",
-		"/agy mode accept-edits|plan",
+		"/agy mode accept-edits",
 		"/agy readonly on|off",
 		"/agy permissions on|off",
 		"/agy permission-mode ask|allow|deny",
@@ -791,6 +858,7 @@ function statusText(ctx: AgyCommandCtx): string {
 		"Antigravity bridge (agy acp)",
 		`  models:              ${ctx.entries.length} ${source}`,
 		...settingsRows(),
+		`  bound conversation:  ${boundConversation}`,
 		`  sessions:            ${ctx.store.size} bound`,
 		`  config:              ${configPath()}`,
 		"",
@@ -798,7 +866,10 @@ function statusText(ctx: AgyCommandCtx): string {
 	].join("\n");
 }
 
-function currentSessionKey(cmdCtx: ExtensionCommandContext): string {
+function currentSessionKey(cmdCtx: {
+	cwd?: string;
+	sessionManager?: { getSessionId?: () => string; getCwd?: () => string };
+}): string {
 	const sessionId = cmdCtx.sessionManager?.getSessionId?.();
 	if (sessionId && sessionId.length > 0) return `sid:${sessionId}@acp`;
 	return `cwd:${cmdCtx.cwd ?? cmdCtx.sessionManager?.getCwd?.() ?? process.cwd()}@acp`;
@@ -858,9 +929,51 @@ const AGY_SUBCOMMAND_ARGS: Readonly<Record<string, readonly string[]>> = {
 	artifacts: ["open"],
 };
 
+function listConversationTaskIds(conversationDir: string): string[] {
+	try {
+		const entries = fs.readdirSync(path.join(conversationDir, ".system_generated", "tasks"), {
+			withFileTypes: true,
+		});
+		const ids = new Set<number>();
+		for (const entry of entries) {
+			if (!entry.isFile()) continue;
+			const match = /^task-(\d+)\.log$/.exec(entry.name);
+			if (!match) continue;
+			const id = Number(match[1]);
+			if (Number.isInteger(id) && id >= 0) ids.add(id);
+		}
+		return [...ids].sort((a, b) => a - b).map(String);
+	} catch {
+		return [];
+	}
+}
+
+function listConversationArtifactNames(conversationDir: string): string[] {
+	const roots = [
+		conversationDir,
+		path.join(conversationDir, ".tempmediaStorage"),
+		path.join(conversationDir, ".user_uploaded"),
+	];
+	const names = new Set<string>();
+	for (const dir of roots) {
+		try {
+			const entries = fs.readdirSync(dir, { withFileTypes: true });
+			for (const entry of entries) {
+				if (!entry.isFile()) continue;
+				if (entry.name.startsWith(".") || entry.name.endsWith(".metadata.json")) continue;
+				names.add(entry.name);
+			}
+		} catch {
+			continue;
+		}
+	}
+	return [...names].sort((a, b) => a.localeCompare(b));
+}
+
 function getAgyArgumentCompletions(
 	argumentPrefix: string,
 	getAllTools: () => ReadonlyArray<{ name: string; description?: string }>,
+	getActiveConversationDir?: () => string | undefined,
 ): AgyCompletionItem[] | null {
 	const trimmedStart = argumentPrefix.trimStart();
 	if (trimmedStart === "") {
@@ -924,18 +1037,74 @@ function getAgyArgumentCompletions(
 		}
 	}
 
+	if (sub === "tasks" && parts[1]?.toLowerCase() === "tail") {
+		if ((parts.length === 2 && hasTrailingSpace) || (parts.length === 3 && !hasTrailingSpace)) {
+			const dir = getActiveConversationDir?.();
+			if (!dir) return null;
+			const idPrefix = parts.length === 3 ? parts[2].toLowerCase() : "";
+			const matches = listConversationTaskIds(dir)
+				.filter((id) => id.startsWith(idPrefix))
+				.map((id) => ({
+					value: `tasks tail ${id}`,
+					label: id,
+				}));
+			return matches.length > 0 ? matches : null;
+		}
+	}
+
+	if (sub === "artifacts") {
+		const openMatch = /^artifacts\s+open\s+(.*)$/i.exec(trimmedStart);
+		if (openMatch) {
+			const dir = getActiveConversationDir?.();
+			if (!dir) return null;
+			const namePrefix = openMatch[1].toLowerCase();
+			const matches = listConversationArtifactNames(dir)
+				.filter((name) => name.toLowerCase().startsWith(namePrefix))
+				.map((name) => ({
+					value: `artifacts open ${name}`,
+					label: name,
+				}));
+			return matches.length > 0 ? matches : null;
+		}
+	}
+
 	return null;
 }
 
+async function notifyTaskTail(
+	ui: ExtensionUIContext | undefined,
+	task: { id: number; logPath: string },
+): Promise<void> {
+	const tail = await tailAgyTaskLog(task.logPath);
+	if (tail === "") {
+		ui?.notify(`task #${task.id} has no readable log.`, "warning");
+		return;
+	}
+	const lines = tail.split("\n");
+	const body = lines.length > 40 ? `...\n${lines.slice(-40).join("\n")}` : tail;
+	ui?.notify(`task #${task.id} tail:\n${body}`, "info");
+}
+
 export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
+	let lastCommandSessionKey: string | undefined;
+	const activeConversationDir = (): string | undefined => {
+		const key = ctx.getActiveSessionKey ? ctx.getActiveSessionKey() : lastCommandSessionKey;
+		const conversationId =
+			(key ? ctx.store.get(key)?.conversationId : undefined) ??
+			ctx.acpDriver.snapshot().conversationId ??
+			undefined;
+		return conversationId ? agyConversationDir(conversationId) : undefined;
+	};
 	pi.registerCommand("agy", {
 		description:
 			"Antigravity ACP provider: settings picker, doctor, session/task/artifact inspection. Usage: /agy [doctor|auth|auth-manual|mode|readonly|permissions|permission-mode|bridge|tools|usage|digest|system-prompt|timeout|quota|subagents|artifacts|tasks|clear]",
 		getArgumentCompletions: (argumentPrefix: string) =>
-			getAgyArgumentCompletions(argumentPrefix, () => pi.getAllTools()),
+			getAgyArgumentCompletions(argumentPrefix, () => pi.getAllTools(), activeConversationDir),
 		handler: async (args, cmdCtx: ExtensionCommandContext) => {
 			const ui = cmdCtx.ui;
 			if (ui) activeUi = ui;
+			lastCommandSessionKey = currentSessionKey(cmdCtx);
+			ctx.onSessionContext?.(cmdCtx);
 			const mode = cmdCtx.mode;
 			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
 			const sub = parts[0]?.toLowerCase();
@@ -1023,12 +1192,24 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 					rawCliCheck.status === "ok" || rawCliCheck.status === "unsupported"
 						? agyVersionVerdict(rawCliCheck.raw, MIN_AGY_ACP_VERSION)
 						: rawCliCheck;
+				const boundConversation =
+					ctx.store.get(currentSessionKey(cmdCtx))?.conversationId ?? "(none)";
+				const driverLine = [
+					snap.state,
+					snap.pid ? `pid=${snap.pid}` : "",
+					snap.conversationId ? `session=${snap.conversationId.slice(0, 8)}` : "",
+				]
+					.filter(Boolean)
+					.join(" ");
+				const s = snap.stats;
+				const statsLine = `spawns=${s.spawns} turns=${s.turns} recycles=${s.recycles}`;
 				const lines = [
 					"Antigravity doctor (no tokens spent)",
 					"  transport:           agy acp (isolated MCP home)",
 					`  bridge:              ${config.bridgeTools}${port ? ` (port ${port})` : " (not running)"}`,
-					`  driver:              ${snap.state}${snap.pid ? ` pid=${snap.pid}` : ""}${snap.conversationId ? ` session=${snap.conversationId.slice(0, 8)}` : ""}`,
-					`  driver stats:        spawns=${snap.stats.spawns} turns=${snap.stats.turns} reused=${snap.stats.reused} recycles=${snap.stats.recycles}${snap.stats.lastRecycleReason ? ` (last: ${snap.stats.lastRecycleReason})` : ""}`,
+					`  driver:              ${driverLine}`,
+					`  driver stats:        ${statsLine}`,
+					`  bound conversation:  ${boundConversation}`,
 					`  sessions:            ${ctx.store.size} bound`,
 					`  models:              ${ctx.entries.length} ${ctx.usingFallback ? "FALLBACK (agy models failed)" : "discovered"}`,
 					`  agy cli:             ${describeAgyVersionCheck(cliCheck)} (min ${MIN_AGY_ACP_VERSION})`,
@@ -1123,12 +1304,21 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 			if (sub === "bridge") {
 				if (val === "all" || val === "mcp" || val === "none") {
 					const next = saveConfig({ bridgeTools: val });
-					ui?.notify(
-						ctx.getMcpPort() === null
-							? `bridge set to ${next.bridgeTools}. Run /reload to start the bridge server.`
-							: `bridge set to ${next.bridgeTools}. Active catalog and call guard updated.`,
-						"info",
-					);
+					let port = ctx.getMcpPort();
+					if ((val === "all" || val === "mcp") && port === null && ctx.ensureMcpServer) {
+						port = await ctx.ensureMcpServer();
+					}
+					if ((val === "all" || val === "mcp") && port === null) {
+						ui?.notify(
+							`bridge set to ${next.bridgeTools}, but the MCP bridge server failed to start.`,
+							"warning",
+						);
+					} else {
+						ui?.notify(
+							`bridge set to ${next.bridgeTools}. Active catalog and call guard updated.`,
+							"info",
+						);
+					}
 				} else {
 					ui?.notify(
 						`bridge: ${loadConfig().bridgeTools}\nusage: /agy bridge all|mcp|none`,
@@ -1244,14 +1434,7 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 						ui?.notify(`no task #${id} in this conversation.`, "warning");
 						return;
 					}
-					const tail = await tailAgyTaskLog(task.logPath);
-					if (tail === "") {
-						ui?.notify(`task #${id} has no readable log.`, "warning");
-						return;
-					}
-					const lines = tail.split("\n");
-					const body = lines.length > 40 ? `...\n${lines.slice(-40).join("\n")}` : tail;
-					ui?.notify(`task #${id} tail:\n${body}`, "info");
+					await notifyTaskTail(ui, task);
 					return;
 				}
 				let tasks = await listAgyTasks(dir);
@@ -1273,8 +1456,12 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 						tasks = await listAgyTasks(dir);
 						if (tasks.length === 0) {
 							ui?.notify("no background tasks recorded for this conversation.", "info");
+							break;
 						}
 						continue;
+					}
+					if (action.type === "tail") {
+						await notifyTaskTail(ui, action.task);
 					}
 					break;
 				}
@@ -1361,21 +1548,21 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 			}
 
 			if (sub) {
-				ui?.notify(`unknown subcommand: ${sub}\n${statusText(ctx)}`, "warning");
+				ui?.notify(`unknown subcommand: ${sub}\n${statusText(ctx, cmdCtx)}`, "warning");
 				return;
 			}
 
 			if (mode !== "tui" || !ui) {
-				ui?.notify(statusText(ctx), "info");
+				ui?.notify(statusText(ctx, cmdCtx), "info");
 				return;
 			}
 
-			await openAgyPicker(ui);
+			await openAgyPicker(ui, ctx);
 		},
 	});
 }
 
-async function openAgyPicker(ui: ExtensionUIContext): Promise<void> {
+async function openAgyPicker(ui: ExtensionUIContext, ctx?: AgyCommandCtx): Promise<void> {
 	const config = loadConfig();
 	const pending: Partial<AgyConfig> = {};
 
@@ -1459,6 +1646,14 @@ async function openAgyPicker(ui: ExtensionUIContext): Promise<void> {
 
 	try {
 		const next = saveConfig(pending);
+		if (
+			(next.bridgeTools === "all" || next.bridgeTools === "mcp") &&
+			ctx &&
+			ctx.getMcpPort() === null &&
+			ctx.ensureMcpServer
+		) {
+			await ctx.ensureMcpServer();
+		}
 		const changed = [
 			pending.readOnly !== undefined ? `readOnly=${next.readOnly ? "on" : "off"}` : null,
 			pending.skipPermissions !== undefined

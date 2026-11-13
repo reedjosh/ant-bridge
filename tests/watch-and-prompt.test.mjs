@@ -262,7 +262,7 @@ function createRecordingDriver(newConversationId = "agy-conv-1") {
       return {
         state: "ready",
         conversationId: lastConversationId,
-        stats: { spawns: 1, turns: requests.length, reused: 0, recycles: 0, recycleReasons: {} },
+        stats: { spawns: 1, turns: requests.length, recycles: 0 },
         lifecycle: [],
       };
     },

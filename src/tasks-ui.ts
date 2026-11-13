@@ -1,9 +1,7 @@
 // /agy tasks overlay: SelectList over one conversation's background tasks.
 //
 // UI mirrors the artifacts browser (engine-picker pattern). Watch-only:
-// enter closes (the list IS the dashboard), r rescans, esc closes. Tails
-// live in the command form: /agy tasks tail <id> — a log tail is chat
-// content, not overlay content.
+// enter tails the selected task's log, r rescans, esc closes.
 
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
@@ -11,7 +9,7 @@ import { Container, type SelectItem, SelectList, Spacer, Text } from "@earendil-
 import { dialogBlocked } from "./ui-helpers.js";
 import type { AgyTask } from "./tasks.js";
 
-export type TasksBrowserAction = { type: "rescan" } | { type: "close" };
+export type TasksBrowserAction = { type: "tail"; task: AgyTask } | { type: "rescan" } | { type: "close" };
 
 export function taskItems(tasks: AgyTask[]): SelectItem[] {
 	return tasks.map((t) => {
@@ -20,8 +18,8 @@ export function taskItems(tasks: AgyTask[]): SelectItem[] {
 		const state = t.livenessKnown ? (t.active ? "ACTIVE" : "idle") : "liveness?";
 		return {
 			value: String(t.id),
-			label: `#${t.id} · ${state}`,
-			description: `${humanBytes(t.bytes)} · last write ${stamp}`,
+			label: `#${t.id} - ${state}`,
+			description: `${humanBytes(t.bytes)} - last write ${stamp}`,
 		};
 	});
 }
@@ -32,8 +30,8 @@ function humanBytes(n: number): string {
 	return `${(n / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-/** Render the overlay. Resolves rescan (caller re-lists and reopens) or
- *  close. */
+/** Render the overlay. Resolves tail (for the selected task), rescan (caller
+ *  re-lists and reopens), or close. */
 export async function showTasksBrowser(
 	ctx: ExtensionUIContext,
 	tasks: AgyTask[],
@@ -48,7 +46,11 @@ export async function showTasksBrowser(
 		);
 		if (!livenessKnown) {
 			container.addChild(
-				new Text(theme.fg("warning", "lsof not found; liveness unknown (install lsof for ACTIVE/idle)"), 1, 0),
+				new Text(
+					theme.fg("warning", "lsof not found; liveness unknown (install lsof for ACTIVE/idle)"),
+					1,
+					0,
+				),
 			);
 		}
 		container.addChild(new Spacer(1));
@@ -60,13 +62,16 @@ export async function showTasksBrowser(
 			scrollInfo: (t: string) => theme.fg("dim", t),
 			noMatch: (t: string) => theme.fg("warning", t),
 		});
-		list.onSelect = () => done({ type: "close" });
+		list.onSelect = (item) => {
+			const task = tasks.find((t) => String(t.id) === item.value);
+			done(task ? { type: "tail", task } : { type: "close" });
+		};
 		list.onCancel = () => done({ type: "close" });
 		container.addChild(list);
 
 		container.addChild(new Spacer(1));
 		container.addChild(
-			new Text(theme.fg("dim", "↑↓ navigate · r rescan · esc close · /agy tasks tail <id> for a log"), 1, 0),
+			new Text(theme.fg("dim", "up/down navigate - enter tail - r rescan - esc close"), 1, 0),
 		);
 		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 

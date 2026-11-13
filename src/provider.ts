@@ -1161,7 +1161,7 @@ async function runTurnDriver(
 			return;
 		}
 		ensureStarted(stream, blocks);
-		const summaryDiffCtx = new TurnDiffContext(createExecGitOps());
+		const summaryDiffCtx = new TurnDiffContext({ toplevel: () => null, showHead: () => null });
 		const summaryFeats: ActivityFeatures = {
 			onNativeEvent: () => {},
 			log: deps.log,
@@ -1404,7 +1404,6 @@ async function runTurnDriver(
 			if (parkedConv) {
 				store.set(key, {
 					conversationId: parkedConv,
-					lastStepIdx: -1,
 					lastMessageCount: messageCount,
 					...(currentCompactionHash ? { compactionHash: currentCompactionHash } : {}),
 				});
@@ -1465,7 +1464,6 @@ async function runTurnDriver(
 		} else if (outcome.status === "OK" && !outcome.aborted) {
 			store.set(key, {
 				conversationId: outcome.conversationId,
-				lastStepIdx: -1,
 				lastMessageCount: messageCount,
 				...(currentCompactionHash ? { compactionHash: currentCompactionHash } : {}),
 			});

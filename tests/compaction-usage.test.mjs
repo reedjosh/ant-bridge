@@ -184,6 +184,7 @@ test(
       extraEnv: { FAKE_ACP_PORT: String(h.port) },
     });
     try {
+      assert.equal(driver.snapshot().acp.exactUsageSeen, false);
       const { entries, model } = makeModelAndEntries();
       const store = new SessionStore(path.join(h.tmpDir, "sessions.json"));
       const streamSimple = createStreamSimple({
@@ -201,6 +202,7 @@ test(
       ).result();
 
       const prompt1 = await h.waitForFrame((f) => f.method === "session/prompt");
+      assert.equal(driver.snapshot().acp.exactUsageSeen, false);
       const sid = prompt1.params.sessionId;
       for (let b = 1; b <= 18; b++) {
         h.sendUpdate(sid, {
@@ -232,6 +234,8 @@ test(
       });
 
       const msg1 = await turn1Promise;
+      assert.equal(driver.snapshot().acp.exactUsageSeen, true);
+      assert.deepEqual(driver.snapshot().stats, { spawns: 1, turns: 1, recycles: 0 });
       assert.equal(msg1.stopReason, "stop");
       assert.equal(msg1.usage.input, 7_573);
       assert.equal(msg1.usage.cacheRead, 81_879);
@@ -378,6 +382,75 @@ test(
 );
 
 test(
+  "driver.snapshot().acp.exactUsageSeen stays false on usage_update and flips true on PromptResponse.usage",
+  async () => {
+    const h = await createFakeAcpHarness();
+    const driver = new AcpDriver({
+      bin: h.launcherPath,
+      binArgs: ["acp"],
+      extraEnv: { FAKE_ACP_PORT: String(h.port) },
+    });
+    try {
+      assert.equal(driver.snapshot().acp.usageSeen, false);
+      assert.equal(driver.snapshot().acp.exactUsageSeen, false);
+
+      // Turn 1: occupancy update without PromptResponse.usage trips usageSeen, not exactUsageSeen.
+      const handle1 = await driver.run({
+        cwd: h.tmpDir,
+        model: "gemini-4-carbon",
+        mode: "accept-edits",
+        skipPermissions: true,
+        prompt: "First turn",
+      });
+      const prompt1 = await h.waitForFrame((f) => f.method === "session/prompt");
+      const sid = prompt1.params.sessionId;
+      h.sendUpdate(sid, {
+        sessionUpdate: "usage_update",
+        used: 42_000,
+        _meta: { usage: { used: 42_000, size: 1_000_000 } },
+      });
+      h.sendUpdate(sid, {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Reply without exact usage." },
+      });
+      h.replyPrompt(prompt1, "end_turn");
+      const out1 = await handle1.outcome;
+      assert.equal(out1.status, "OK");
+      assert.equal(driver.snapshot().acp.usageSeen, true);
+      assert.equal(driver.snapshot().acp.exactUsageSeen, false);
+
+      // Turn 2: PromptResponse.usage flips exactUsageSeen from false to true.
+      const idx2 = h.received.length;
+      const handle2 = await driver.run({
+        cwd: h.tmpDir,
+        model: "gemini-4-carbon",
+        mode: "accept-edits",
+        skipPermissions: true,
+        conversationId: sid,
+        prompt: "Second turn",
+      });
+      const prompt2 = await h.waitForFrame((f) => f.method === "session/prompt", idx2);
+      h.sendUpdate(sid, {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Reply with exact usage." },
+      });
+      h.replyPrompt(prompt2, "end_turn", {
+        inputTokens: 1_200,
+        outputTokens: 300,
+        cachedReadTokens: 8_000,
+        totalTokens: 9_500,
+      });
+      const out2 = await handle2.outcome;
+      assert.equal(out2.status, "OK");
+      assert.equal(driver.snapshot().acp.exactUsageSeen, true);
+    } finally {
+      await driver.close("shutdown");
+      await h.close();
+    }
+  },
+);
+
+test(
   "standalone summarization isolates SessionStore and post-compaction turn resets ACP session",
   async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ant-summary-iso-"));
@@ -444,7 +517,7 @@ test(
           return {
             state: "ready",
             conversationId: `acp-conv-${nextConvSeq}`,
-            stats: { spawns: 1, turns: nextConvSeq, reused: 0, recycles: 0, recycleReasons: {} },
+            stats: { spawns: 1, turns: nextConvSeq, recycles: 0 },
             lifecycle: [],
             engine: "acp",
           };

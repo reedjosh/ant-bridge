@@ -60,7 +60,12 @@ Or set a default in `~/.pi/agent/settings.json`:
 - **Pi 1.5 extension and MCP tools bridge automatically:** Active Pi extension tools (including `builtin:codemode`,
   `builtin:mcp`, `builtin:tool-search`, `pi-subagents`, and PR tracking tools) are served over a loopback `127.0.0.1`
   MCP endpoint (`pi-bridge`) authenticated with a per-session random header token (`x-bridge-token`).
-- **Skills:** Pi Agent Skills are exposed via `activate_skill` on `pi-bridge`.
+- **Skills:** Pi Agent Skills are exposed dynamically via `activate_skill` on `pi-bridge`, sourced live from
+  `pi.getCommands()` (reflecting package, settings, project-trusted skills, and `/reload` updates) with a filesystem
+  `scanSkills` fallback.
+- **Usage footer:** Streaming turns display live ACP token counts in the status bar (`ACP <in> in (+<cached> cached) /
+  <out> out` when native usage is reported, or `ACP ~ <in> in / <out> out` for client-side estimates, hidden while all
+  counts are zero).
 - **Long-running tool escalation:** Calls that exceed their foreground window (120s for `subagent` and `codemode`, 20s
   for other bridged tools) return a `STILL RUNNING` handle that resolves via `bridge_poll_result` without hitting
   transport timeouts.
@@ -71,17 +76,22 @@ Or set a default in `~/.pi/agent/settings.json`:
 
 ## Commands
 
-Run `/agy` inside Pi to open the settings picker, or pass a subcommand:
+Run `/agy` inside Pi to open the settings picker (or display status in non-TUI modes), or pass a subcommand:
 
-- `/agy` or `/agy settings` - interactive configuration picker (`bridgeTools`, timeouts, permission mode, digest).
-- `/agy doctor` - check `agy` binary version, authentication, active session binding, and loopback MCP server status.
-- `/agy tools` - inspect which Pi tools are exposed over `pi-bridge` (`default` or `hide` per tool).
-- `/agy tasks` - inspect background task logs in the bound conversation directory.
-- `/agy artifacts` - browse artifacts written in the bound conversation directory.
+- `/agy` - interactive configuration picker (`bridgeTools`, timeouts, permission mode, usage estimate, digest).
+- `/agy doctor` - check `agy` binary version, active `bound conversation`, driver stats (`spawns`, `turns`, `recycles`),
+  and loopback MCP server status.
+- `/agy bridge all|mcp|none` - update bridged tool scope live and start the loopback `pi-bridge` MCP server on demand
+  when switching from `none` to `all` or `mcp` (no `/reload` needed).
+- `/agy tools [hide|show <name>|reset]` - inspect or toggle which Pi tools are exposed over `pi-bridge`, with tab
+  completion over `pi.getAllTools()`.
+- `/agy tasks [tail <id>]` - browse background task logs in the bound conversation directory (`Enter` tails the last 40
+  lines, `r` rescans), with tab completion over task IDs on `/agy tasks tail <id>`.
+- `/agy artifacts [open <n|name>]` - browse or open artifacts in the bound conversation directory, with tab completion
+  over artifact filenames on `/agy artifacts open <name>`.
 - `/agy quota` - display model quota status from `agy usage`.
-- `/agy clear` - clear the conversation binding for the current Pi session only so the next turn starts fresh (leaving
-  other open Pi sessions untouched).
-- `/agy clear all` - clear persisted conversation bindings across all Pi sessions.
+- `/agy clear [all]` - clear the conversation binding for the current Pi session only (leaving other open Pi sessions
+  untouched), or pass `all` to clear persisted bindings across every Pi session.
 
 Configuration and session bindings are stored under `~/.pi/agent/antigravity-bridge/` (or
 `$PI_CODING_AGENT_DIR/antigravity-bridge/`).

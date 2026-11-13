@@ -128,7 +128,8 @@ test("mid-turn completed tasks do not fire post-turn wakes", async () => {
       [
         { step_index: 184, source: "SYSTEM", type: "SYSTEM_MESSAGE", content: sysLine },
         { step_index: 185, source: "SYSTEM", type: "SYSTEM_MESSAGE", content: sysLine.replaceAll("180", "246") },
-        { step_index: 186, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Tests read." },
+        { step_index: 186, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Tests read.",
+          created_at: new Date(9_000).toISOString() },
       ].map((record) => JSON.stringify(record)).join("\n") + "\n",
     );
 
@@ -176,13 +177,18 @@ test("queued completion after the final inference wakes even when its log predat
     const logsDir = path.join(tmpRoot, ".system_generated", "logs");
     fs.mkdirSync(logsDir, { recursive: true });
     fs.writeFileSync(path.join(logsDir, "transcript.jsonl"), [
-      { step_index: 926, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Waiting." },
+      { step_index: 926, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Waiting.",
+        created_at: new Date(9_000).toISOString() },
       { step_index: 927, source: "SYSTEM", type: "SYSTEM_MESSAGE",
         content: '[Message] sender=conv-1/task-925 content=Task id "conv-1/task-925" finished with result: ok' },
       // Tool results and malformed/truncated records do not prove a new model inference.
       { step_index: 928, source: "MODEL", type: "GENERIC", status: "DONE", content: "output" },
+      // agy can infer after the ACP prompt ended without delivering anything to Pi.
+      { step_index: 929, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Hidden reply.",
+        created_at: new Date(11_000).toISOString() },
     ].map((record) => JSON.stringify(record)).join("\n") + '\n{"partial":');
-    assert.deepEqual([...await readDeliveredTaskIds(tmpRoot)], []);
+    assert.deepEqual([...await readDeliveredTaskIds(tmpRoot)], [925]);
+    assert.deepEqual([...await readDeliveredTaskIds(tmpRoot, 10_000)], []);
 
     let clock = 10_000;
     const settles = [];

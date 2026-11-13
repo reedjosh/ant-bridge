@@ -201,8 +201,9 @@ export async function tailAgyTaskLog(logPath: string): Promise<string> {
 }
 
 /** Task IDs whose completion was followed by another model inference. A queued
- *  SYSTEM_MESSAGE alone does not prove the model consumed the result. */
-export async function readDeliveredTaskIds(conversationDir: string): Promise<Set<number>> {
+ *  SYSTEM_MESSAGE alone does not prove consumption. The cutoff excludes hidden
+ *  native inferences after Pi's turn ended, which cannot deliver a response to Pi. */
+export async function readDeliveredTaskIds(conversationDir: string, beforeMs?: number): Promise<Set<number>> {
 	const transcriptPath = path.join(conversationDir, ".system_generated", "logs", "transcript.jsonl");
 	const delivered = new Set<number>();
 	let text: string;
@@ -223,7 +224,10 @@ export async function readDeliveredTaskIds(conversationDir: string): Promise<Set
 		}
 		if (!record || typeof record.step_index !== "number") continue;
 		if (record.source === "MODEL" && record.type === "PLANNER_RESPONSE" && record.status === "DONE") {
-			lastInferenceStep = Math.max(lastInferenceStep, record.step_index);
+			const createdAt = typeof record.created_at === "string" ? Date.parse(record.created_at) : NaN;
+			if (beforeMs === undefined || (Number.isFinite(createdAt) && createdAt <= beforeMs)) {
+				lastInferenceStep = Math.max(lastInferenceStep, record.step_index);
+			}
 		} else if (record.source === "SYSTEM" && record.type === "SYSTEM_MESSAGE" &&
 			typeof record.content === "string") {
 			notifications.push({ step: record.step_index, content: record.content });

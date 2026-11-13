@@ -30,11 +30,12 @@ export interface BackgroundWatchOptions {
 	 *  never tracked (the task dir is cumulative per conversation). */
 	turnStartMs: number;
 	/** Timestamp when the turn ended and armed the watch. Completion can race
-	 *  with arming; only transcript consumption, not this timestamp, suppresses a wake. */
+	 *  with arming; only in-turn transcript consumption suppresses a wake. */
 	armedAt?: number;
 	listTasks: (conversationDir: string) => Promise<AgyTask[]>;
-	/** Optional reader for task IDs agy already delivered in-turn via transcript.jsonl. */
-	deliveredTaskIds?: (conversationDir: string) => Promise<Set<number>>;
+	/** Optional reader for task IDs consumed before Pi's turn ended. Later native
+	 *  inferences can be invisible to Pi and must not suppress the wake. */
+	deliveredTaskIds?: (conversationDir: string, beforeMs?: number) => Promise<Set<number>>;
 	tail: (logPath: string) => Promise<string>;
 	sendWake: (content: string) => void;
 	/** Structured settle report (outcome + task ids), fired before sendWake;
@@ -128,7 +129,7 @@ export function armBackgroundWatch(opts: BackgroundWatchOptions): BackgroundWatc
 			let delivered = new Set<number>();
 			if (candidates.length > 0 && opts.deliveredTaskIds) {
 				try {
-					delivered = await opts.deliveredTaskIds(opts.conversationDir);
+					delivered = await opts.deliveredTaskIds(opts.conversationDir, opts.armedAt);
 				} catch {
 					delivered = new Set<number>();
 				}

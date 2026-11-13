@@ -329,7 +329,7 @@ export function buildContextDigest(
 	let start = effectiveWatermark;
 	if (lastCompactionIdx >= 0) start = Math.max(start, lastCompactionIdx + 1);
 	const trailingStart = trailingUserTurnStart(messages, effectiveWatermark);
-	const end = trailingStart < messages.length ? trailingStart : Math.max(0, messages.length - 1);
+	const end = trailingStart;
 	for (let i = start; i < end; i++) {
 		const m = messages[i];
 		if (m.role === "assistant") {
@@ -1394,10 +1394,16 @@ async function runTurnDriver(
 			!userPrompt &&
 			images.length === 0 &&
 			late.length === 0 &&
-			hasBoundSession &&
-			(lastRole === "toolResult" || lastRole === "assistant");
-		const prompt = resume ? RESUME_PROMPT : userPrompt;
-		if (resume) deps.log?.("resume-turn", { conversation: existing?.conversationId }, "error");
+			((hasBoundSession && (lastRole === "toolResult" || lastRole === "assistant")) ||
+				(!hasBoundSession && Boolean(currentCompactionHash)));
+		const compactedResume = resume && !hasBoundSession && Boolean(currentCompactionHash);
+		const prompt = compactedResume
+			? "Continue the unfinished task from the compacted context and latest results. " +
+				"Do not wait for a new user message."
+			: resume
+				? RESUME_PROMPT
+				: userPrompt;
+		if (resume) deps.log?.("resume-turn", { conversation: existing?.conversationId, compactedResume }, "info");
 		if (!prompt && images.length === 0 && late.length === 0) {
 			deps.log?.("turn-error", { reason: "no-user-message" }, "error");
 			finalize(stream, blocks, "error", "No user message to send to agy.");
@@ -1410,7 +1416,7 @@ async function runTurnDriver(
 		// config.digest is enabled.
 		let digest = "";
 		let digestPreamble = DIGEST_PREAMBLE;
-		if (late.length === 0 && !resume) {
+		if (late.length === 0 && (!resume || !hasBoundSession)) {
 			if (!hasBoundSession) {
 				digest = buildContextDigest(context.messages, 0, {
 					ownProvider: "",
@@ -1552,6 +1558,9 @@ async function runTurnDriver(
 		}
 	}
 
+	// Reentry still uses the old ACP context. Leave its summary hash unchanged
+	// so the next fresh prompt rotates instead of skipping the compacted seed.
+	const deliveredCompactionHash = active ? existing?.compactionHash : currentCompactionHash;
 	if (outcome.pendingNativeQuestion) {
 		store.delete(key);
 		deps.log?.("session-unbound-native-question", { conversation: outcome.conversationId }, "warn");
@@ -1562,7 +1571,7 @@ async function runTurnDriver(
 			store.set(key, {
 				conversationId: outcome.conversationId,
 				lastMessageCount: messageCount,
-				...(currentCompactionHash ? { compactionHash: currentCompactionHash } : {}),
+				...(deliveredCompactionHash ? { compactionHash: deliveredCompactionHash } : {}),
 			});
 		}
 	}

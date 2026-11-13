@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.4.4 - 2026-11-13
+
+- Continue automatically after compaction without requiring a new user message, preserving the compacted checkpoint
+  and latest retained tool results. Defer the compaction watermark until the new context is actually delivered.
+- Isolate child-session summarization from parked turns so compaction cannot deadlock behind a pending tool result.
+- Wake Pi for native background results unless an in-turn model inference consumed them; hidden native responses
+  after Pi's turn ended must not suppress the wake. Handle completion racing with watcher arming.
+- Validate with 84 passing tests and live Carbon checks for automatic compaction, compacted-session continuation,
+  and background wake recovery without another user message or rerunning the completed job.
+
 ## 2.4.3 - 2026-11-13
 
 - Recover Carbon conversations blocked by native `ask_question`: detect the call during live output and suppressed

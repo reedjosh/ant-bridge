@@ -1130,15 +1130,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			const concurrentForeignSession =
 				primaryBusy && primaryActiveKey !== undefined && key !== primaryActiveKey;
 			const isPrimaryKey = !explicitForeignSession && !concurrentForeignSession;
-			if (isPrimaryKey && !(isSummarization && primaryBusy)) {
-				primaryActiveKey = key;
-				return undefined;
-			}
-			if (isSummarization && isPrimaryKey) {
+			// Summarization must not queue behind a parked parent or child turn:
+			// Pi waits for the summary before delivering that turn's tool result.
+			if (isSummarization && (primaryBusy || !isPrimaryKey || childRuntimes.has(key))) {
 				const ephKey = `ephemeral:${++childSeq}@acp`;
 				const rt = createChildRuntime(ephKey, { ephemeral: true });
 				childRuntimes.set(ephKey, rt);
 				return rt.getDeps(context, cwd);
+			}
+			if (isPrimaryKey) {
+				primaryActiveKey = key;
+				return undefined;
 			}
 			let rt = childRuntimes.get(key);
 			if (!rt) {

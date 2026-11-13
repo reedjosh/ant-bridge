@@ -125,11 +125,16 @@ test("mid-turn completed tasks do not fire post-turn wakes", async () => {
       'content=Task id "conv-1/task-180" finished with result:\nok';
     fs.writeFileSync(
       path.join(logsDir, "transcript.jsonl"),
-      JSON.stringify({ step_index: 184, source: "SYSTEM", type: "SYSTEM_MESSAGE", content: sysLine }) + "\n",
+      [
+        { step_index: 184, source: "SYSTEM", type: "SYSTEM_MESSAGE", content: sysLine },
+        { step_index: 185, source: "SYSTEM", type: "SYSTEM_MESSAGE", content: sysLine.replaceAll("180", "246") },
+        { step_index: 186, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Tests read.",
+          created_at: new Date(9_000).toISOString() },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
     );
 
     const delivered = await readDeliveredTaskIds(tmpRoot);
-    assert.deepEqual([...delivered], [180]);
+    assert.deepEqual([...delivered], [180, 246]);
 
     let clock = 10_000;
     const settles = [];
@@ -164,6 +169,72 @@ test("mid-turn completed tasks do not fire post-turn wakes", async () => {
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
+});
+
+test("queued completion after the final inference wakes even when its log predates arming", async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agy-watch-queued-"));
+  try {
+    const logsDir = path.join(tmpRoot, ".system_generated", "logs");
+    fs.mkdirSync(logsDir, { recursive: true });
+    fs.writeFileSync(path.join(logsDir, "transcript.jsonl"), [
+      { step_index: 926, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Waiting.",
+        created_at: new Date(9_000).toISOString() },
+      { step_index: 927, source: "SYSTEM", type: "SYSTEM_MESSAGE",
+        content: '[Message] sender=conv-1/task-925 content=Task id "conv-1/task-925" finished with result: ok' },
+      // Tool results and malformed/truncated records do not prove a new model inference.
+      { step_index: 928, source: "MODEL", type: "GENERIC", status: "DONE", content: "output" },
+      // agy can infer after the ACP prompt ended without delivering anything to Pi.
+      { step_index: 929, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "Hidden reply.",
+        created_at: new Date(11_000).toISOString() },
+    ].map((record) => JSON.stringify(record)).join("\n") + '\n{"partial":');
+    assert.deepEqual([...await readDeliveredTaskIds(tmpRoot)], [925]);
+    assert.deepEqual([...await readDeliveredTaskIds(tmpRoot, 10_000)], []);
+
+    let clock = 10_000;
+    const settles = [];
+    const wakes = [];
+    const handle = armBackgroundWatch({
+      conversationId: "conv-1", conversationDir: tmpRoot, turnStartMs: 2_000, armedAt: 10_000,
+      listTasks: async () => [
+        { id: 925, logPath: "/tmp/task-925.log", bytes: 100, modifiedMs: 9_999,
+          active: false, livenessKnown: true },
+        { id: 100, logPath: "/tmp/task-100.log", bytes: 50, modifiedMs: 1_000,
+          active: false, livenessKnown: true },
+      ],
+      deliveredTaskIds: readDeliveredTaskIds,
+      tail: async () => "tests passed",
+      onSettle: (result) => settles.push(result), sendWake: (msg) => wakes.push(msg),
+      now: () => clock, sleep: async (ms) => { clock += ms; }, pollMs: 100, quietMs: 300,
+    });
+    while (!handle.stopped) await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(settles, [{ outcome: "settled", taskIds: [925] }]);
+    assert.equal(wakes.length, 1);
+    assert.match(wakes[0], /tests passed/);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("task consumed during observation settles silently without waiting for the cap", async () => {
+  let clock = 1_000;
+  let polls = 0;
+  const settles = [];
+  const wakes = [];
+  const handle = armBackgroundWatch({
+    conversationId: "conv-1", conversationDir: "/unused", turnStartMs: 0,
+    listTasks: async () => {
+      polls++;
+      return [{ id: 1, logPath: "/tmp/task-1.log", bytes: 10, modifiedMs: 500,
+        active: false, livenessKnown: true }];
+    },
+    deliveredTaskIds: async () => new Set(polls > 1 ? [1] : []),
+    tail: async () => "done", onSettle: (result) => settles.push(result), sendWake: (msg) => wakes.push(msg),
+    now: () => clock, sleep: async (ms) => { clock += ms; }, pollMs: 100, quietMs: 300,
+  });
+  while (!handle.stopped) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(polls, 2);
+  assert.deepEqual(settles, [{ outcome: "settled", taskIds: [] }]);
+  assert.deepEqual(wakes, []);
 });
 
 test("still-active task at armedAt tracks until idle and wakes once settled", async () => {
@@ -280,7 +351,7 @@ function makeTestStream(tmpDir, driver) {
   const store = new SessionStore(path.join(tmpDir, "sessions.json"));
   const roundTrips = new ToolRoundTrips(driver);
   const streamSimple = createStreamSimple({ entries, store, acpDriver: driver, roundTrips });
-  return { model, store, streamSimple };
+  return { model, store, streamSimple, roundTrips };
 }
 
 async function withIsolatedConfig(envOverrides, fn) {
@@ -305,6 +376,64 @@ async function withIsolatedConfig(envOverrides, fn) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
+
+for (const bound of [false, true]) {
+  for (const tailRole of ["summary-only", "assistant", "toolResult"]) {
+    const label = `automatic compaction resumes ${bound ? "bound" : "fresh"} session with ${tailRole}`;
+    test(`${label} and no user nudge`, async () => {
+      await withIsolatedConfig({}, async (tmpDir) => {
+        const { driver, requests } = createRecordingDriver("agy-compacted");
+        const { model, store, streamSimple } = makeTestStream(tmpDir, driver);
+        if (bound) store.set("sid:compacted@acp", { conversationId: "old-conv", lastMessageCount: 100 });
+        const messages = [{ role: "user", timestamp: 1, content:
+          "The conversation history before this point was compacted into the following summary:\n\n" +
+          "<summary>\nContinue checking the checkpoint.\n</summary>" }];
+        if (tailRole === "assistant") messages.push({ role: "assistant", provider: "antigravity", timestamp: 2,
+          content: [{ type: "text", text: "Latest retained assistant checkpoint." }] });
+        if (tailRole === "toolResult") messages.push({ role: "toolResult", toolName: "checkpoint", toolCallId: "tc-1",
+          isError: false, timestamp: 2, content: [{ type: "text", text: "Latest checkpoint result: passed." }] });
+        const result = await streamSimple(model, { messages }, { cwd: tmpDir, sessionId: "compacted" }).result();
+        assert.equal(result.stopReason, "stop");
+        assert.equal(requests.length, 1);
+        assert.equal(requests[0].conversationId, null);
+        assert.match(requests[0].prompt, /Continue the unfinished task/);
+        assert.match(requests[0].contextBlock.text, /Continue checking the checkpoint/);
+        if (tailRole !== "summary-only") assert.match(requests[0].contextBlock.text, /Latest/);
+        assert.equal(store.get("sid:compacted@acp")?.conversationId, "agy-compacted");
+        assert.equal(typeof store.get("sid:compacted@acp")?.compactionHash, "string");
+      });
+    });
+  }
+}
+
+test("compaction during parked reentry does not mark the unseeded summary as delivered", async () => {
+  await withIsolatedConfig({}, async (tmpDir) => {
+    const { driver, requests } = createRecordingDriver("fresh-after-reentry");
+    const { model, store, streamSimple, roundTrips } = makeTestStream(tmpDir, driver);
+    store.set("sid:reentry@acp", { conversationId: "old-conv", lastMessageCount: 100 });
+    driver.activeHandle = await driver.run({ conversationId: "old-conv" });
+    driver.reentry = () => driver.activeHandle;
+    const toolResult = roundTrips.onToolCall("tc-1", "checkpoint", {}, new AbortController().signal);
+    const summary = { role: "user", timestamp: 1, content:
+      "The conversation history before this point was compacted into the following summary:\n\n" +
+      "<summary>\nCheckpoint still pending.\n</summary>" };
+    const messages = [summary, { role: "toolResult", toolName: "checkpoint", toolCallId: "tc-1",
+      isError: false, content: [{ type: "text", text: "checkpoint passed" }], timestamp: 2 }];
+    const result = await streamSimple(model, { messages }, { cwd: tmpDir, sessionId: "reentry" }).result();
+    assert.equal(result.stopReason, "stop");
+    assert.equal((await toolResult).content[0].text, "checkpoint passed");
+    assert.equal(requests.length, 1);
+    assert.equal(store.get("sid:reentry@acp")?.compactionHash, undefined);
+    driver.activeHandle = null;
+    await streamSimple(model, { messages: [...messages, result,
+      { role: "user", content: "Continue validation", timestamp: 3 }] },
+      { cwd: tmpDir, sessionId: "reentry" }).result();
+    assert.equal(requests[1].conversationId, null);
+    assert.match(requests[1].contextBlock.text, /checkpoint passed/);
+    assert.equal(store.get("sid:reentry@acp")?.conversationId, "fresh-after-reentry");
+    assert.equal(typeof store.get("sid:reentry@acp")?.compactionHash, "string");
+  });
+});
 
 test("/fork of Antigravity session seeds prior user, antigravity assistant, and toolResult once", async () => {
   await withIsolatedConfig({}, async (tmpDir) => {

@@ -502,6 +502,8 @@ test("TOOL_PRIORITY_NOTE and PI_BRIDGE_INSTRUCTIONS are plain ASCII and cover MC
       "call_mcp_tool",
       "text(",
       "bridge_poll_result",
+      "async: true",
+      "bg_wait",
     ]) {
       assert.ok(value.includes(token), `${label} must cover ${token}`);
     }

@@ -253,6 +253,32 @@ export function sweepStaleChildMcpDirs(
 	}
 }
 
+/** Remove `~/.gemini/antigravity-cli/mcp/<serverPrefix>*` directories when an in-process
+ *  child session runtime disposes so long-lived parent sessions do not accumulate schemas. */
+export function removeChildMcpDirsByPrefix(
+	serverPrefix: string,
+	geminiHome: string = path.join(os.homedir(), ".gemini"),
+): void {
+	if (!/^pi-bridge-s\d+-c\d+$/.test(serverPrefix)) return;
+	const mcpDir = path.join(geminiHome, "antigravity-cli", "mcp");
+	let entries: string[];
+	try {
+		entries = fs.readdirSync(mcpDir);
+	} catch {
+		return;
+	}
+	for (const name of entries) {
+		if (name !== serverPrefix && !name.startsWith(`${serverPrefix}-`)) continue;
+		const target = path.join(mcpDir, name);
+		try {
+			if (!fs.lstatSync(target).isDirectory()) continue;
+			fs.rmSync(target, { recursive: true, force: true });
+		} catch {
+			// Best-effort cleanup of disposed in-process child MCP schema directory.
+		}
+	}
+}
+
 export function sweepStaleAcpHomes(
 	stateDir: string = bridgeStateDir(),
 	alive: (pid: number) => boolean = isPidAlive,

@@ -383,6 +383,19 @@ export class AcpDriver implements TurnDriver {
 			}
 		}
 		if (turn.closed) return;
+		if (conn.nativeQuestionSeen) {
+			this.#log("session-blocked-native-question", { sessionId: turn.sessionId });
+			this.#settle(turn, {
+				conversationId: turn.sessionId,
+				status: "ERROR",
+				response: "",
+				error: "Native ask_question blocked this ACP conversation; a fresh session is required.",
+				retryInFreshSession: true,
+				finished: true,
+				aborted: false,
+			});
+			return;
+		}
 
 		// Config: model + mode. Model failure fails the turn (wrong-model turns
 		// are a parity break); mode failure is best-effort (auto policy makes
@@ -1034,6 +1047,9 @@ export class AcpDriver implements TurnDriver {
 			this.#emit(turn, { type: "text", delta: flushed });
 		}
 		outcome.response = turn.response.text;
+		if (outcome.status === "OK" && !outcome.aborted && this.#conn?.nativeQuestionSeen) {
+			outcome.pendingNativeQuestion = true;
+		}
 		// Gate B stopgap: synthesize usage on clean turns while the server sends
 		// none. Runs BEFORE close so the usage activity drains through the
 		// normal #nextActivity loop (provider maps it onto partial.usage).

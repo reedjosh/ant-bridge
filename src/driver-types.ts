@@ -100,6 +100,10 @@ export interface TurnOutcome {
 	finished: boolean;
 	aborted: boolean;
 	steered?: boolean;
+	/** Native ask_question leaves ACP blocked; do not bind this conversation again. */
+	pendingNativeQuestion?: boolean;
+	/** Loaded a blocked conversation without submitting the user prompt; safe to retry once. */
+	retryInFreshSession?: boolean;
 }
 
 export interface TurnHandle {

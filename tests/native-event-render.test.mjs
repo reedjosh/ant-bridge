@@ -302,7 +302,7 @@ test("cleanNativeCommandOutput strips agy wrapper, normalizes CRLF, and preserve
   assert.equal(cleanedCapped.includes("Created At:"), false);
 });
 
-test("formatNativeEventLines renders 5-line collapsed tail/diff previews and full expanded output", () => {
+test("formatNativeEventLines collapses successful commands to one line, keeps 5-line failure tails and diff previews, and full expanded output", () => {
   assert.equal(PREVIEW_LINES, 5);
 
   const silentLines = formatNativeEventLines(
@@ -347,6 +347,19 @@ test("formatNativeEventLines renders 5-line collapsed tail/diff previews and ful
   );
   assert.deepEqual(collapsedCmd, [
     "<success>ok</success> <toolTitle>run_command</toolTitle> <muted>npm test</muted>",
+  ]);
+
+  const failedCmd = formatNativeEventLines(
+    { ...cmdEvent, status: "failed" },
+    false,
+    {
+      expanded: false,
+      keyHint: (id, desc) => `[${id}:${desc}]`,
+    },
+    tagTheme,
+  );
+  assert.deepEqual(failedCmd, [
+    "<error>x</error> <toolTitle>run_command</toolTitle> <muted>npm test</muted>",
     "<muted>... (3 earlier lines, click or </muted>[app.tools.expand:to expand]<muted>)</muted>",
     "<toolOutput>out-4</toolOutput>",
     "<toolOutput>out-5</toolOutput>",
@@ -416,7 +429,7 @@ test("MouseRegion entry renderer toggles per-entry on left click and syncs with 
     customType: "agy-native-event",
     data: {
       name: "run_command",
-      status: "completed",
+      status: "failed",
       command: "seq 1 7",
       output:
         "Created At: 2026-11-12T13:00:00Z\nCompleted At: 2026-11-12T13:00:01Z\n" +
@@ -443,13 +456,13 @@ test("MouseRegion entry renderer toggles per-entry on left click and syncs with 
   const clickExpand = host.handleMouse(mouseEvent("click", "left", 0, initialLines.length));
   assert.equal(clickExpand?.handled, true);
   const expandedLines = host.render(120).map((l) => l.trimEnd());
-  assert.deepEqual(expandedLines, ["ok run_command seq 1 7", "1", "2", "3", "4", "5", "6", "7"]);
+  assert.deepEqual(expandedLines, ["x run_command seq 1 7", "1", "2", "3", "4", "5", "6", "7"]);
 
   // Rebuild with unchanged global expanded=false preserves local click expansion.
   const rebuiltSameGlobal = renderer(entry, { expanded: false }, plainTheme);
   assert.deepEqual(
     rebuiltSameGlobal.render(120).map((l) => l.trimEnd()),
-    ["ok run_command seq 1 7", "1", "2", "3", "4", "5", "6", "7"],
+    ["x run_command seq 1 7", "1", "2", "3", "4", "5", "6", "7"],
   );
 
   // Global Ctrl+O toggle (false -> true -> false) resets local override and syncs cleanly.

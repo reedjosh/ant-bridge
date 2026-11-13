@@ -150,8 +150,45 @@ export const SYSTEM_PROMPT_PREAMBLE =
 
 export const SYSTEM_PROMPT_END = "[END SYSTEM PROMPT]";
 
-export const TOOL_PRIORITY_NOTE =
-	"[Tool priority: this conversation runs inside pi, not as a standalone agy session; the user only sees what surfaces in pi. Native interactive tools, for example ask_question, never reach the user. When a Pi Bridge tool covers the same purpose, always use the Pi Bridge tool; for user questions use ask_user_question. For MCP servers marked (codemode) in <mcp_servers> (such as Slack, Linear, Sentry, or Figma), call Pi Bridge's codemode tool directly instead of searching local config files. For workspace files and commands, your native read_file, edit_file, write_file, and run_command tools operate directly on the real filesystem and render in pi (including visible images on read_file). When a bridge call answers STILL RUNNING, poll bridge_poll_result before doing other work: until you poll, the result (including any image) stays undelivered to you. Delegate subagent work through Pi Bridge: when pi's tool list includes a delegation tool (for example subagent, Agent, agent_spawn, agent_wait, or subagent_run), always delegate through it and never through the native invoke_subagent, run_subagent, or manage_subagents; use native ones only if no pi delegation tool is listed, because native subagents run inside agy and are invisible to pi and anything watching it. Long-running bridge calls do not fail: after ~20 seconds (120 seconds for subagent and codemode calls) the bridge answers STILL RUNNING with a callId; fetch the result with bridge_poll_result and poll until it lands.]";
+/** Concise MCP server instructions for `InitializeResult.instructions`
+ *  (written by `agy` to `<appDataDir>/mcp/<serverName>/instructions.md`). */
+export const PI_BRIDGE_INSTRUCTIONS: string = [
+	"Pi Bridge exposes active Pi tools and direct MCP servers (`pi-bridge` and `pi-bridge-<server>`).",
+	"",
+	"- Direct Pi tools live on `pi-bridge` and `pi-bridge-<server>`; if `agy` marks any tool `Lazy:`,",
+	"  read its `<toolName>.json` schema in this directory and invoke it via `call_mcp_tool`.",
+	"- If any bridged call answers `STILL RUNNING` with a `callId`, poll `bridge_poll_result` on",
+	"  `pi-bridge` until it settles before ending your turn.",
+	"- Inside `codemode` scripts, MCP tools resolve to `{ content, structuredContent, isError }`",
+	"  objects and `return <object>` renders as one escaped JSON line in Pi; extract readable text and",
+	"  emit formatted multi-line strings with `text(...)` instead of returning raw or nested JSON",
+	"  objects.",
+].join("\n");
+
+export const TOOL_PRIORITY_NOTE: string = [
+	"[Tool priority: this conversation runs inside pi, not as a standalone agy session; the user only",
+	"sees what surfaces in pi. Native interactive tools, for example ask_question, never reach the",
+	"user. When a Pi Bridge tool covers the same purpose, always use the Pi Bridge tool; for user",
+	"questions use ask_user_question. Direct Pi MCP servers appear in agy's <mcp_servers> as",
+	"pi-bridge-<server> (mcp_pi-bridge-<server>_<tool> when eager, or via call_mcp_tool when Lazy:);",
+	"call them directly so Pi renders clean <server>/<tool> rows. Servers marked (codemode) in Pi's",
+	"<mcp_servers> section (such as Slack, Linear, Sentry, or Figma) do not appear as separate agy MCP",
+	"servers; reach them via mcp_pi-bridge_codemode (searchTools / describeNamespace) and never inspect",
+	"local ~/.pi MCP config files. When batching calls in codemode, extract readable text from",
+	"{ content, structuredContent } results and emit formatted multi-line text via text(...) rather",
+	"than returning raw or nested JSON objects. For workspace files and commands, your native",
+	"read_file, edit_file, write_file, and run_command tools operate directly on the real filesystem",
+	"and render in pi (including visible images on read_file). When a bridge call answers STILL",
+	"RUNNING, poll bridge_poll_result before doing other work: until you poll, the result (including",
+	"any image) stays undelivered to you. Delegate subagent work through Pi Bridge: when pi's tool list",
+	"includes a delegation tool (for example subagent, Agent, agent_spawn, agent_wait, or",
+	"subagent_run), always delegate through it and never through the native invoke_subagent,",
+	"run_subagent, or manage_subagents; use native ones only if no pi delegation tool is listed,",
+	"because native subagents run inside agy and are invisible to pi and anything watching it.",
+	"Long-running bridge calls do not fail: after ~20 seconds (120 seconds for subagent and codemode",
+	"calls) the bridge answers STILL RUNNING with a callId; fetch the result with bridge_poll_result",
+	"and poll until it lands.]",
+].join(" ");
 
 export const SUMMARIZATION_NO_TOOLS_NOTE = [
 	"[Summarization mode: summarize strictly from the provided <conversation> text. Do NOT call any",

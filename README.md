@@ -4,8 +4,8 @@ ACP model provider and loopback MCP/skill bridge for Pi (`@earendil-works/pi-cod
 
 `ant-bridge` connects Pi to the `agy` CLI over stdio JSON-RPC (`agy acp`), registers models under the `antigravity`
 provider, and exposes Pi's extension, MCP, codemode, subagent, and skill surfaces over a per-session `127.0.0.1`
-Streamable HTTP MCP server (`pi-bridge`). It does not register extra Pi tools, wrap core file/shell tools, or write to
-shared global MCP config files.
+Streamable HTTP MCP server (`pi-bridge` and per-server `pi-bridge-<server>` routes). It does not register extra Pi
+tools, wrap core file/shell tools, or write to shared global MCP config files.
 
 ## Prerequisites
 
@@ -58,8 +58,13 @@ Or set a default in `~/.pi/agent/settings.json`:
   runtime. Core Pi file/shell builtins (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) are excluded from the
   MCP bridge so tools are never duplicated.
 - **Pi 1.5 extension and MCP tools bridge automatically:** Active Pi extension tools (including `builtin:codemode`,
-  `builtin:mcp`, `builtin:tool-search`, `pi-subagents`, and PR tracking tools) are served over a loopback `127.0.0.1`
-  MCP endpoint (`pi-bridge`) authenticated with a per-session random header token (`x-bridge-token`).
+  `builtin:mcp`, `builtin:tool-search`, `pi-subagents`, and PR tracking tools) are served on `pi-bridge`, while direct
+  Pi MCP tools (`mcp__<server>__<tool>`) bridge onto per-server `pi-bridge-<server>` routes over loopback `127.0.0.1`
+  HTTP authenticated with a per-session random header token (`x-bridge-token`).
+- **Live catalog sync:** Whenever the active bridged tool catalog changes between turns (for example after
+  `tool_search` loads deferred tools, `/mcp` updates server exposure or connection state, `/agy bridge` or `/agy tools`
+  changes bridged scope, or `/reload` runs), `ant-bridge` automatically recycles `agy acp` and reloads the bound
+  session (`session/load`) so `agy` sees the updated MCP routes and schemas without losing conversation history.
 - **Skills:** Pi Agent Skills are exposed dynamically via `activate_skill` on `pi-bridge`, sourced live from
   `pi.getCommands()` (reflecting package, settings, project-trusted skills, and `/reload` updates) with a filesystem
   `scanSkills` fallback.
@@ -73,6 +78,33 @@ Or set a default in `~/.pi/agent/settings.json`:
   `<agentDir>/antigravity-bridge/acp-homes/` whose `antigravity-cli` state directory symlinks back to
   `~/.gemini/antigravity-cli`, isolating MCP configuration per session while preserving conversation state across
   restarts.
+
+### MCP server exposure
+
+Pi 1.5 controls how MCP servers in `~/.pi/agent/mcp.json` or `.pi/mcp.json` (or interactively via `/mcp`) reach the
+model:
+
+- **`"exposure": "direct"` (recommended for daily-driver servers):** Pi declares each tool directly, and `ant-bridge`
+  bridges the server onto its own `pi-bridge-<server>` MCP route (`mcp_pi-bridge-<server>_<tool>` when eager, or via
+  `call_mcp_tool` when `agy` marks a large catalog `Lazy:`). Calls execute directly and render as clean
+  `<server>/<tool>` rows in Pi. You can also promote specific tools on a larger server with `"toolExposure"`.
+- **`"exposure": "codemode"` (Pi default):** Tools are not declared as individual MCP tools; `agy` reaches them via
+  `codemode` (`searchTools`, `describeNamespace`, `tools.mcp__<server>__<tool>`) to batch or filter multi-step calls in
+  one script.
+- **`"exposure": "deferred"`:** Tools stay undeclared until `tool_search` loads matching tools into Pi's active tool
+  catalog; on the next turn `ant-bridge` recycles `agy acp`, reloads the bound session, and exposes the loaded tools on
+  `pi-bridge-<server>`.
+
+```json
+{
+  "mcpServers": {
+    "linear": {
+      "url": "https://mcp.linear.app/mcp",
+      "exposure": "direct"
+    }
+  }
+}
+```
 
 ## Commands
 

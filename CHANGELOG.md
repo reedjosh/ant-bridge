@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.4.3 - 2026-11-13
+
+- Recover Carbon conversations blocked by native `ask_question`: detect the call during live output and suppressed
+  history replay, then deliver the next user reply to a fresh ACP session seeded with the Pi transcript.
+- Explicitly prohibit native `ask_question` in the tool guidance; use Pi questions or plain-text questions instead.
+- Verify recovery against a live blocked Carbon session and cover fresh questions, loaded questions, single-stream
+  completion, transcript preservation, and unrelated MCP question tools in regression tests.
+
 ## 2.4.0 - 2026-11-12
 
 - **Per-namespace MCP routes (`pi-bridge-<server>`):** Partition direct Pi MCP tools (`mcp__<server>__<tool>`) onto

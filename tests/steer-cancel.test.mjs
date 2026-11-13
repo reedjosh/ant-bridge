@@ -936,3 +936,105 @@ test("extension input handler interrupts only active non-parked antigravity stee
   await new Promise((r) => setTimeout(r, 25));
   assert.equal(fs.existsSync(h.tmpDir), false);
 });
+
+for (const replay of [false, true]) {
+  test(`native ask_question recovers with transcript and latest answer (load replay: ${replay})`, async () => {
+    const h = await createFakeAcpHarness();
+    const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = path.join(h.tmpDir, "agent-dir");
+    const driver = new AcpDriver({
+      bin: process.execPath,
+      binArgs: [h.relayPath, "acp"],
+      extraEnv: { FAKE_ACP_PORT: String(h.port) },
+    });
+    try {
+      const { entries, model } = makeModelAndEntries();
+      const store = new SessionStore(path.join(h.tmpDir, "sessions.json"));
+      const roundTrips = new ToolRoundTrips(driver);
+      const streamSimple = createStreamSimple({ entries, store, acpDriver: driver, roundTrips });
+      const options = { cwd: h.tmpDir, sessionId: "question-recovery" };
+      const key = "sid:question-recovery@acp";
+      const question = "Which fleet setup? 1: Fleet + pi-intercom. 2: Other.";
+      const messages = [{ role: "user", content: "Install a fleet plugin", timestamp: 1 }];
+      const nativeQuestion = {
+        sessionUpdate: "tool_call",
+        toolCallId: "question-1",
+        name: "ask_question",
+        rawInput: { questions: [{ question, options: ["Fleet + pi-intercom", "Other"] }] },
+        status: replay ? "failed" : "in_progress",
+      };
+      let frameStart;
+      if (replay) {
+        store.set(key, { conversationId: "blocked-existing", lastMessageCount: 1 });
+        h.interceptNextSessionLoad((frame, sock) => {
+          h.sendUpdate("blocked-existing", nativeQuestion);
+          h.sendUpdate("blocked-existing", {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: question },
+          });
+          h.sendToClient({ jsonrpc: "2.0", id: frame.id, result: {} }, sock);
+        });
+        frameStart = h.received.length;
+      } else {
+        const first = streamSimple(model, { messages }, options);
+        const prompt = await h.waitForFrame((f) => f.method === "session/prompt");
+        h.sendUpdate(prompt.params.sessionId, nativeQuestion);
+        h.sendUpdate(prompt.params.sessionId, {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: question },
+        });
+        h.replyPrompt(prompt);
+        assert.equal((await first.result()).stopReason, "stop");
+        assert.equal(store.get(key), null, "native question must not leave a blocked binding");
+        frameStart = h.received.length;
+      }
+      messages.push(
+        { role: "assistant", provider: "antigravity", content: [{ type: "text", text: question }], timestamp: 2 },
+        { role: "user", content: "1. Do not ask again; install Fleet + pi-intercom.", timestamp: 3 },
+      );
+      const second = streamSimple(model, { messages }, options);
+      const prompt = await h.waitForFrame((f) => f.method === "session/prompt", frameStart);
+      assert.notEqual(prompt.params.sessionId, "blocked-existing");
+      assert.match(promptTextFromFrame(prompt), /1\. Do not ask again/);
+      const seed = prompt.params.prompt.find((b) => b.type === "resource")?.resource.text;
+      assert.match(seed, /Which fleet setup/);
+      assert.match(seed, /Install a fleet plugin/);
+      h.sendUpdate(prompt.params.sessionId, {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Installing Fleet + pi-intercom." },
+      });
+      h.replyPrompt(prompt);
+      const events = [];
+      for await (const event of second) events.push(event);
+      const result = await second.result();
+      assert.equal(result.stopReason, "stop");
+      assert.equal(events.filter((e) => e.type === "start").length, 1);
+      assert.equal(events.filter((e) => e.type === "done").length, 1);
+      assert.equal(result.content.filter((b) => b.type === "text").map((b) => b.text).join(""),
+        "Installing Fleet + pi-intercom.");
+      assert.equal(h.received.slice(frameStart).filter((f) => f.method === "session/prompt").length, 1);
+      assert.equal(store.get(key).conversationId, prompt.params.sessionId);
+
+      // A bridged tool with the same short name is not the native interactive tool.
+      frameStart = h.received.length;
+      const third = streamSimple(model, {
+        messages: [...messages, result, { role: "user", content: "Continue", timestamp: 4 }],
+      }, options);
+      const normal = await h.waitForFrame((f) => f.method === "session/prompt", frameStart);
+      assert.equal(normal.params.sessionId, prompt.params.sessionId);
+      assert.equal(normal.params.prompt.some((b) => b.type === "resource"), false);
+      h.sendUpdate(normal.params.sessionId, {
+        ...nativeQuestion,
+        _meta: { mcp: { server: "external-questions", tool: "ask_question" } },
+      });
+      h.replyPrompt(normal);
+      assert.equal((await third.result()).stopReason, "stop");
+      assert.equal(store.get(key).conversationId, normal.params.sessionId);
+    } finally {
+      await driver.close("shutdown");
+      if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+      await h.close();
+    }
+  });
+}

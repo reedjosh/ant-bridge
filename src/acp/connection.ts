@@ -15,7 +15,7 @@
 //     LIST; a dead URL is accepted at session time (lazy connect)
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { frameCarriesUsage } from "./events.js";
+import { frameCarriesUsage, mapUpdate } from "./events.js";
 import type { AgyUsage } from "../driver-types.js";
 import { redactText } from "../redact.js";
 import { JsonRpcResponseError, JsonRpcSession } from "./jsonrpc.js";
@@ -114,6 +114,12 @@ export class AcpConnection {
 	#killed = false;
 	#suppressUpdates = false;
 	#updateSessionId: string | null = null;
+	#nativeQuestionSeen = false;
+
+	/** Native questions cannot be answered through ACP 1.5.8 session/prompt. */
+	get nativeQuestionSeen(): boolean {
+		return this.#nativeQuestionSeen;
+	}
 	agentInfo: Record<string, unknown> | undefined;
 	/** Last known mode/model config echo from set_config_option results. */
 	lastConfigOptions: unknown = undefined;
@@ -259,6 +265,7 @@ export class AcpConnection {
 	}
 
 	async newSession(cwd: string): Promise<AcpSessionInfo> {
+		this.#nativeQuestionSeen = false;
 		const result = (await this.guarded(
 			"session/new",
 			{ cwd, mcpServers: this.#mcpServers() },
@@ -274,6 +281,7 @@ export class AcpConnection {
 	}
 
 	async loadSession(sessionId: string, cwd: string): Promise<void> {
+		this.#nativeQuestionSeen = false;
 		this.#updateSessionId = sessionId;
 		this.updateSuppression = true;
 		try {
@@ -452,9 +460,17 @@ export class AcpConnection {
 			// Latched before the suppression gate: history-replay frames are the
 			// server's payloads too, and they are the cheapest signal source.
 			if (!this.#usageSeen && frameCarriesUsage(params)) this.#usageSeen = true;
-			if (this.#suppressUpdates) return; // load replay: history, not live text
 			const p = typeof params === "object" && params !== null ? (params as Record<string, unknown>) : {};
 			const sessionId = typeof p.sessionId === "string" ? p.sessionId : this.#updateSessionId;
+			if (sessionId === this.#updateSessionId) {
+				const mapped = mapUpdate(p.update);
+				if (mapped?.kind === "tool_start" && mapped.name === "ask_question" && !mapped.mcpServer) {
+					// Load replays this call as failed, but the server remains blocked and
+					// reprints its menu on every prompt. Detect it even during suppression.
+					this.#nativeQuestionSeen = true;
+				}
+			}
+			if (this.#suppressUpdates) return; // load replay: history, not live text
 			this.#opts.onUpdate(sessionId, p.update);
 			return;
 		}

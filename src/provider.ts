@@ -180,9 +180,10 @@ export const PI_BRIDGE_INSTRUCTIONS: string = [
 
 export const TOOL_PRIORITY_NOTE: string = [
 	"[Tool priority: this conversation runs inside pi, not as a standalone agy session; the user only",
-	"sees what surfaces in pi. Native interactive tools, for example ask_question, never reach the",
-	"user. When a Pi Bridge tool covers the same purpose, always use the Pi Bridge tool; for user",
-	"questions use ask_user_question. Direct Pi MCP servers appear in agy's <mcp_servers> as",
+	"sees what surfaces in pi. NEVER call native ask_question: ACP cannot deliver answers to it,",
+	"so it blocks the conversation and replays the same question on later turns. For questions use",
+	"Pi's ask_user_question if available; otherwise ask in plain text and end your turn. When a Pi",
+	"Bridge tool covers the same purpose, always use it. Direct Pi MCP servers appear in agy's <mcp_servers> as",
 	"pi-bridge-<server> (mcp_pi-bridge-<server>_<tool> when eager); call eager tools directly so Pi",
 	"renders clean <server>/<tool> rows. Because agy acp omits schemas above ~1.48 KB (including",
 	"subagent, codemode, activate_skill, and larger MCP tools) without registering Lazy: or",
@@ -1195,9 +1196,10 @@ async function runTurnDriver(
 	entries: AgyModelEntry[],
 	store: SessionStore,
 	deps: DriverDeps,
+	recoveryBlocks?: BlockState,
 ): Promise<void> {
-	const partial = newAssistant(model);
-	const blocks: BlockState = { partial, textIdx: null, thinkingIdx: null, started: false };
+	const partial = recoveryBlocks?.partial ?? newAssistant(model);
+	const blocks: BlockState = recoveryBlocks ?? { partial, textIdx: null, thinkingIdx: null, started: false };
 
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 	const config = loadConfig();
@@ -1499,6 +1501,13 @@ async function runTurnDriver(
 	parkedTurnBgState.delete(key);
 
 	let outcome = await handle.outcome;
+	if (outcome.retryInFreshSession && !isContinuation && !recoveryBlocks) {
+		// No prompt or tools ran in the blocked session. Reuse the open stream,
+		// seed the transcript once, and deliver the latest reply to a fresh session.
+		store.delete(key);
+		deps.log?.("session-reset-native-question", { previousConversation: outcome.conversationId }, "warn");
+		return runTurnDriver(stream, model, context, options, entries, store, deps, blocks);
+	}
 	if (isContinuation && outcome.status === "OK" && !outcome.aborted && !outcome.steered) {
 		const more = collectStranded();
 		if (more.length > 0) {
@@ -1543,7 +1552,10 @@ async function runTurnDriver(
 		}
 	}
 
-	if (outcome.conversationId) {
+	if (outcome.pendingNativeQuestion) {
+		store.delete(key);
+		deps.log?.("session-unbound-native-question", { conversation: outcome.conversationId }, "warn");
+	} else if (outcome.conversationId) {
 		if (existing?.conversationId && outcome.conversationId !== existing.conversationId) {
 			store.delete(key);
 		} else if (outcome.status === "OK" && !outcome.aborted) {

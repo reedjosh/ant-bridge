@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.4.0 - 2026-11-12
+
+- **Per-namespace MCP routes (`pi-bridge-<server>`):** Partition direct Pi MCP tools (`mcp__<server>__<tool>`) onto
+  dedicated loopback HTTP routes (`/mcp/ns/<server>`, registered with `agy acp` as `pi-bridge-<server>`) while keeping
+  core extension, codemode, skill, and poll tools on `pi-bridge` (`/mcp`), exposing short tool names with collision
+  fallback and routing `tools/call` back to Pi so direct MCP calls render as clean `<server>/<tool>` rows.
+- **Automatic catalog-change driver recycle:** Fingerprint the active bridged tool and skill catalog before normal
+  turns and on `/agy bridge` and `/agy tools` (`hide`, `show`, `reset`) changes, automatically recycling warm `agy acp`
+  connections and reloading the bound `conversationId` via `session/load` while skipping recycles during parked
+  `reentry()` continuations and standalone summarization turns.
+- **MCP instructions, fast-fail probes, and event suppression:** Serve `PI_BRIDGE_INSTRUCTIONS` via
+  `InitializeResult.instructions` across all `pi-bridge*` routes, fast-fail `server/discover` (`-32601`) and
+  `/.well-known/*` (`404`) probes without instantiating MCP servers, filter `pi-bridge-*` entries when staging
+  `acp-home`, and suppress duplicate native tool rows for both eager `mcp_pi-bridge-*` and lazy `call_mcp_tool` calls.
+- **Refined tool-priority and codemode output guidance:** Update `TOOL_PRIORITY_NOTE` and `README.md` to cover
+  `direct`, `codemode`, and `deferred` MCP server exposure and guide `codemode` scripts to emit readable multi-line
+  `text(...)` strings instead of returning raw or nested JSON objects.
+
 ## 2.3.0 - 2026-11-12
 
 - **Live Pi skill catalog and multi-line frontmatter:** Populate `activate_skill` from `pi.getCommands()` so skills

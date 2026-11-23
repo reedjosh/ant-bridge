@@ -80,6 +80,27 @@ export interface WakeTaskView {
 	tailText: string;
 }
 
+const MAX_WAKE_TAIL_LINES = 20;
+
+/** Collapse carriage-return progress overwrites (such as docker pull or npm
+ *  progress bars) and cap the tail line count so a wake never floods Pi's TUI. */
+export function sanitizeTaskTail(raw: string, maxLines: number = MAX_WAKE_TAIL_LINES): string {
+	const normalized = raw.replace(/\r\n/g, "\n");
+	const lines: string[] = [];
+	for (const line of normalized.split("\n")) {
+		if (!line.includes("\r")) {
+			lines.push(line);
+			continue;
+		}
+		const parts = line.split("\r").filter((part) => part.trim().length > 0);
+		lines.push(parts.length > 0 ? parts[parts.length - 1]! : "");
+	}
+	while (lines.length > 0 && lines[0]!.trim().length === 0) lines.shift();
+	while (lines.length > 0 && lines[lines.length - 1]!.trim().length === 0) lines.pop();
+	if (lines.length <= maxLines) return lines.join("\n");
+	return ["... (earlier lines omitted)", ...lines.slice(-maxLines)].join("\n");
+}
+
 export function buildTaskWakeContent(tasks: WakeTaskView[], outcome: WatchOutcome, elapsedS: number): string {
 	const header =
 		outcome === "settled"
@@ -87,7 +108,7 @@ export function buildTaskWakeContent(tasks: WakeTaskView[], outcome: WatchOutcom
 			: `Antigravity background task watcher: stopped watching after ${elapsedS}s; the task log(s) (${tasks.map((t) => `task-${t.id}`).join(", ")}) still showed activity. Check before assuming anything completed.`;
 	const tails = tasks
 		.map((t) => {
-			const body = t.tailText.trim();
+			const body = sanitizeTaskTail(t.tailText).trim();
 			return `--- task-${t.id} (${t.logPath}) ---\n${body.length > 0 ? body : "(empty log)"}`;
 		})
 		.join("\n\n");

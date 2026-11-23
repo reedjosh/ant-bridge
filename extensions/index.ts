@@ -458,6 +458,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	};
 	pi.on("turn_start", () => {
 		outOfTurnWarned = false;
+		// Any previous turn's native background-task watcher only exists to wake
+		// an idle Pi session; stop and settle it once a new turn takes over so a
+		// task killed or handled in the new turn cannot emit a stale wake later.
+		for (const [conversationId, slot] of backgroundWatchers.entries()) {
+			slot.handle.stop();
+			if (!slot.settled) {
+				slot.settled = true;
+				appendWatchSettled(conversationId, slot.armedAt, []);
+			}
+		}
+		backgroundWatchers.clear();
 	});
 	pi.on("agent_end", (event, ctx) => {
 		clearUsageStatus(event, ctx);

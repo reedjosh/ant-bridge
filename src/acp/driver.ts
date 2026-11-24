@@ -19,6 +19,7 @@
 //     approvals.mode allow to the same synchronous auto path
 
 import { randomUUID } from "node:crypto";
+import { PI_BRIDGE_SERVER_RE } from "../bridge-catalog.js";
 import type { UsageEstimate } from "../config.js";
 import {
 	AcpAuthError,
@@ -590,6 +591,7 @@ export class AcpDriver implements TurnDriver {
 					mcpServer: mapped.mcpServer,
 				};
 				turn.toolCalls.set(mapped.toolCallId, entry);
+				this.#syncIdle(turn);
 				this.#emit(turn, {
 					type: "tool_start",
 					name: mapped.name,
@@ -609,6 +611,7 @@ export class AcpDriver implements TurnDriver {
 						mapped.mcpServer ??
 						entry.mcpServer ??
 						(entry.name === "call_mcp_tool" ? callMcpServerArg(entry.args) : undefined);
+					this.#syncIdle(turn);
 				}
 				return;
 			}
@@ -624,6 +627,7 @@ export class AcpDriver implements TurnDriver {
 					turn.toolCalls.clear();
 				}
 				turn.toolCalls.delete(mapped.toolCallId);
+				this.#syncIdle(turn);
 				const name = entry?.name ?? "tool";
 				const args = mapped.args
 					? { ...(entry?.args ?? {}), ...mapped.args }
@@ -651,8 +655,13 @@ export class AcpDriver implements TurnDriver {
 				return;
 			}
 			case "tool_error": {
-				const entry = turn.toolCalls.get(mapped.toolCallId);
+				let entry = turn.toolCalls.get(mapped.toolCallId);
+				if (!entry && turn.toolCalls.size === 1) {
+					entry = turn.toolCalls.values().next().value;
+					turn.toolCalls.clear();
+				}
 				turn.toolCalls.delete(mapped.toolCallId);
+				this.#syncIdle(turn);
 				const name = entry?.name ?? "tool";
 				const args = mapped.args
 					? { ...(entry?.args ?? {}), ...mapped.args }
@@ -671,6 +680,14 @@ export class AcpDriver implements TurnDriver {
 					mcpServer,
 					toolCallId: mapped.toolCallId,
 				});
+				if (turn.steered && !turn.steerCancelSent && turn.promptStarted && turn.toolCalls.size === 0) {
+					this.#sendSteerCancel(turn);
+				}
+				return;
+			}
+			case "tool_discard": {
+				turn.toolCalls.delete(mapped.toolCallId);
+				this.#syncIdle(turn);
 				if (turn.steered && !turn.steerCancelSent && turn.promptStarted && turn.toolCalls.size === 0) {
 					this.#sendSteerCancel(turn);
 				}
@@ -1016,15 +1033,48 @@ export class AcpDriver implements TurnDriver {
 		this.#startOverallTimer(turn, remaining);
 	}
 
+	/** True when an in-flight non-bridge, non-daemon native tool (such as a long
+	 *  run_command, background task, or schedule timer) is currently running inside
+	 *  agy. agy acp emits zero session/update frames while waiting on these tools
+	 *  and only sends tool_call_update(completed|failed) when they settle, so the
+	 *  inactivity stall guard must pause until they finish while overallTimer still
+	 *  enforces any configured turn deadline. */
+	#hasActiveNativeTool(turn: ActiveTurn): boolean {
+		for (const entry of turn.toolCalls.values()) {
+			if (entry.mcpServer && PI_BRIDGE_SERVER_RE.test(entry.mcpServer)) continue;
+			if (isDaemonToolArgs(entry.args)) continue;
+			return true;
+		}
+		return false;
+	}
+
+	#shouldSuspendIdle(turn: ActiveTurn): boolean {
+		return turn.parks > 0 || this.#hasActiveNativeTool(turn);
+	}
+
+	#syncIdle(turn: ActiveTurn): void {
+		if (turn.closed) return;
+		if (this.#shouldSuspendIdle(turn)) {
+			this.#clearIdle(turn);
+		} else {
+			this.#armIdle(turn);
+		}
+	}
+
 	#armIdle(turn: ActiveTurn): void {
 		if (turn.idleTimer) clearTimeout(turn.idleTimer);
-		if (turn.parks > 0) return; // parked: idle timer resumes on unpark
+		turn.idleTimer = undefined;
+		if (this.#shouldSuspendIdle(turn)) return; // parked or waiting on active native tool
 		const idleMs = this.#idleBudgetMs(turn);
 		// 0 disables the stall guard (config inactivityTimeoutMin: 0).
 		if (idleMs <= 0) return;
 		turn.idleTimer = setTimeout(() => {
 			if (turn.closed) return;
-			this.#log("stall", { sessionId: turn.sessionId });
+			this.#log("stall", {
+				sessionId: turn.sessionId,
+				activeTools: turn.toolCalls.size,
+				parks: turn.parks,
+			});
 			this.#conn?.abortAll("idle stall");
 			this.#conn?.kill();
 			this.#failTurn(turn, `ACP stalled for ${(idleMs / 60_000) | 0}m with no output`);
@@ -1228,6 +1278,11 @@ export class AcpDriver implements TurnDriver {
 			},
 		};
 	}
+}
+
+function isDaemonToolArgs(args: Record<string, unknown>): boolean {
+	const v = args.IsDaemon ?? args.isDaemon ?? args.is_daemon;
+	return v === true || v === "true";
 }
 
 function describe(err: unknown): string {

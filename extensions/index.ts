@@ -167,16 +167,21 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		if (logClosed) return;
 		rawFileLog(event, data, level);
 		if (level !== "warn") return;
-		if (event.startsWith("abort:") || event === "connection-exited" || mcpFailures.has(event)) {
+		if (
+			event.startsWith("abort:") ||
+			event === "connection-exited" ||
+			event === "turn-end" ||
+			mcpFailures.has(event)
+		) {
 			return;
 		}
 		const d = (data ?? {}) as Record<string, unknown>;
 		let text: string;
 		if (event === "round-trip-fail") {
 			text = `Bridge tool call failed: ${String(d.name ?? "tool")} (${String(d.reason ?? "unknown")})`;
-		} else if (event.startsWith("stall:")) {
+		} else if (event === "stall" || event.startsWith("stall:")) {
 			text = "Antigravity stalled with no output; the turn was stopped";
-		} else if (event.startsWith("timeout:")) {
+		} else if (event === "timeout" || event.startsWith("timeout:")) {
 			text = "Antigravity turn timed out";
 		} else if (event.startsWith("exit:") && event !== "exit:0") {
 			text = "Antigravity process exited unexpectedly";
@@ -1389,6 +1394,10 @@ function settingsRows(): string[] {
 		row("digest:", config.digest ? "on" : "off"),
 		row("system prompt:", config.systemPrompt ? "on" : "off"),
 		row("turn cap:", config.turnTimeoutMin === 0 ? "off" : `${config.turnTimeoutMin}m`),
+		row(
+			"inactivity cap:",
+			config.inactivityTimeoutMin === 0 ? "off" : `${config.inactivityTimeoutMin}m`,
+		),
 	];
 }
 
@@ -2176,6 +2185,13 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx?: AgyCommandCtx): Promi
 			values: ["0", "5", "10", "15", "30", "60", "120", "360", "720", "1440"],
 		},
 		{
+			id: "inactivity-cap",
+			label: "Inactivity stall cap (min)",
+			description: "Silence cap when no tool is running (0 disables).",
+			currentValue: String(config.inactivityTimeoutMin),
+			values: ["0", "5", "10", "15", "30", "60"],
+		},
+		{
 			id: "digest",
 			label: "Context digest",
 			description: "Inject non-Antigravity Pi context delta each turn (defeats server cache).",
@@ -2202,6 +2218,7 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx?: AgyCommandCtx): Promi
 			else if (id === "bridge") pending.bridgeTools = newValue as BridgeTools;
 			else if (id === "usage") pending.acp = { usageEstimate: newValue as UsageEstimate };
 			else if (id === "turn-cap") pending.turnTimeoutMin = Number(newValue);
+			else if (id === "inactivity-cap") pending.inactivityTimeoutMin = Number(newValue);
 			else if (id === "digest") pending.digest = newValue === "on";
 			else if (id === "system-prompt") pending.systemPrompt = newValue === "on";
 		},
@@ -2232,6 +2249,9 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx?: AgyCommandCtx): Promi
 			pending.acp !== undefined ? `usage=${next.acp.usageEstimate}` : null,
 			pending.turnTimeoutMin !== undefined
 				? `turn-cap=${next.turnTimeoutMin === 0 ? "off" : `${next.turnTimeoutMin}m`}`
+				: null,
+			pending.inactivityTimeoutMin !== undefined
+				? `inactivity-cap=${next.inactivityTimeoutMin === 0 ? "off" : `${next.inactivityTimeoutMin}m`}`
 				: null,
 			pending.digest !== undefined ? `digest=${next.digest ? "on" : "off"}` : null,
 			pending.systemPrompt !== undefined

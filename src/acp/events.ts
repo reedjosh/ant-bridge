@@ -75,6 +75,7 @@ export type MappedUpdate =
 			location?: AcpToolLocation;
 			mcpServer?: string;
 	  }
+	| { kind: "tool_discard"; toolCallId: string }
 	| { kind: "replay_user" }
 	| null;
 
@@ -142,10 +143,12 @@ export function mapUpdate(update: unknown): MappedUpdate {
 				// Legacy approved-echo: after an allow, the APPROVED call
 				// id reports failed with this sentinel while the real work runs
 				// under a different id that reports its own lifecycle. Track
-				// effects, not ids: drop the echo instead of rendering a bogus
-				// failure next to a successful edit.
+				// effects, not ids: drop the echo from UI rendering while still
+				// letting the driver remove the stale toolCallId from tracking.
 				const raw = stringField(u.rawOutput);
-				if (raw?.includes("approved but never executed")) return null;
+				if (raw?.includes("approved but never executed")) {
+					return { kind: "tool_discard", toolCallId: id };
+				}
 				return {
 					kind: "tool_error",
 					toolCallId: id,

@@ -44,7 +44,7 @@ export interface AgyConfig {
 	digest: boolean;
 	/** Prepend Pi's composed system prompt (including AGENTS.md files) on fresh conversations. */
 	systemPrompt: boolean;
-	/** Overall cap on one turn in minutes (0 disables; default 0 on TTY, 20 headless). */
+	/** Overall cap on one turn in minutes (0 disables; default 0 on TTY, 40 headless). */
 	turnTimeoutMin: number;
 	/** Silence cap in minutes before a turn fails as a stall (default 5; 0 disables). */
 	inactivityTimeoutMin: number;
@@ -68,7 +68,7 @@ const DEFAULTS: AgyConfig = {
 export const MAX_TURN_CAP_MIN = 1440;
 
 export function defaultTurnTimeoutMin(): number {
-	return process.stdout.isTTY || process.stdin.isTTY ? 0 : 20;
+	return process.stdout.isTTY || process.stdin.isTTY ? 0 : 40;
 }
 
 export function parseCapMinutes(raw: string | number | undefined, fallback: number): number {

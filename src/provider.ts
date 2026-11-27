@@ -28,7 +28,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { looksBackgroundNativeCall } from "./background-watch.js";
 import { CALL_PI_TOOL_NAME } from "./bridge-catalog.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, type ToolMode } from "./config.js";
 
 export { CALL_PI_TOOL_NAME };
 import { createExecGitOps, formatInlineDiff, TurnDiffContext } from "./diff-render.js";
@@ -233,6 +233,21 @@ export const TOOL_PRIORITY_NOTE: string = [
 	"and poll until it lands.]",
 ].join(" ");
 
+export const PI_ONLY_TOOL_PRIORITY_NOTE: string = [
+	"[Tool priority (pi-only mode): this conversation runs inside pi with all native agy file, shell,",
+	"subagent, schedule, and question tools disabled. Use call_mcp_tool({ ServerName, ToolName, Arguments })",
+	"for every workspace, shell, extension, MCP, subagent, and skill call through Pi Bridge (`pi-bridge` and",
+	"`pi-bridge-<server>`). Never call native manage_task. For user questions use Pi's ask_user_question if",
+	"available; otherwise ask in plain text and end your turn. Servers marked (codemode) in Pi's <mcp_servers>",
+	"section are reached through call_mcp_tool on `pi-bridge` with ToolName `codemode` (searchTools /",
+	"describeNamespace); inside codemode scripts, extract readable text from { content, structuredContent }",
+	"results and emit formatted multi-line text via text(...) rather than raw JSON. Keep subagent launches",
+	"asynchronous (async: true, the default) and end your turn without calling bg_wait or polling; Pi wakes",
+	"the session when subagents finish. Long-running bridge calls do not fail: after ~20 seconds (120 seconds",
+	"for bash, powershell, subagent, and codemode calls) the bridge answers STILL RUNNING with a callId; fetch",
+	"the result with call_mcp_tool(pi-bridge, bridge_poll_result, { callId }) until it lands.]",
+].join(" ");
+
 export const SUMMARIZATION_NO_TOOLS_NOTE = [
 	"[Summarization mode: summarize strictly from the provided <conversation> text. Do NOT call any",
 	"tools (no read_file, run_command, grep_search, MCP tools, or subagents); reply immediately with",
@@ -257,11 +272,13 @@ export function buildFullPrompt(
 	systemPrompt: string | undefined,
 	digest: string,
 	prompt: string,
+	toolMode: ToolMode = "hybrid",
 ): string {
 	const parts: string[] = [];
+	const priorityNote = toolMode === "pi-only" ? PI_ONLY_TOOL_PRIORITY_NOTE : TOOL_PRIORITY_NOTE;
 	if (systemPrompt) {
 		parts.push(
-			`${SYSTEM_PROMPT_PREAMBLE}\n\n${systemPrompt}\n\n${TOOL_PRIORITY_NOTE}\n\n${SYSTEM_PROMPT_END}`,
+			`${SYSTEM_PROMPT_PREAMBLE}\n\n${systemPrompt}\n\n${priorityNote}\n\n${SYSTEM_PROMPT_END}`,
 		);
 	}
 	if (digest) {
@@ -477,7 +494,7 @@ export const ESCALATE_AFTER_MS = 20_000;
 export const DELEGATION_ESCALATE_MS = 120_000;
 export const ESCALATED_TIMEOUT_MS = 1_800_000;
 
-const DELEGATION_NAME_RE = /subagent|delegate|^agent(_|$)|^codemode$/i;
+const DELEGATION_NAME_RE = /subagent|delegate|^agent(_|$)|^codemode$|^bash$|^powershell$/i;
 
 export function defaultEscalateAfterMs(
 	name: string,
@@ -1447,7 +1464,7 @@ async function runTurnDriver(
 		const fullPrompt =
 			late.length > 0
 				? buildLateResultPrompt(late, prompt || undefined)
-				: buildFullPrompt(sysPrompt, "", prompt ?? "");
+				: buildFullPrompt(sysPrompt, "", prompt ?? "", config.toolMode);
 		try {
 			await deps.beforeTurn?.();
 			handle = await deps.driver.run({

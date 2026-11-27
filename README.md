@@ -65,6 +65,22 @@ Each `agy acp` process uses a staged `HOME` under `<agentDir>/antigravity-bridge
 directory symlinked to `~/.gemini/antigravity-cli`. That keeps MCP config isolated while preserving conversation state
 across restarts.
 
+## Tool mode
+
+By default (`hybrid`), `agy` runs its own file and shell tools while Pi extensions, MCP servers, subagents, and skills
+bridge over MCP.
+
+If you want every tool call to run through Pi instead, switch to `pi-only` mode:
+
+```text
+/agy tool-mode pi-only
+```
+
+You can also toggle it in the `/agy` settings picker or set `AGY_TOOL_MODE=pi-only`. In `pi-only` mode, `ant-bridge`
+starts `agy acp` with a zero-native-tool custom agent and a per-session staged MCP config, injects compact parameter
+schemas for active Pi tools, and gives `bash` and `powershell` a 120s foreground window. Run `/agy clear` (or start a
+new session) after switching so `agy` creates a conversation with the new toolset.
+
 ## MCP server exposure
 
 Pi controls how MCP servers in `~/.pi/agent/mcp.json`, `.pi/mcp.json`, or `/mcp` are exposed to the model:
@@ -96,6 +112,7 @@ Run `/agy` in Pi to open the settings picker (or print status in non-TUI mode), 
 | `/agy` | Open settings (`bridgeTools`, timeouts, permission mode, usage estimate, digest). |
 | `/agy doctor` | Check the `agy` version, bound conversation, driver stats, and bridge server status. |
 | `/agy bridge all\|mcp\|none` | Change bridged tool scope live. Switching from `none` starts the bridge without `/reload`. |
+| `/agy tool-mode hybrid\|pi-only` | Choose `hybrid` (`agy` native workspace tools + Pi MCP, default) or `pi-only` (disable `agy` native tools and route every tool through Pi). |
 | `/agy tools [hide\|show <name>\|reset]` | Inspect or toggle which Pi tools are bridged, with tab completion. |
 | `/agy tasks [tail <id>]` | Browse background task logs (`Enter` tails 40 lines, `r` rescans), with tab completion on task IDs. |
 | `/agy artifacts [open <n\|name>]` | Browse or open conversation artifacts, with tab completion on filenames. |

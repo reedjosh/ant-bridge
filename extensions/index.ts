@@ -18,7 +18,14 @@ import {
 import type { SettingItem } from "@earendil-works/pi-tui";
 import type { AcpPermissionRequest } from "../src/acp/connection.js";
 import { AcpDriver } from "../src/acp/driver.js";
-import { removeChildMcpDirsByPrefix, sweepStaleAcpHomes } from "../src/acp/home.js";
+import {
+	buildPiOnlyAgentMarkdown,
+	PI_ONLY_AGENT_NAME,
+	removeChildMcpDirsByPrefix,
+	sweepStaleAcpHomes,
+	type StageAcpHomeOptions,
+	type StagedMcpServerEntry,
+} from "../src/acp/home.js";
 import {
 	agyAuthenticationMessage,
 	agyMissingMessage,
@@ -47,6 +54,7 @@ import {
 	bridgeServerPrefix,
 	CALL_PI_TOOL_NAME,
 	childBridgeServerPrefix,
+	formatCompactToolSchemas,
 	normalizeCallPiToolArguments,
 	partitionBridgeTools,
 	PI_BRIDGE_SERVER_PREFIX,
@@ -65,6 +73,7 @@ import {
 	type AgyMode,
 	type BridgeTools,
 	type PermissionMode,
+	type ToolMode,
 	type UsageEstimate,
 } from "../src/config.js";
 import { createDailyLogger, type DailyLogger } from "../src/daily-log.js";
@@ -209,13 +218,60 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	let mcpEpoch = 0;
 	let lastSyncedCatalogFingerprint: string | null = null;
 	const hiddenBridgeTools = new Set<string>();
-	const getBridgeTools = () =>
-		bridgedPiTools(
+	const getBridgeTools = () => {
+		const cfg = loadConfig();
+		return bridgedPiTools(
 			pi.getAllTools(),
 			pi.getActiveTools(),
-			loadConfig().bridgeTools,
+			cfg.bridgeTools,
 			hiddenBridgeTools,
+			cfg.toolMode,
 		);
+	};
+	const buildStagedMcpMap = (
+		handle: McpServerHandle,
+		tools: BridgeToolInfo[],
+		serverPrefix: string,
+	): Record<string, StagedMcpServerEntry> => {
+		const { namespaces } = partitionBridgeTools(tools, serverPrefix);
+		const map: Record<string, StagedMcpServerEntry> = {
+			[serverPrefix]: {
+				url: `http://127.0.0.1:${handle.port}/mcp`,
+				headers: { [TOKEN_HEADER]: handle.token },
+			},
+		};
+		for (const ns of namespaces) {
+			map[ns.serverName] = {
+				url: `http://127.0.0.1:${handle.port}/mcp/ns/${ns.routeName}`,
+				headers: { [TOKEN_HEADER]: handle.token },
+			};
+		}
+		return map;
+	};
+	const resolveIsolateHome = (
+		handle: McpServerHandle | null,
+		tools: BridgeToolInfo[],
+		serverPrefix: string,
+	): boolean | StageAcpHomeOptions => {
+		const cfg = loadConfig();
+		if (cfg.toolMode !== "pi-only" || cfg.bridgeTools === "none" || !handle) {
+			return true;
+		}
+		return {
+			perSession: true,
+			extraMcpServers: buildStagedMcpMap(handle, tools, serverPrefix),
+			agentDefinition: {
+				name: PI_ONLY_AGENT_NAME,
+				content: buildPiOnlyAgentMarkdown(formatCompactToolSchemas(tools, serverPrefix)),
+			},
+		};
+	};
+	const resolveCustomAgent = (handle: McpServerHandle | null): string | undefined => {
+		const cfg = loadConfig();
+		return cfg.toolMode === "pi-only" && cfg.bridgeTools !== "none" && handle
+			? PI_ONLY_AGENT_NAME
+			: undefined;
+	};
 	const resolveSkills = (): SkillLite[] =>
 		skillsFromCommands(
 			typeof pi.getCommands === "function" ? pi.getCommands() : [],
@@ -278,13 +334,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const acpDriver = new AcpDriver({
 		bin: binary,
 		binArgs: ["acp"],
-		isolateHome: true,
+		isolateHome: () => resolveIsolateHome(mcpHandle, getBridgeTools(), primaryServerPrefix()),
+		agent: () => resolveCustomAgent(mcpHandle),
 		usageEstimate: () => loadConfig().acp.usageEstimate,
 		permissionPolicy: resolvePermissionPolicy,
 		onPermissionRequest: handlePermissionRequest,
 		log: acpLog,
 		mcpServers: () => {
-			if (loadConfig().bridgeTools === "none") {
+			const cfg = loadConfig();
+			if (cfg.bridgeTools === "none") {
 				if (lastSyncedCatalogFingerprint === null) lastSyncedCatalogFingerprint = "none";
 				return [];
 			}
@@ -296,10 +354,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			if (lastSyncedCatalogFingerprint === null) {
 				lastSyncedCatalogFingerprint = bridgeCatalogFingerprint(
 					tools,
-					resolveSkills().map((s) => `skill:${s.name}`),
+					[...resolveSkills().map((s) => `skill:${s.name}`), `toolMode:${cfg.toolMode}`],
 					serverPrefix,
 				);
 			}
+			// In pi-only mode, bridged MCP servers are registered via staged config/mcp_config.json
+			// so the custom agent can dispatch them via call_mcp_tool (session/new.mcpServers must be empty).
+			if (cfg.toolMode === "pi-only") return [];
 			return [
 				{
 					name: serverPrefix,
@@ -579,12 +640,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	const syncBridgeCatalog = async (reason: string): Promise<void> => {
 		const serverPrefix = primaryServerPrefix();
+		const cfg = loadConfig();
 		const nextFp =
-			loadConfig().bridgeTools === "none"
+			cfg.bridgeTools === "none"
 				? "none"
 				: bridgeCatalogFingerprint(
 						getBridgeTools(),
-						resolveSkills().map((s) => `skill:${s.name}`),
+						[...resolveSkills().map((s) => `skill:${s.name}`), `toolMode:${cfg.toolMode}`],
 						serverPrefix,
 					);
 		if (acpDriver.state === "idle" || acpDriver.state === "dead") {
@@ -926,13 +988,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		const childDriver = new AcpDriver({
 			bin: binary,
 			binArgs: ["acp"],
-			isolateHome: true,
+			isolateHome: () => resolveIsolateHome(childMcpHandle, latestTools, serverPrefix),
+			agent: () => resolveCustomAgent(childMcpHandle),
 			usageEstimate: () => loadConfig().acp.usageEstimate,
 			permissionPolicy: resolvePermissionPolicy,
 			onPermissionRequest: handlePermissionRequest,
 			log: acpLog,
 			mcpServers: () => {
-				if (loadConfig().bridgeTools === "none") {
+				const cfg = loadConfig();
+				if (cfg.bridgeTools === "none") {
 					if (lastChildFp === null) lastChildFp = "none";
 					return [];
 				}
@@ -942,10 +1006,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				if (lastChildFp === null) {
 					lastChildFp = bridgeCatalogFingerprint(
 						latestTools,
-						latestSkills.map((s) => `skill:${s.name}`),
+						[...latestSkills.map((s) => `skill:${s.name}`), `toolMode:${cfg.toolMode}`],
 						serverPrefix,
 					);
 				}
+				if (cfg.toolMode === "pi-only") return [];
 				return [
 					{
 						name: serverPrefix,
@@ -1069,10 +1134,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				roundTrips: childRoundTrips,
 				beforeTurn: async () => {
 					clearIdleTimer();
-					const bridgeMode = loadConfig().bridgeTools;
+					const cfg = loadConfig();
+					const bridgeMode = cfg.bridgeTools;
 					latestTools = bridgedTranscriptTools(
 						getCurrentTools(context.messages),
 						bridgeMode,
+						cfg.toolMode,
 					);
 					const sys = getCurrentSystemPrompt(context.messages);
 					latestSkills =
@@ -1090,7 +1157,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 							? "none"
 							: bridgeCatalogFingerprint(
 									latestTools,
-									latestSkills.map((s) => `skill:${s.name}`),
+									[...latestSkills.map((s) => `skill:${s.name}`), `toolMode:${cfg.toolMode}`],
 									serverPrefix,
 								);
 					if (childDriver.state === "idle" || childDriver.state === "dead") {
@@ -1401,6 +1468,7 @@ function settingsRows(): string[] {
 		row("readOnly:", config.readOnly ? "on (provider turns refused)" : "off"),
 		row("permissions:", perm),
 		row("bridge tools:", config.bridgeTools),
+		row("tool mode:", config.toolMode),
 		row("usage estimate:", config.acp.usageEstimate),
 		row("digest:", config.digest ? "on" : "off"),
 		row("system prompt:", config.systemPrompt ? "on" : "off"),
@@ -1425,6 +1493,7 @@ function statusText(ctx: AgyCommandCtx, cmdCtx?: ExtensionCommandContext): strin
 		"/agy permissions on|off",
 		"/agy permission-mode ask|allow|deny",
 		"/agy bridge all|mcp|none",
+		"/agy tool-mode hybrid|pi-only",
 		"/agy tools [hide|show <name>|reset]",
 		"/agy usage estimate|direct|off",
 		"/agy digest on|off",
@@ -1484,6 +1553,7 @@ const AGY_SUBCOMMANDS: ReadonlyArray<{ name: string; description: string }> = [
 	{ name: "permissions", description: "Toggle ACP permission auto-approval (on|off)" },
 	{ name: "permission-mode", description: "Set ACP permission fallback (ask|allow|deny)" },
 	{ name: "bridge", description: "Set bridged Pi tool scope (all|mcp|none)" },
+	{ name: "tool-mode", description: "Set tool execution mode (hybrid|pi-only)" },
 	{ name: "tools", description: "Inspect, hide, show, or reset bridged Pi tools" },
 	{ name: "usage", description: "Set token usage estimate mode (estimate|direct|off)" },
 	{ name: "digest", description: "Toggle Pi context digest injection (on|off)" },
@@ -1503,6 +1573,7 @@ const AGY_SUBCOMMAND_ARGS: Readonly<Record<string, readonly string[]>> = {
 	permissions: ["on", "off"],
 	"permission-mode": ["ask", "allow", "deny"],
 	bridge: ["all", "mcp", "none"],
+	"tool-mode": ["hybrid", "pi-only"],
 	usage: ["estimate", "direct", "off"],
 	digest: ["on", "off"],
 	"system-prompt": ["on", "off"],
@@ -1679,7 +1750,7 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 	};
 	pi.registerCommand("agy", {
 		description:
-			"Antigravity ACP provider: settings picker, doctor, session/task/artifact inspection. Usage: /agy [doctor|auth|auth-manual|mode|readonly|permissions|permission-mode|bridge|tools|usage|digest|system-prompt|timeout|quota|subagents|artifacts|tasks|clear]",
+			"Antigravity ACP provider: settings picker, doctor, session/task/artifact inspection. Usage: /agy [doctor|auth|auth-manual|mode|readonly|permissions|permission-mode|bridge|tool-mode|tools|usage|digest|system-prompt|timeout|quota|subagents|artifacts|tasks|clear]",
 		getArgumentCompletions: (argumentPrefix: string) =>
 			getAgyArgumentCompletions(argumentPrefix, () => pi.getAllTools(), activeConversationDir),
 		handler: async (args, cmdCtx: ExtensionCommandContext) => {
@@ -1789,6 +1860,7 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 					"Antigravity doctor (no tokens spent)",
 					"  transport:           agy acp (isolated MCP home)",
 					`  bridge:              ${config.bridgeTools}${port ? ` (port ${port})` : " (not running)"}`,
+					`  tool mode:           ${config.toolMode}`,
 					`  driver:              ${driverLine}`,
 					`  driver stats:        ${statsLine}`,
 					`  bound conversation:  ${boundConversation}`,
@@ -1905,6 +1977,32 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 				} else {
 					ui?.notify(
 						`bridge: ${loadConfig().bridgeTools}\nusage: /agy bridge all|mcp|none`,
+						"info",
+					);
+				}
+				return;
+			}
+			if (sub === "tool-mode") {
+				if (val === "hybrid" || val === "pi-only") {
+					const next = saveConfig({ toolMode: val });
+					if (
+						val === "pi-only" &&
+						next.bridgeTools !== "none" &&
+						ctx.getMcpPort() === null &&
+						ctx.ensureMcpServer
+					) {
+						await ctx.ensureMcpServer();
+					}
+					await ctx.syncBridgeCatalog?.(`/agy tool-mode ${val}`);
+					ui?.notify(
+						next.toolMode === "pi-only"
+							? "tool-mode set to pi-only. Fresh sessions will run with agy native tools disabled (run /agy clear to reset an already-bound conversation)."
+							: "tool-mode set to hybrid. Fresh sessions will use agy native workspace tools plus Pi MCP bridge (run /agy clear to reset an already-bound conversation).",
+						"info",
+					);
+				} else {
+					ui?.notify(
+						`tool-mode: ${loadConfig().toolMode}\nusage: /agy tool-mode hybrid|pi-only`,
 						"info",
 					);
 				}
@@ -2182,6 +2280,14 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx?: AgyCommandCtx): Promi
 			values: ["all", "mcp", "none"],
 		},
 		{
+			id: "tool-mode",
+			label: "Tool execution mode",
+			description:
+				"hybrid (agy native file/shell + Pi MCP, default) or pi-only (disable agy native tools, route all tools through Pi).",
+			currentValue: config.toolMode,
+			values: ["hybrid", "pi-only"],
+		},
+		{
 			id: "usage",
 			label: "Token usage estimate",
 			description: "Client-side token estimate mode until ACP emits native usage.",
@@ -2227,6 +2333,7 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx?: AgyCommandCtx): Promi
 			else if (id === "permissions") pending.skipPermissions = newValue === "on";
 			else if (id === "permission-mode") pending.permissionMode = newValue as PermissionMode;
 			else if (id === "bridge") pending.bridgeTools = newValue as BridgeTools;
+			else if (id === "tool-mode") pending.toolMode = newValue as ToolMode;
 			else if (id === "usage") pending.acp = { usageEstimate: newValue as UsageEstimate };
 			else if (id === "turn-cap") pending.turnTimeoutMin = Number(newValue);
 			else if (id === "inactivity-cap") pending.inactivityTimeoutMin = Number(newValue);
@@ -2247,8 +2354,15 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx?: AgyCommandCtx): Promi
 		) {
 			await ctx.ensureMcpServer();
 		}
-		if (pending.bridgeTools !== undefined) {
-			await ctx?.syncBridgeCatalog?.(`/agy picker bridge=${next.bridgeTools}`);
+		if (pending.bridgeTools !== undefined || pending.toolMode !== undefined) {
+			await ctx?.syncBridgeCatalog?.(
+				`/agy picker ${[
+					pending.bridgeTools !== undefined ? `bridge=${next.bridgeTools}` : null,
+					pending.toolMode !== undefined ? `toolMode=${next.toolMode}` : null,
+				]
+					.filter(Boolean)
+					.join(" ")}`,
+			);
 		}
 		const changed = [
 			pending.readOnly !== undefined ? `readOnly=${next.readOnly ? "on" : "off"}` : null,
@@ -2257,6 +2371,7 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx?: AgyCommandCtx): Promi
 				: null,
 			pending.permissionMode !== undefined ? `permission-mode=${next.permissionMode}` : null,
 			pending.bridgeTools !== undefined ? `bridge=${next.bridgeTools}` : null,
+			pending.toolMode !== undefined ? `tool-mode=${next.toolMode}` : null,
 			pending.acp !== undefined ? `usage=${next.acp.usageEstimate}` : null,
 			pending.turnTimeoutMin !== undefined
 				? `turn-cap=${next.turnTimeoutMin === 0 ? "off" : `${next.turnTimeoutMin}m`}`

@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.5.0 - 2026-11-27
+
+- Add opt-in `pi-only` tool mode (`/agy tool-mode pi-only`, `/agy` settings picker, or `AGY_TOOL_MODE=pi-only`) to
+  disable `agy`'s native workspace and agent tools and route all tools through Pi over MCP (#11).
+- Stage per-session isolated `config/mcp_config.json` and `config/agents/pi-bridge.md` with compact parameter schemas
+  (including nested object/array shapes and enums) so turn-one `call_mcp_tool` calls need no extra discovery step, and
+  clean up per-session dirs on connection exit.
+- Give `bash` and `powershell` the 120s synchronous foreground window before `STILL RUNNING` escalation.
+- Document `tool-mode` in `README.md`.
+
 ## 2.4.6 - 2026-11-27
 
 - Collapse successful native command output to its header line until expanded (#3, @lansmurf).

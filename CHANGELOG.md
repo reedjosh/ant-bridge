@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.4.5 - 2026-11-27
+
+- Pause the idle stall guard while native `agy` tools are in flight so long-running commands do not trigger false
+  stalls.
+- Raise the default headless turn timeout to 40 minutes.
+- Rewrite `README.md` in plain technical style and remove legacy fork migration notes.
+
 ## 2.4.4 - 2026-11-13
 
 - Continue automatically after compaction without requiring a new user message, preserving the compacted checkpoint

@@ -65,6 +65,22 @@ Each `agy acp` process uses a staged `HOME` under `<agentDir>/antigravity-bridge
 directory symlinked to `~/.gemini/antigravity-cli`. That keeps MCP config isolated while preserving conversation state
 across restarts.
 
+## Tool mode
+
+By default (`hybrid`), `agy` runs its own file and shell tools while Pi extensions, MCP servers, subagents, and skills
+bridge over MCP.
+
+If you want every tool call to run through Pi instead, switch to `pi-only` mode:
+
+```text
+/agy tool-mode pi-only
+```
+
+You can also toggle it in the `/agy` settings picker or set `AGY_TOOL_MODE=pi-only`. In `pi-only` mode, `ant-bridge`
+starts `agy acp` with a zero-native-tool custom agent and a per-session staged MCP config, injects compact parameter
+schemas for active Pi tools, and gives `bash` and `powershell` a 120s foreground window. Run `/agy clear` (or start a
+new session) after switching so `agy` creates a conversation with the new toolset.
+
 ## MCP server exposure
 
 Pi controls how MCP servers in `~/.pi/agent/mcp.json`, `.pi/mcp.json`, or `/mcp` are exposed to the model:

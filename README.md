@@ -8,7 +8,7 @@ config files.
 
 ## Requirements
 
-- Pi 1.5 or newer (`pi --version`).
+- Pi installed.
 - `agy` 1.5.3 or newer on `PATH` and signed in (`agy --version`, or run `agy` once to sign in).
 
 ## Install
@@ -67,7 +67,7 @@ across restarts.
 
 ## MCP server exposure
 
-Pi 1.5 controls how MCP servers in `~/.pi/agent/mcp.json`, `.pi/mcp.json`, or `/mcp` are exposed to the model:
+Pi controls how MCP servers in `~/.pi/agent/mcp.json`, `.pi/mcp.json`, or `/mcp` are exposed to the model:
 
 - `"exposure": "direct"` (recommended for servers you use often): Pi declares each tool directly, and `ant-bridge`
   serves it on `pi-bridge-<server>`. You can also promote specific tools on a large server with `"toolExposure"`.

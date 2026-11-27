@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.4.6 - 2026-11-27
+
+- Collapse successful native command output to its header line until expanded (#3, @lansmurf).
+- Prohibit native `agy` background tasks, daemons, and subagents in bridge guidance, stop prior-turn watchers on
+  `turn_start` to prevent stale wakes, and collapse carriage-return progress overwrites in wake tails (#10).
+- Simplify `README.md` and drop Pi 1.5 version callouts.
+
 ## 2.4.5 - 2026-11-27
 
 - Pause the idle stall guard while native `agy` tools are in flight so long-running commands do not trigger false

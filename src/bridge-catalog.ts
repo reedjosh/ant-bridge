@@ -127,10 +127,48 @@ export function bridgedTranscriptTools(
 	);
 }
 
-function summarizeSchemaParams(parameters: object | undefined): string {
-	const schema = parameters as
-		| { properties?: Record<string, { type?: unknown }>; required?: unknown }
-		| undefined;
+interface JsonSchemaLike {
+	type?: unknown;
+	enum?: unknown;
+	properties?: Record<string, JsonSchemaLike>;
+	required?: unknown;
+	items?: JsonSchemaLike;
+	anyOf?: JsonSchemaLike[];
+	oneOf?: JsonSchemaLike[];
+}
+
+function summarizeSchemaType(def: JsonSchemaLike | undefined, depth: number): string {
+	if (!def || typeof def !== "object") return "any";
+	if (Array.isArray(def.enum) && def.enum.length > 0 && def.enum.length <= 6) {
+		const literals = def.enum
+			.filter((v) => typeof v === "string" || typeof v === "number" || typeof v === "boolean")
+			.map((v) => JSON.stringify(v));
+		if (literals.length === def.enum.length) return literals.join("|");
+	}
+	const rawType = def.type;
+	if (rawType === "array") {
+		if (def.items && depth < 2) {
+			return `${summarizeSchemaType(def.items, depth + 1)}[]`;
+		}
+		return "array";
+	}
+	if ((rawType === "object" || (!rawType && def.properties)) && def.properties && depth < 2) {
+		const inner = summarizeObjectProps(def, depth + 1);
+		return inner ? `{ ${inner} }` : "object";
+	}
+	if (typeof rawType === "string") return rawType;
+	if (Array.isArray(rawType)) {
+		const types = rawType.filter((t): t is string => typeof t === "string");
+		if (types.length > 0) return types.join("|");
+	}
+	const variants = def.anyOf ?? def.oneOf;
+	if (Array.isArray(variants) && variants.length > 0 && variants.length <= 4 && depth < 2) {
+		return variants.map((v) => summarizeSchemaType(v, depth + 1)).join("|");
+	}
+	return "any";
+}
+
+function summarizeObjectProps(schema: JsonSchemaLike | undefined, depth: number): string {
 	const props = schema?.properties;
 	if (!props || typeof props !== "object") return "";
 	const reqSet = new Set(
@@ -140,16 +178,13 @@ function summarizeSchemaParams(parameters: object | undefined): string {
 	);
 	const parts: string[] = [];
 	for (const [key, def] of Object.entries(props)) {
-		const rawType = def && typeof def === "object" ? def.type : undefined;
-		const typeStr =
-			typeof rawType === "string"
-				? rawType
-				: Array.isArray(rawType)
-					? rawType.filter((t): t is string => typeof t === "string").join("|")
-					: "any";
-		parts.push(`${key}${reqSet.has(key) ? "" : "?"}: ${typeStr}`);
+		parts.push(`${key}${reqSet.has(key) ? "" : "?"}: ${summarizeSchemaType(def, depth)}`);
 	}
 	return parts.join(", ");
+}
+
+function summarizeSchemaParams(parameters: object | undefined): string {
+	return summarizeObjectProps(parameters as JsonSchemaLike | undefined, 0);
 }
 
 function oneLineSummary(desc: string | undefined, maxLen = 100): string {

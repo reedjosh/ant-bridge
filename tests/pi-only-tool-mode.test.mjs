@@ -78,12 +78,38 @@ test("bridgedPiTools and bridgedTranscriptTools include core file/shell builtins
   );
 });
 
-test("formatCompactToolSchemas prioritizes core builtins and groups namespaced servers", () => {
+test("formatCompactToolSchemas prioritizes core builtins, expands nested shapes, and groups namespaced servers", () => {
   const tools = [
     {
       name: "subagent",
       description: "Launch a child agent",
-      parameters: { type: "object", properties: { prompt: { type: "string" } }, required: ["prompt"] },
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string" },
+          workflow: { type: "string", enum: ["single", "parallel"] },
+        },
+        required: ["prompt"],
+      },
+    },
+    {
+      name: "edit",
+      description: "Make precise file edits",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          edits: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: { oldText: { type: "string" }, newText: { type: "string" } },
+              required: ["oldText", "newText"],
+            },
+          },
+        },
+        required: ["path", "edits"],
+      },
     },
     {
       name: "read",
@@ -103,6 +129,14 @@ test("formatCompactToolSchemas prioritizes core builtins and groups namespaced s
   const text = formatCompactToolSchemas(tools, "pi-bridge");
   assert.ok(text.includes('Server "pi-bridge":'));
   assert.ok(text.includes("- read(path: string, offset?: number): Read file contents"));
+  assert.ok(
+    text.includes(
+      "- edit(path: string, edits: { oldText: string, newText: string }[]): Make precise file edits",
+    ),
+  );
+  assert.ok(
+    text.includes('- subagent(prompt: string, workflow?: "single"|"parallel"): Launch a child agent'),
+  );
   assert.ok(text.includes('Server "pi-bridge-linear":'));
   assert.ok(text.includes("- get_issue(id: string): Fetch a Linear issue"));
   assert.ok(text.indexOf("- read(") < text.indexOf("- subagent("));

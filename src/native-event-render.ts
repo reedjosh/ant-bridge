@@ -230,7 +230,7 @@ export function formatNativeEventLines(
 		}
 	}
 
-	if (outputLines.length > 0 && (diffLines.length === 0 || event?.status === "failed")) {
+	if (outputLines.length > 0 && event?.status === "failed") {
 		if (outputLines.length > PREVIEW_LINES) {
 			lines.push(
 				formatExpandHint(outputLines.length - PREVIEW_LINES, "earlier", options, theme),

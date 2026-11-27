@@ -20,7 +20,7 @@ const {
 } = await importBridgeModule("src/provider.ts");
 const { entriesFromRaw, toPiModel } = await importBridgeModule("src/models.ts");
 const { SessionStore } = await importBridgeModule("src/sessions.ts");
-const { armBackgroundWatch, partitionRearmPlans, rearmPlansFromEntries } =
+const { armBackgroundWatch, buildTaskWakeContent, partitionRearmPlans, rearmPlansFromEntries } =
   await importBridgeModule("src/background-watch.ts");
 const { readDeliveredTaskIds } = await importBridgeModule("src/tasks.ts");
 
@@ -654,8 +654,14 @@ test("TOOL_PRIORITY_NOTE and PI_BRIDGE_INSTRUCTIONS are plain ASCII and cover MC
     "edit_file",
     "write_file",
     "run_command",
+    "WaitMsBeforeAsync: 10000",
+    "IsDaemon: true",
+    "manage_task",
     "subagent",
+    "define_subagent",
     "invoke_subagent",
+    "send_message",
+    "run_workflow",
     "STILL RUNNING",
     "20 seconds",
     "120 seconds",
@@ -675,4 +681,21 @@ test("TOOL_PRIORITY_NOTE and PI_BRIDGE_INSTRUCTIONS are plain ASCII and cover MC
 
   const full = buildFullPrompt("System rules.", "", "Hello");
   assert.ok(full.includes(TOOL_PRIORITY_NOTE));
+});
+
+test("buildTaskWakeContent collapses carriage-return progress spam and bounds tail lines", () => {
+  const dockerSpam = [
+    "696c1fe91c64: Downloading 10MB/237MB\r\r696c1fe91c64: Downloading 200MB/237MB\r\r696c1fe91c64: Download complete",
+    ...Array.from({ length: 25 }, (_, i) => `line-${i + 1}`),
+  ].join("\n");
+  const wake = buildTaskWakeContent(
+    [{ id: 433, logPath: "/tmp/task-433.log", tailText: dockerSpam }],
+    "settled",
+    10,
+  );
+  assert.doesNotMatch(wake, /Downloading 10MB/);
+  assert.doesNotMatch(wake, /Downloading 200MB/);
+  assert.match(wake, /\.\.\. \(earlier lines omitted\)/);
+  assert.match(wake, /line-25/);
+  assert.doesNotMatch(wake, /\bline-1\b/);
 });

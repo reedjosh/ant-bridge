@@ -28,6 +28,7 @@ import {
 	type AcpPermissionRequest,
 } from "./connection.js";
 import type { AcpPermissionHandler } from "./connection.js";
+import type { StageAcpHomeOptions } from "./home.js";
 import {
 	callMcpServerArg,
 	mapStopReason,
@@ -58,7 +59,9 @@ export interface AcpDriverOptions {
 	/** Extra argv (production: ["acp"]; tests: fake-server script). */
 	binArgs?: string[] | (() => string[]);
 	/** Native agy only: isolate inherited global MCP from other pi sessions. */
-	isolateHome?: boolean;
+	isolateHome?: boolean | StageAcpHomeOptions | (() => boolean | StageAcpHomeOptions);
+	/** Optional custom agent name passed via `--agent <name>`. */
+	agent?: string | (() => string | undefined);
 	extraEnv?: Record<string, string>;
 	/** Bridge registration for session/new AND session/load. */
 	mcpServers?: () => AcpMcpServer[];
@@ -760,6 +763,7 @@ export class AcpDriver implements TurnDriver {
 			bin: typeof this.#opts.bin === "function" ? this.#opts.bin() : this.#opts.bin,
 			binArgs: typeof this.#opts.binArgs === "function" ? this.#opts.binArgs() : this.#opts.binArgs,
 			isolateHome: this.#opts.isolateHome,
+			agent: this.#opts.agent,
 			extraEnv: this.#opts.extraEnv,
 			cwd: request.cwd,
 			mcpServers: this.#opts.mcpServers,

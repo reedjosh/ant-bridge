@@ -286,6 +286,7 @@ test("/agy getArgumentCompletions completes subcommands, arguments, and pi.getAl
       "permissions",
       "permission-mode",
       "bridge",
+      "tool-mode",
       "tools",
       "usage",
       "digest",
@@ -312,6 +313,7 @@ test("/agy getArgumentCompletions completes subcommands, arguments, and pi.getAl
       "permission-mode deny",
     ]);
     assert.deepEqual(valuesOf("bridge "), ["bridge all", "bridge mcp", "bridge none"]);
+    assert.deepEqual(valuesOf("tool-mode "), ["tool-mode hybrid", "tool-mode pi-only"]);
     assert.deepEqual(valuesOf("usage "), ["usage estimate", "usage direct", "usage off"]);
     assert.deepEqual(valuesOf("digest "), ["digest on", "digest off"]);
     assert.deepEqual(valuesOf("system-prompt "), ["system-prompt on", "system-prompt off"]);

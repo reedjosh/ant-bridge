@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import type { BridgeTools } from "./config.js";
+import type { BridgeTools, ToolMode } from "./config.js";
 
 export const PI_BRIDGE_SERVER_PREFIX = "pi-bridge";
 export const PI_BRIDGE_SERVER_RE = /^pi-bridge(?:-[a-zA-Z0-9-]+)?$/;
@@ -96,6 +96,7 @@ export function bridgedPiTools(
 	active: readonly string[],
 	mode: BridgeTools,
 	hidden: ReadonlySet<string>,
+	toolMode: ToolMode = "hybrid",
 ): BridgeToolInfo[] {
 	if (mode === "none") return [];
 	const enabled = new Set(active);
@@ -104,7 +105,7 @@ export function bridgedPiTools(
 			enabled.has(tool.name) &&
 			!hidden.has(tool.name) &&
 			!SELF_TOOLS.has(tool.name) &&
-			(mode === "mcp" ? isMcpBridgeTool(tool) : !isCoreBuiltin(tool)),
+			(mode === "mcp" ? isMcpBridgeTool(tool) : toolMode === "pi-only" || !isCoreBuiltin(tool)),
 	);
 }
 
@@ -113,16 +114,102 @@ export function bridgedPiTools(
 export function bridgedTranscriptTools(
 	tools: BridgeToolInfo[],
 	mode: BridgeTools,
+	toolMode: ToolMode = "hybrid",
 ): BridgeToolInfo[] {
 	if (mode === "none") return [];
 	return tools.filter(
 		(tool) =>
 			!SELF_TOOLS.has(tool.name) &&
-			!CORE_BUILTIN_TOOLS.has(tool.name) &&
+			(toolMode === "pi-only" || !CORE_BUILTIN_TOOLS.has(tool.name)) &&
 			(mode === "mcp"
 				? MCP_BRIDGE_TOOL_RE.test(tool.name) || TRANSCRIPT_MCP_HELPER_TOOLS.has(tool.name)
 				: true),
 	);
+}
+
+function summarizeSchemaParams(parameters: object | undefined): string {
+	const schema = parameters as
+		| { properties?: Record<string, { type?: unknown }>; required?: unknown }
+		| undefined;
+	const props = schema?.properties;
+	if (!props || typeof props !== "object") return "";
+	const reqSet = new Set(
+		Array.isArray(schema.required)
+			? schema.required.filter((r): r is string => typeof r === "string")
+			: [],
+	);
+	const parts: string[] = [];
+	for (const [key, def] of Object.entries(props)) {
+		const rawType = def && typeof def === "object" ? def.type : undefined;
+		const typeStr =
+			typeof rawType === "string"
+				? rawType
+				: Array.isArray(rawType)
+					? rawType.filter((t): t is string => typeof t === "string").join("|")
+					: "any";
+		parts.push(`${key}${reqSet.has(key) ? "" : "?"}: ${typeStr}`);
+	}
+	return parts.join(", ");
+}
+
+function oneLineSummary(desc: string | undefined, maxLen = 100): string {
+	if (!desc) return "";
+	const first = desc.replace(/\s+/g, " ").trim();
+	if (first.length <= maxLen) return first;
+	return `${first.slice(0, maxLen - 3).trimEnd()}...`;
+}
+
+/** Format a compact parameter reference for bridged Pi tools grouped by MCP server.
+ *  Used in `pi-only` mode so the model can invoke `call_mcp_tool` on turn 1 without
+ *  needing to read schema files from disk first. */
+export function formatCompactToolSchemas(
+	tools: BridgeToolInfo[],
+	serverPrefix: string = PI_BRIDGE_SERVER_PREFIX,
+	maxChars = 6_000,
+): string {
+	const { coreTools, namespaces } = partitionBridgeTools(tools, serverPrefix);
+	const lines: string[] = [
+		"Call tools with call_mcp_tool({ ServerName, ToolName, Arguments }).",
+	];
+	let used = lines[0]!.length;
+
+	const pushLine = (line: string): boolean => {
+		if (used + line.length + 1 > maxChars) return false;
+		lines.push(line);
+		used += line.length + 1;
+		return true;
+	};
+
+	const formatEntry = (name: string, tool: BridgeToolInfo): string => {
+		const params = summarizeSchemaParams(tool.parameters);
+		const summary = oneLineSummary(tool.description);
+		return summary ? `  - ${name}(${params}): ${summary}` : `  - ${name}(${params})`;
+	};
+
+	// Prioritize core workspace builtins first so read/edit/write/bash never get truncated.
+	const orderedCore = [
+		...coreTools.filter((t) => CORE_BUILTIN_TOOLS.has(t.name)),
+		...coreTools.filter((t) => !CORE_BUILTIN_TOOLS.has(t.name)),
+	];
+	if (orderedCore.length > 0 || true) {
+		pushLine(`Server "${serverPrefix}":`);
+		for (const tool of orderedCore) {
+			if (!pushLine(formatEntry(tool.name, tool))) break;
+		}
+		pushLine(
+			"  - bridge_poll_result(callId: string): Fetch result of a STILL RUNNING bridged tool call",
+		);
+		pushLine("  - activate_skill(name: string): Load instructions for an available Pi skill");
+	}
+
+	for (const ns of namespaces) {
+		if (!pushLine(`Server "${ns.serverName}":`)) break;
+		for (const item of ns.tools) {
+			if (!pushLine(formatEntry(item.exposedName, item.tool))) break;
+		}
+	}
+
+	return lines.join("\n");
 }
 
 /** Parse a `mcp__<namespace>__<tool>` Pi tool name into its bridge route and server identifiers. */

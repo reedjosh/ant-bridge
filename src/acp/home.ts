@@ -115,11 +115,50 @@ export function acpHomeStagingDir(baseDir: string = bridgeStateDir()): string {
 	return path.join(baseDir, "acp-homes");
 }
 
+export const PI_ONLY_AGENT_NAME = "pi-bridge";
+
+/** Build the custom agent definition used in `pi-only` tool mode (`tools: []`, `inheritMcp: true`).
+ *  MCP servers registered in the staged `config/mcp_config.json` are exposed via `call_mcp_tool`
+ *  while all native `agy` file/shell/subagent/schedule/question tools are withheld. */
+export function buildPiOnlyAgentMarkdown(schemaSummary?: string): string {
+	const lines = [
+		"---",
+		`name: ${PI_ONLY_AGENT_NAME}`,
+		"description: Calls only the tools Pi serves over MCP",
+		"mainAgent: true",
+		"subagent: false",
+		"tools: []",
+		"inheritMcp: true",
+		"---",
+		"Use call_mcp_tool to run every workspace, shell, extension, MCP, subagent, and skill action through Pi.",
+		"Never call manage_task. If a bridged call returns STILL RUNNING with a callId, poll bridge_poll_result until it settles.",
+	];
+	if (schemaSummary && schemaSummary.trim().length > 0) {
+		lines.push("", schemaSummary.trim());
+	}
+	lines.push("");
+	return lines.join("\n");
+}
+
+export interface StagedMcpServerEntry {
+	url: string;
+	headers?: Record<string, string>;
+}
+
 export interface StageAcpHomeOptions {
 	geminiHome?: string;
 	parentDir?: string;
 	stagingDir?: string;
+	/** Stage under `<baseDir>/acp-homes/acp-home-<pid>-<seq>/` so concurrent sessions do not
+	 *  collide on `config/mcp_config.json` or `config/agents/`. */
+	perSession?: boolean;
+	/** Additional MCP server entries to write into the staged `config/mcp_config.json`. */
+	extraMcpServers?: Record<string, StagedMcpServerEntry>;
+	/** Optional custom agent markdown file to write under `<staged>/config/agents/<name>.md`. */
+	agentDefinition?: { name: string; content: string };
 }
+
+let sessionHomeSeq = 0;
 
 /** Isolate `agy acp` from any stale `pi-bridge*` entries in ~/.gemini/config/mcp_config.json
  *  while linking ~/.gemini/antigravity-cli so OAuth credentials, brain conversations, and
@@ -138,12 +177,19 @@ export function stageAcpHome(opts: StageAcpHomeOptions = {}): string {
 		}
 	}
 	const servers = record(config.mcpServers ?? {}, `${globalMcpPath} mcpServers`);
-	const filtered = Object.fromEntries(
+	const filtered: Record<string, unknown> = Object.fromEntries(
 		Object.entries(servers).filter(([name]) => !PI_BRIDGE_SERVER_RE.test(name)),
 	);
+	if (opts.extraMcpServers) {
+		for (const [name, entry] of Object.entries(opts.extraMcpServers)) {
+			filtered[name] = entry;
+		}
+	}
 
 	const baseDir = opts.parentDir ?? opts.stagingDir ?? bridgeStateDir();
-	const staged = acpHomeDir(baseDir);
+	const staged = opts.perSession
+		? path.join(acpHomeStagingDir(baseDir), `acp-home-${process.pid}-${++sessionHomeSeq}`)
+		: acpHomeDir(baseDir);
 	const stagedConfigDir = path.join(staged, "config");
 	fs.mkdirSync(staged, { recursive: true, mode: 0o700 });
 	fs.mkdirSync(stagedConfigDir, { recursive: true, mode: 0o700 });
@@ -180,9 +226,22 @@ export function stageAcpHome(opts: StageAcpHomeOptions = {}): string {
 	}
 
 	const keepConfigEntries = new Set<string>(["mcp_config.json"]);
+	if (opts.agentDefinition) {
+		const agentsDir = path.join(stagedConfigDir, "agents");
+		removeEntry(agentsDir);
+		fs.mkdirSync(agentsDir, { recursive: true, mode: 0o700 });
+		if (process.platform !== "win32") fs.chmodSync(agentsDir, 0o700);
+		writeFileAtomic(
+			path.join(agentsDir, `${opts.agentDefinition.name}.md`),
+			opts.agentDefinition.content,
+			0o600,
+		);
+		keepConfigEntries.add("agents");
+	}
 	if (fs.existsSync(globalConfigDir)) {
 		for (const entry of fs.readdirSync(globalConfigDir, { withFileTypes: true })) {
 			if (entry.name === "mcp_config.json") continue;
+			if (opts.agentDefinition && entry.name === "agents") continue;
 			const source = path.join(globalConfigDir, entry.name);
 			const target = path.join(stagedConfigDir, entry.name);
 			let stat: fs.Stats | fs.Dirent = entry;

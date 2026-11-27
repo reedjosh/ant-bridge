@@ -96,6 +96,7 @@ Run `/agy` in Pi to open the settings picker (or print status in non-TUI mode), 
 | `/agy` | Open settings (`bridgeTools`, timeouts, permission mode, usage estimate, digest). |
 | `/agy doctor` | Check the `agy` version, bound conversation, driver stats, and bridge server status. |
 | `/agy bridge all\|mcp\|none` | Change bridged tool scope live. Switching from `none` starts the bridge without `/reload`. |
+| `/agy tool-mode hybrid\|pi-only` | Choose `hybrid` (`agy` native workspace tools + Pi MCP, default) or `pi-only` (disable `agy` native tools and route every tool through Pi). |
 | `/agy tools [hide\|show <name>\|reset]` | Inspect or toggle which Pi tools are bridged, with tab completion. |
 | `/agy tasks [tail <id>]` | Browse background task logs (`Enter` tails 40 lines, `r` rescans), with tab completion on task IDs. |
 | `/agy artifacts [open <n\|name>]` | Browse or open conversation artifacts, with tab completion on filenames. |

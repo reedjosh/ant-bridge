@@ -14,12 +14,13 @@
 //   - mcpServers entries: {name, type:"http", url, headers:[]} — headers is a
 //     LIST; a dead URL is accepted at session time (lazy connect)
 
+import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { frameCarriesUsage, mapUpdate } from "./events.js";
 import type { AgyUsage } from "../driver-types.js";
 import { redactText } from "../redact.js";
 import { JsonRpcResponseError, JsonRpcSession } from "./jsonrpc.js";
-import { stageAcpHome, type StageAcpHomeOptions } from "./home.js";
+import { removeStagedAcpHome, stageAcpHome, type StageAcpHomeOptions } from "./home.js";
 
 export interface AcpMcpServer {
 	name: string;
@@ -49,7 +50,9 @@ export interface AcpConnectionOptions {
 	bin: string;
 	binArgs?: string[];
 	/** Native agy only: filter per-pid bridges out of inherited global MCP. */
-	isolateHome?: boolean | StageAcpHomeOptions;
+	isolateHome?: boolean | StageAcpHomeOptions | (() => boolean | StageAcpHomeOptions);
+	/** Optional custom agent name passed via `--agent <name>`. */
+	agent?: string | (() => string | undefined);
 	extraEnv?: Record<string, string>;
 	log: (msg: string, data?: unknown) => void;
 	/** Verified `session/update` payloads (post-suppression). */
@@ -172,9 +175,18 @@ export class AcpConnection {
 	async start(): Promise<void> {
 		if (this.#child) return;
 		const args = [...(this.#opts.binArgs ?? [])];
-		if (this.#opts.isolateHome) {
-			this.#stagedHome = stageAcpHome(typeof this.#opts.isolateHome === "object" ? this.#opts.isolateHome : {});
+		const isolate =
+			typeof this.#opts.isolateHome === "function"
+				? this.#opts.isolateHome()
+				: this.#opts.isolateHome;
+		if (isolate) {
+			this.#stagedHome = stageAcpHome(typeof isolate === "object" ? isolate : {});
 			args.push("--gemini-dir", this.#stagedHome);
+		}
+		const agent =
+			typeof this.#opts.agent === "function" ? this.#opts.agent() : this.#opts.agent;
+		if (agent) {
+			args.push("--agent", agent);
 		}
 		let child: ChildProcess;
 		try {
@@ -566,8 +578,13 @@ export class AcpConnection {
 	}
 
 	#releaseHome(): void {
-		// Persistent acp-home survives teardown so artifact/transcript file:// links stay valid.
+		// Remove per-session staged dirs on teardown; persistent acp-home survives so
+		// artifact/transcript file:// links stay valid.
+		const staged = this.#stagedHome;
 		this.#stagedHome = undefined;
+		if (staged && path.basename(staged).startsWith("acp-home-")) {
+			removeStagedAcpHome(staged);
+		}
 	}
 }
 

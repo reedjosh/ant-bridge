@@ -19,6 +19,7 @@ export function logsDir(): string {
 
 export type AgyMode = "accept-edits" | "plan";
 export type BridgeTools = "none" | "mcp" | "all";
+export type ToolMode = "hybrid" | "pi-only";
 export type UsageEstimate = "estimate" | "direct" | "off";
 export type PermissionMode = "ask" | "allow" | "deny";
 
@@ -38,6 +39,9 @@ export interface AgyConfig {
 	permissionMode: PermissionMode;
 	/** Which Pi tools the MCP bridge exposes to `agy acp`: "all" (default), "mcp", or "none". */
 	bridgeTools: BridgeTools;
+	/** Tool execution mode: "hybrid" (agy native file/shell + Pi MCP, default) or "pi-only"
+	 *  (disable agy native tools via custom agent and route all tools through Pi over MCP). */
+	toolMode: ToolMode;
 	/** Extra Pi tool names that get the 120s synchronous window before STILL RUNNING escalation. */
 	escalateLongTools: string[];
 	/** Inject a delta digest of non-Antigravity Pi context into each prompt (default false). */
@@ -57,6 +61,7 @@ const DEFAULTS: AgyConfig = {
 	skipPermissions: true,
 	permissionMode: "ask",
 	bridgeTools: "all",
+	toolMode: "hybrid",
 	escalateLongTools: [],
 	digest: false,
 	systemPrompt: true,
@@ -151,6 +156,11 @@ export function loadConfig(filePath: string = configPath()): AgyConfig {
 			? bridgeRaw
 			: DEFAULTS.bridgeTools;
 
+	const toolModeRaw = String(
+		process.env.AGY_TOOL_MODE ?? file.toolMode ?? DEFAULTS.toolMode,
+	).toLowerCase();
+	const toolMode: ToolMode = toolModeRaw === "pi-only" ? "pi-only" : "hybrid";
+
 	const escalateLongTools = normalizeLongTools(
 		process.env.AGY_ESCALATE_LONG_TOOLS ?? file.escalateLongTools,
 	);
@@ -190,6 +200,7 @@ export function loadConfig(filePath: string = configPath()): AgyConfig {
 		skipPermissions,
 		permissionMode,
 		bridgeTools,
+		toolMode,
 		escalateLongTools,
 		digest,
 		systemPrompt,
@@ -244,6 +255,7 @@ export function saveConfig(
 		skipPermissions: patch.skipPermissions ?? file.skipPermissions ?? DEFAULTS.skipPermissions,
 		permissionMode: rawPerm === "allow" || rawPerm === "deny" ? rawPerm : "ask",
 		bridgeTools: patch.bridgeTools ?? file.bridgeTools ?? DEFAULTS.bridgeTools,
+		toolMode: (patch.toolMode ?? file.toolMode) === "pi-only" ? "pi-only" : "hybrid",
 		escalateLongTools: normalizeLongTools(patch.escalateLongTools ?? file.escalateLongTools),
 		digest: patch.digest ?? file.digest ?? DEFAULTS.digest,
 		systemPrompt: patch.systemPrompt ?? file.systemPrompt ?? DEFAULTS.systemPrompt,

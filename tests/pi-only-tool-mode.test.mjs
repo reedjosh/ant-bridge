@@ -187,7 +187,7 @@ test("stageAcpHome supports perSession isolation with extraMcpServers and pi-onl
       path.join(staged, "config", "agents", `${PI_ONLY_AGENT_NAME}.md`),
       "utf8",
     );
-    assert.ok(stagedAgent.includes("tools: []"));
+    assert.ok(stagedAgent.includes("tools: [read_file]"));
     assert.ok(stagedAgent.includes("inheritMcp: true"));
     assert.ok(stagedAgent.includes("- read(path: string)"));
     assert.equal(fs.existsSync(path.join(staged, "config", "agents", "other.md")), false);

@@ -11,6 +11,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { bridgeStateDir } from "./agy-paths.js";
+import type { ToolMode } from "./config.js";
 import { isPidAlive } from "./mcp-server.js";
 
 let tmpSeq = 0;
@@ -43,6 +44,10 @@ export interface AgySession {
 	 *  appears), signaling provider.ts to start a fresh ACP session seeded with
 	 *  the compacted summary instead of resuming the uncompacted ACP session. */
 	compactionHash?: string;
+	/** Tool execution mode (`hybrid` or `pi-only`) active when this conversation
+	 *  was created. Because `agy` pins a conversation's toolset at creation, a
+	 *  mismatch tells provider.ts to start a fresh seeded conversation. */
+	toolMode?: ToolMode;
 }
 
 type StoreMap = Record<string, AgySession>;
@@ -62,10 +67,12 @@ function narrowStoreMap(parsed: unknown): StoreMap {
 		if (typeof conversationId !== "string") continue;
 		const mc = (value as { lastMessageCount?: unknown }).lastMessageCount;
 		const ch = (value as { compactionHash?: unknown }).compactionHash;
+		const tm = (value as { toolMode?: unknown }).toolMode;
 		clean[key] = {
 			conversationId,
 			lastMessageCount: typeof mc === "number" && Number.isFinite(mc) ? mc : 0,
 			...(typeof ch === "string" && ch.length > 0 ? { compactionHash: ch } : {}),
+			...(tm === "hybrid" || tm === "pi-only" ? { toolMode: tm } : {}),
 		};
 	}
 	return clean;
@@ -152,6 +159,7 @@ export class SessionStore {
 			conversationId: s.conversationId,
 			lastMessageCount: s.lastMessageCount ?? 0,
 			...(s.compactionHash ? { compactionHash: s.compactionHash } : {}),
+			...(s.toolMode === "hybrid" || s.toolMode === "pi-only" ? { toolMode: s.toolMode } : {}),
 		};
 	}
 
@@ -160,10 +168,12 @@ export class SessionStore {
 	set(key: string, session: AgySession): void {
 		const mc = session.lastMessageCount;
 		const ch = session.compactionHash;
+		const tm = session.toolMode;
 		this.cache[key] = {
 			conversationId: session.conversationId,
 			lastMessageCount: typeof mc === "number" && Number.isFinite(mc) ? mc : 0,
 			...(typeof ch === "string" && ch.length > 0 ? { compactionHash: ch } : {}),
+			...(tm === "hybrid" || tm === "pi-only" ? { toolMode: tm } : {}),
 		};
 		this.dirty.add(key);
 		this.removed.delete(key);

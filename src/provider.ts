@@ -234,18 +234,23 @@ export const TOOL_PRIORITY_NOTE: string = [
 ].join(" ");
 
 export const PI_ONLY_TOOL_PRIORITY_NOTE: string = [
-	"[Tool priority (pi-only mode): this conversation runs inside pi with all native agy file, shell,",
-	"subagent, schedule, and question tools disabled. Use call_mcp_tool({ ServerName, ToolName, Arguments })",
-	"for every workspace, shell, extension, MCP, subagent, and skill call through Pi Bridge (`pi-bridge` and",
-	"`pi-bridge-<server>`). Never call native manage_task. For user questions use Pi's ask_user_question if",
-	"available; otherwise ask in plain text and end your turn. Servers marked (codemode) in Pi's <mcp_servers>",
-	"section are reached through call_mcp_tool on `pi-bridge` with ToolName `codemode` (searchTools /",
-	"describeNamespace); inside codemode scripts, extract readable text from { content, structuredContent }",
-	"results and emit formatted multi-line text via text(...) rather than raw JSON. Keep subagent launches",
-	"asynchronous (async: true, the default) and end your turn without calling bg_wait or polling; Pi wakes",
-	"the session when subagents finish. Long-running bridge calls do not fail: after ~20 seconds (120 seconds",
-	"for bash, powershell, subagent, and codemode calls) the bridge answers STILL RUNNING with a callId; fetch",
-	"the result with call_mcp_tool(pi-bridge, bridge_poll_result, { callId }) until it lands.]",
+	"[Tool priority (pi-only mode): this conversation runs inside pi with native agy write, edit,",
+	"shell, subagent, schedule, and question tools disabled. Use call_mcp_tool({ ServerName,",
+	"ToolName, Arguments }) for workspace text/code reads, edits, writes, shell commands, extensions,",
+	"MCP tools, subagents, and skills through Pi Bridge (`pi-bridge` and `pi-bridge-<server>`).",
+	"Native read_file is kept ONLY for viewing image files (PNG, JPEG, WebP, GIF, screenshots) or",
+	".system_generated/ files that agy offloaded from a call_mcp_tool response (such as media_0.*",
+	"or output.txt); do not use read_file for ordinary workspace source files. Never call native",
+	"manage_task. For user questions use Pi's ask_user_question if available; otherwise ask in plain",
+	"text and end your turn. Servers marked (codemode) in Pi's <mcp_servers> section are reached",
+	"through call_mcp_tool on `pi-bridge` with ToolName `codemode` (searchTools / describeNamespace);",
+	"inside codemode scripts, extract readable text from { content, structuredContent } results and",
+	"emit formatted multi-line text via text(...) rather than raw JSON. Keep subagent launches",
+	"asynchronous (async: true, the default) and end your turn without calling bg_wait or polling;",
+	"Pi wakes the session when subagents finish. Long-running bridge calls do not fail: after ~20",
+	"seconds (120 seconds for bash, powershell, subagent, and codemode calls) the bridge answers",
+	"STILL RUNNING with a callId; fetch the result with call_mcp_tool(pi-bridge, bridge_poll_result,",
+	"{ callId }) until it lands.]",
 ].join(" ");
 
 export const SUMMARIZATION_NO_TOOLS_NOTE = [
@@ -1320,6 +1325,10 @@ async function runTurnDriver(
 			currentCompactionHash &&
 			currentCompactionHash !== rawExisting.compactionHash,
 	);
+	const storedToolMode = rawExisting?.toolMode ?? "hybrid";
+	const resetForToolMode = Boolean(
+		!isContinuation && rawExisting?.conversationId && storedToolMode !== config.toolMode,
+	);
 	if (resetForCompaction) {
 		store.delete(key);
 		deps.log?.(
@@ -1330,8 +1339,19 @@ async function runTurnDriver(
 			},
 			"info",
 		);
+	} else if (resetForToolMode) {
+		store.delete(key);
+		deps.log?.(
+			"session-reset-tool-mode",
+			{
+				previousConversation: rawExisting?.conversationId,
+				previousToolMode: storedToolMode,
+				toolMode: config.toolMode,
+			},
+			"info",
+		);
 	}
-	const existing = resetForCompaction ? null : rawExisting;
+	const existing = resetForCompaction || resetForToolMode ? null : rawExisting;
 	const escalatedNames = results
 		.map((r) => deps.roundTrips.poll(r.toolCallId)?.name)
 		.filter((n): n is string => Boolean(n));
@@ -1529,6 +1549,7 @@ async function runTurnDriver(
 					conversationId: parkedConv,
 					lastMessageCount: messageCount,
 					...(currentCompactionHash ? { compactionHash: currentCompactionHash } : {}),
+					...(config.toolMode === "pi-only" ? { toolMode: "pi-only" } : {}),
 				});
 			}
 		}
@@ -1588,9 +1609,10 @@ async function runTurnDriver(
 		}
 	}
 
-	// Reentry still uses the old ACP context. Leave its summary hash unchanged
-	// so the next fresh prompt rotates instead of skipping the compacted seed.
+	// Reentry still uses the old ACP context. Leave its summary hash and toolMode
+	// unchanged so the next fresh prompt rotates instead of skipping the seed.
 	const deliveredCompactionHash = active ? existing?.compactionHash : currentCompactionHash;
+	const deliveredToolMode = active ? (existing?.toolMode ?? config.toolMode) : config.toolMode;
 	if (outcome.pendingNativeQuestion) {
 		store.delete(key);
 		deps.log?.("session-unbound-native-question", { conversation: outcome.conversationId }, "warn");
@@ -1602,6 +1624,7 @@ async function runTurnDriver(
 				conversationId: outcome.conversationId,
 				lastMessageCount: messageCount,
 				...(deliveredCompactionHash ? { compactionHash: deliveredCompactionHash } : {}),
+				...(deliveredToolMode === "pi-only" ? { toolMode: "pi-only" } : {}),
 			});
 		}
 	}

@@ -11,50 +11,58 @@
 import {
 	createAssistantMessageEventStream,
 	getCurrentSystemPrompt,
-	getCurrentTools,
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
-	type JsonValue,
-	type Message,
 	type Model,
 	type SimpleStreamOptions,
 	type TranscriptContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
-import { createHash } from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { looksBackgroundNativeCall } from "./background-watch.js";
-import { CALL_PI_TOOL_NAME } from "./bridge-catalog.js";
-import { loadConfig, type ToolMode } from "./config.js";
-
-export { CALL_PI_TOOL_NAME };
-import { createExecGitOps, formatInlineDiff, TurnDiffContext } from "./diff-render.js";
 import {
-	toPiUsage,
-	type DriverActivity,
-	type DriverToolLocation,
-	type TurnDriver,
-	type TurnHandle,
-} from "./driver-types.js";
+	appendText,
+	appendThinking,
+	closeText,
+	closeThinking,
+	consumeActivity,
+	ensureStarted,
+	ensureTextOpen,
+	finalize,
+	type ActivityFeatures,
+	type BlockState,
+	type NativeDisplayEvent,
+} from "./activity-consumer.js";
+import { CALL_PI_TOOL_NAME } from "./bridge-catalog.js";
+import { loadConfig } from "./config.js";
+import { createExecGitOps, TurnDiffContext } from "./diff-render.js";
+import { toPiUsage, type TurnDriver, type TurnHandle } from "./driver-types.js";
 import { toAgyEffort, type AgyModelEntry } from "./models.js";
+import {
+	buildContextDigest,
+	buildFullPrompt,
+	buildLateResultPrompt,
+	DIGEST_PREAMBLE,
+	extractImages,
+	extractUserPrompt,
+	isObservationalMemoryContext,
+	isStandaloneSummarizationTurn,
+	latestCompactionHash,
+	RESUME_PROMPT,
+	SEED_DIGEST_PREAMBLE,
+	SUMMARIZATION_NO_TOOLS_NOTE,
+	SYSTEM_PROMPT_END,
+	SYSTEM_PROMPT_PREAMBLE,
+	trailingUserTurnStart,
+	type LateToolResult,
+} from "./prompt-builder.js";
 import { SessionStore } from "./sessions.js";
 import { SubagentRoster } from "./subagent-roster.js";
+import { collectToolResults, POLL_TOOL_NAME, ToolRoundTrips } from "./tool-roundtrips.js";
 
-/** Caller-scoped tool names declared by pi-observational-memory background workers. */
-export const OM_WORKER_TOOL_NAMES = new Set([
-	"record_observations",
-	"record_reflections",
-	"drop_observations",
-]);
-
-/** True when a turn belongs to a pi-observational-memory background worker. */
-export function isObservationalMemoryContext(context: TranscriptContext): boolean {
-	const currentTools = getCurrentTools(context.messages);
-	return currentTools.some((t) => OM_WORKER_TOOL_NAMES.has(t.name));
-}
+export { CALL_PI_TOOL_NAME };
+export * from "./activity-consumer.js";
+export * from "./prompt-builder.js";
+export * from "./tool-roundtrips.js";
 
 let warnedObservationalMemoryMismatch = false;
 
@@ -73,345 +81,6 @@ function zeroUsage(): Usage {
 	};
 }
 
-const COMPACTION_MARKER = "compacted into the following summary";
-const BRANCH_SUMMARY_MARKER = "summary of a branch that this conversation came back from";
-
-/** Find the start index of the current turn's contiguous trailing user-role messages
- *  (excluding compaction and branch summaries, and never crossing an already-delivered
- *  watermark). Extensions such as pr-tracker inject trailing custom_message entries
- *  (mapped to role="user" by Pi's convertToLlm) after the user's message; reading only
- *  messages[length - 1] would shadow the real user prompt. */
-export function trailingUserTurnStart(messages: Message[], watermark = 0): number {
-	const floor = watermark > 0 && watermark < messages.length ? Math.floor(watermark) : 0;
-	let start = messages.length;
-	for (let i = messages.length - 1; i >= floor; i--) {
-		const m = messages[i];
-		if (!m || m.role !== "user") break;
-		const t = blocksToText(m.content);
-		if (t.includes(COMPACTION_MARKER) || t.includes(BRANCH_SUMMARY_MARKER)) break;
-		start = i;
-	}
-	return start;
-}
-
-/** Extract the current turn's user message(s) as a flat prompt string. */
-export function extractUserPrompt(context: TranscriptContext, watermark = 0): string | null {
-	const start = trailingUserTurnStart(context.messages, watermark);
-	if (start >= context.messages.length) return null;
-	const parts: string[] = [];
-	for (let i = start; i < context.messages.length; i++) {
-		const content = context.messages[i].content;
-		const text =
-			typeof content === "string"
-				? content.trim()
-				: content
-						.filter((b): b is { type: "text"; text: string } => b.type === "text")
-						.map((b) => b.text)
-						.join("\n")
-						.trim();
-		if (text) parts.push(text);
-	}
-	return parts.length > 0 ? parts.join("\n\n") : null;
-}
-
-/** Extract image blocks across the current turn's trailing user message(s). */
-export function extractImages(
-	context: TranscriptContext,
-	watermark = 0,
-): Array<{ data: string; mimeType: string }> {
-	const start = trailingUserTurnStart(context.messages, watermark);
-	if (start >= context.messages.length) return [];
-	const images: Array<{ data: string; mimeType: string }> = [];
-	for (let i = start; i < context.messages.length; i++) {
-		const content = context.messages[i].content;
-		if (typeof content === "string") continue;
-		for (const b of content) {
-			if (b.type === "image") {
-				images.push({ data: b.data, mimeType: b.mimeType });
-			}
-		}
-	}
-	return images;
-}
-
-/** Synthetic prompt used when Pi retries after discarding a failed attempt. */
-export const RESUME_PROMPT =
-	"[The previous attempt of this turn failed and was discarded. Check your conversation history for the last step you completed, then continue the task from there. Do not repeat completed actions.]";
-
-export const DIGEST_PREAMBLE =
-	"[The following is context from the broader pi session that this Antigravity turn was not directly spawned for: compaction summaries and turns handled by other providers or pi's own tools. Your own prior turns are already in your conversation history. Use this for continuity only.]";
-
-export const SEED_DIGEST_PREAMBLE = [
-	"[The following is prior conversation history from the pi session before this fresh Antigravity",
-	"conversation started (for example after /fork or a mid-session provider switch): earlier user",
-	"messages, assistant turns, tool results, and any compaction summary. This fresh conversation",
-	"has no prior turns of its own; use this history for continuity.]",
-].join(" ");
-
-export const SYSTEM_PROMPT_PREAMBLE =
-	"[The following is the system prompt of the pi session that spawned this conversation: operating instructions plus project context (AGENTS.md files). Apply it for this whole conversation.]";
-
-export const SYSTEM_PROMPT_END = "[END SYSTEM PROMPT]";
-
-/** Concise MCP server instructions for `InitializeResult.instructions`
- *  (written by `agy` to `<appDataDir>/mcp/<serverName>/instructions.md`). */
-export const PI_BRIDGE_INSTRUCTIONS: string = [
-	"Pi Bridge exposes active Pi tools and direct MCP servers (`pi-bridge` and `pi-bridge-<server>`).",
-	"",
-	"- Eager tools register natively as `mcp_pi-bridge_<tool>` and `mcp_pi-bridge-<server>_<tool>`.",
-	"- `agy acp` drops schemas above ~1.48 KB (such as `subagent`, `codemode`, `activate_skill`, and",
-	"  larger MCP tools) from `Eager:` without registering `Lazy:` or `call_mcp_tool`, even though",
-	"  every tool's `<tool>.json` schema is written to `<appDataDir>/mcp/pi-bridge*/` on disk.",
-	"- To use any non-eager Pi or MCP tool, read `<appDataDir>/mcp/<serverName>/<tool>.json` for its",
-	"  parameters and invoke `mcp_pi-bridge_call_pi_tool` (or `mcp_pi-bridge-s*_call_pi_tool` in",
-	"  child sessions) with `{ name, arguments }` (for example `name: \"subagent\"`,",
-	"  `name: \"codemode\"`, or `name: \"pi-bridge-slack/slack_read_thread\"`).",
-	"- Launch `subagent` runs asynchronously (`async: true`, the default, especially for",
-	"  `workflow: \"parallel\"`) and end your turn immediately without calling `bg_wait` or polling:",
-	"  the main thread stays free for user chat while subagents run, and Pi wakes the session when",
-	"  they finish. Use `async: false` only when blocking the turn is explicitly required.",
-	"- Never run background tasks, daemons, or subagents natively inside Antigravity (no `run_command`",
-	"  with `IsDaemon: true`, low `WaitMsBeforeAsync`, or commands expected to exceed 10s; no",
-	"  `manage_task`, `define_subagent`, `invoke_subagent`, `run_subagent`, `manage_subagents`,",
-	"  `send_message`, `run_workflow`, `swarm`, or `schedule`). Keep `run_command` to quick",
-	"  synchronous commands (`WaitMsBeforeAsync: 10000`) and delegate any long-running, background,",
-	"  or parallel work (builds, test suites, pulls, watches) to Pi's `subagent` (`async: true`).",
-	"- If any bridged call answers `STILL RUNNING` with a `callId`, poll `bridge_poll_result` on",
-	"  `pi-bridge` until it settles before ending your turn.",
-	"- Inside `codemode` scripts, MCP tools resolve to `{ content, structuredContent, isError }`",
-	"  objects and `return <object>` renders as one escaped JSON line in Pi; extract readable text and",
-	"  emit formatted multi-line strings with `text(...)` instead of returning raw or nested JSON",
-	"  objects.",
-].join("\n");
-
-export const TOOL_PRIORITY_NOTE: string = [
-	"[Tool priority: this conversation runs inside pi, not as a standalone agy session; the user only",
-	"sees what surfaces in pi. NEVER call native ask_question: ACP cannot deliver answers to it,",
-	"so it blocks the conversation and replays the same question on later turns. For questions use",
-	"Pi's ask_user_question if available; otherwise ask in plain text and end your turn. When a Pi",
-	"Bridge tool covers the same purpose, always use it. Direct Pi MCP servers appear in agy's <mcp_servers> as",
-	"pi-bridge-<server> (mcp_pi-bridge-<server>_<tool> when eager); call eager tools directly so Pi",
-	"renders clean <server>/<tool> rows. Because agy acp omits schemas above ~1.48 KB (including",
-	"subagent, codemode, activate_skill, and larger MCP tools) without registering Lazy: or",
-	"call_mcp_tool, every tool's <tool>.json schema is still written under <appDataDir>/mcp/pi-bridge*/",
-	"on disk: read <appDataDir>/mcp/<serverName>/<tool>.json and invoke any non-eager tool via",
-	"mcp_pi-bridge_call_pi_tool (or mcp_pi-bridge-s*_call_pi_tool in child sessions) with",
-	"{ name, arguments }. Servers marked (codemode) in Pi's",
-	"<mcp_servers> section (such as Slack, Linear, Sentry, or Figma) do not appear as separate agy MCP",
-	"servers; reach them via mcp_pi-bridge_codemode (or mcp_pi-bridge_call_pi_tool with name",
-	"\"codemode\" when non-eager, using searchTools / describeNamespace) and never inspect local ~/.pi",
-	"MCP config files. When batching calls in codemode, extract readable text from",
-	"{ content, structuredContent } results and emit formatted multi-line text via text(...) rather",
-	"than returning raw or nested JSON objects. For workspace files and commands, your native",
-	"read_file, edit_file, write_file, and run_command tools operate directly on the real filesystem",
-	"and render in pi (including visible images on read_file). Use run_command ONLY for short",
-	"synchronous commands that finish within WaitMsBeforeAsync: 10000; NEVER run background tasks or",
-	"daemons natively in agy (no IsDaemon: true, no low WaitMsBeforeAsync like 500, no manage_task",
-	"polling, and never leave a detached task-* running across turns). For any long-running,",
-	"asynchronous, or parallel command or job (builds, npm ci, docker pull, full test suites, watches,",
-	"or multi-step work), delegate to a Pi subagent via mcp_pi-bridge_call_pi_tool with name",
-	"\"subagent\" (async: true) instead of backgrounding run_command in agy. When a bridge call answers STILL",
-	"RUNNING, poll bridge_poll_result before doing other work: until you poll, the result (including",
-	"any image) stays undelivered to you. Delegate subagent work through Pi Bridge: when pi's tool list",
-	"includes a delegation tool (for example subagent, Agent, agent_spawn, agent_wait, or",
-	"subagent_run), always delegate through it (directly or via mcp_pi-bridge_call_pi_tool with name",
-	"\"subagent\") and never through the native define_subagent, invoke_subagent, run_subagent,",
-	"manage_subagents, send_message, run_workflow, or swarm; native invoke_subagent and swarm",
-	"background workers run inside agy invisible to pi, lose",
-	"access to pi-bridge* tools as soon as the parent turn ends, and never wake pi on completion (even",
-	"if no pi delegation tool is listed, never leave native subagents running across turn boundaries or",
-	"expect them to call pi-bridge* tools). Keep subagent launches asynchronous (async: true, the",
-	"default, especially for parallel workflows) and return control immediately without calling",
-	"bg_wait or polling so the user can keep chatting on the main thread until pi natively wakes the",
-	"session on completion; pass async: false only when blocking is explicitly required. Never call",
-	"the native schedule tool and end your turn to",
-	"wait for a timer or cron: ending your turn closes the active pi prompt, so a later native schedule",
-	"wakeup runs with no active pi turn, drops its output, cannot call pi-bridge* tools, and races with",
-	"subsequent prompts; keep polling bounded inside the active turn or use Pi Bridge tools instead.",
-	"Long-running bridge calls do not fail: after ~20 seconds (120 seconds for subagent and codemode",
-	"calls) the bridge answers STILL RUNNING with a callId; fetch the result with bridge_poll_result",
-	"and poll until it lands.]",
-].join(" ");
-
-export const PI_ONLY_TOOL_PRIORITY_NOTE: string = [
-	"[Tool priority (pi-only mode): this conversation runs inside pi with native agy write, edit,",
-	"shell, subagent, schedule, and question tools disabled. Use call_mcp_tool({ ServerName,",
-	"ToolName, Arguments }) for workspace text/code reads, edits, writes, shell commands, extensions,",
-	"MCP tools, subagents, and skills through Pi Bridge (`pi-bridge` and `pi-bridge-<server>`).",
-	"Native read_file is kept ONLY for viewing image files (PNG, JPEG, WebP, GIF, screenshots) or",
-	".system_generated/ files that agy offloaded from a call_mcp_tool response (such as media_0.*",
-	"or output.txt); do not use read_file for ordinary workspace source files. Never call native",
-	"manage_task. For user questions use Pi's ask_user_question if available; otherwise ask in plain",
-	"text and end your turn. Servers marked (codemode) in Pi's <mcp_servers> section are reached",
-	"through call_mcp_tool on `pi-bridge` with ToolName `codemode` (searchTools / describeNamespace);",
-	"inside codemode scripts, extract readable text from { content, structuredContent } results and",
-	"emit formatted multi-line text via text(...) rather than raw JSON. Keep subagent launches",
-	"asynchronous (async: true, the default) and end your turn without calling bg_wait or polling;",
-	"Pi wakes the session when subagents finish. Long-running bridge calls do not fail: after ~20",
-	"seconds (120 seconds for bash, powershell, subagent, and codemode calls) the bridge answers",
-	"STILL RUNNING with a callId; fetch the result with call_mcp_tool(pi-bridge, bridge_poll_result,",
-	"{ callId }) until it lands.]",
-].join(" ");
-
-export const SUMMARIZATION_NO_TOOLS_NOTE = [
-	"[Summarization mode: summarize strictly from the provided <conversation> text. Do NOT call any",
-	"tools (no read_file, run_command, grep_search, MCP tools, or subagents); reply immediately with",
-	"the requested summary text only.]",
-].join(" ");
-
-/** True for Pi's standalone compaction and branch-summary calls
- *  (completeSummarization sets cacheRetention="none" with zero tools). */
-export function isStandaloneSummarizationTurn(
-	context: TranscriptContext,
-	options?: SimpleStreamOptions,
-): boolean {
-	if (getCurrentTools(context.messages).length > 0) return false;
-	const cacheRetention = (options as { cacheRetention?: string } | undefined)?.cacheRetention;
-	if (cacheRetention === "none") return true;
-	const sys = getCurrentSystemPrompt(context.messages);
-	return /\bcontext summarization assistant\b/i.test(sys);
-}
-
-/** Assemble the full prompt on fresh turns (system prompt block + optional digest + user prompt). */
-export function buildFullPrompt(
-	systemPrompt: string | undefined,
-	digest: string,
-	prompt: string,
-	toolMode: ToolMode = "hybrid",
-): string {
-	const parts: string[] = [];
-	const priorityNote = toolMode === "pi-only" ? PI_ONLY_TOOL_PRIORITY_NOTE : TOOL_PRIORITY_NOTE;
-	if (systemPrompt) {
-		parts.push(
-			`${SYSTEM_PROMPT_PREAMBLE}\n\n${systemPrompt}\n\n${priorityNote}\n\n${SYSTEM_PROMPT_END}`,
-		);
-	}
-	if (digest) {
-		parts.push(`${DIGEST_PREAMBLE}\n\n${digest}`);
-	}
-	if (prompt) {
-		parts.push(prompt);
-	}
-	return parts.join("\n\n---\n\n");
-}
-
-function blocksToText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.filter(
-			(b): b is { type: "text"; text: string } =>
-				typeof b === "object" && b !== null && (b as { type?: string }).type === "text",
-		)
-		.map((b) => b.text)
-		.join("\n");
-}
-
-function stripCompactionWrapping(t: string): string {
-	const open = t.indexOf("<summary>");
-	const close = t.lastIndexOf("</summary>");
-	if (open >= 0 && close > open) return t.slice(open + "<summary>".length, close).trim();
-	return t.trim();
-}
-
-/** Deterministic 16-hex-char SHA-256 tag of the latest Pi compaction summary in messages, if any. */
-export function latestCompactionHash(messages: Message[]): string | undefined {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const m = messages[i];
-		if (m.role !== "user") continue;
-		const t = blocksToText(m.content);
-		if (t.includes(COMPACTION_MARKER)) {
-			const summary = stripCompactionWrapping(t);
-			return createHash("sha256").update(summary).digest("hex").slice(0, 16);
-		}
-	}
-	return undefined;
-}
-
-export interface DigestOptions {
-	ownProvider?: string;
-	includeOwnAssistant?: boolean;
-	maxChars?: number;
-}
-
-/** Build a delta or seed digest of Pi-side context (compaction summary + prior turns). */
-export function buildContextDigest(
-	messages: Message[],
-	watermark: number,
-	opts: DigestOptions = {},
-): string {
-	const own = opts.ownProvider ?? "antigravity";
-	const includeOwn = opts.includeOwnAssistant === true || own === "";
-	const maxChars = opts.maxChars ?? 8000;
-	if (messages.length === 0) return "";
-
-	let summaryPart: string | null = null;
-	const deltaParts: string[] = [];
-
-	let lastCompactionIdx = -1;
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const m = messages[i];
-		if (m.role !== "user") continue;
-		const t = blocksToText(m.content);
-		if (t.includes(COMPACTION_MARKER)) {
-			lastCompactionIdx = i;
-			summaryPart = `[pi compaction summary]\n${stripCompactionWrapping(t)}`;
-			break;
-		}
-	}
-
-	const effectiveWatermark = watermark > messages.length ? 0 : Math.max(0, Math.floor(watermark));
-	let start = effectiveWatermark;
-	if (lastCompactionIdx >= 0) start = Math.max(start, lastCompactionIdx + 1);
-	const trailingStart = trailingUserTurnStart(messages, effectiveWatermark);
-	const end = trailingStart;
-	for (let i = start; i < end; i++) {
-		const m = messages[i];
-		if (m.role === "assistant") {
-			if (!includeOwn && m.provider === own) continue;
-			const t = blocksToText(m.content).trim();
-			if (!t) continue;
-			deltaParts.push(`[assistant turn from ${m.provider}]\n${t}`);
-		} else if (m.role === "user") {
-			const t = blocksToText(m.content);
-			if (t.includes(COMPACTION_MARKER)) continue;
-			if (!t.trim()) continue;
-			deltaParts.push(`[earlier user message]\n${t}`);
-		} else if (m.role === "toolResult") {
-			const t = blocksToText(m.content).trim();
-			deltaParts.push(
-				`[tool result: ${m.toolName}${m.isError ? " (error)" : ""}]\n${t || "(no text output)"}`,
-			);
-		}
-	}
-
-	const SEP = "\n\n";
-	const MARKER = "[truncated]";
-	let delta = deltaParts.join(SEP);
-	if (maxChars > 0) {
-		const budget = Math.max(0, maxChars - (summaryPart ? summaryPart.length + SEP.length : 0));
-		if (delta.length > budget) {
-			const kept: string[] = [];
-			let used = 0;
-			for (let i = deltaParts.length - 1; i >= 0; i--) {
-				const cost = deltaParts[i].length + (kept.length > 0 ? SEP.length : 0);
-				if (used + cost > budget) break;
-				kept.unshift(deltaParts[i]);
-				used += cost;
-			}
-			if (kept.length > 0) {
-				delta = `${MARKER}\n${kept.join(SEP)}`;
-			} else {
-				const room = Math.max(0, budget - MARKER.length - 1);
-				delta = room > 0 ? `${MARKER}\n${deltaParts[deltaParts.length - 1].slice(-room)}` : "";
-			}
-		}
-	}
-
-	return [summaryPart, delta]
-		.filter((s): s is string => typeof s === "string" && s.length > 0)
-		.join(SEP);
-}
 
 function newAssistant(model: Model<Api>): AssistantMessage {
 	return {
@@ -431,26 +100,6 @@ export function sessionKey(options: SimpleStreamOptions | undefined, cwd: string
 	const sid = (options as { sessionId?: string } | undefined)?.sessionId;
 	const base = sid && sid.length > 0 ? `sid:${sid}` : `cwd:${cwd}`;
 	return `${base}@acp`;
-}
-
-export interface BlockState {
-	partial: AssistantMessage;
-	textIdx: number | null;
-	thinkingIdx: number | null;
-	started: boolean;
-}
-
-export interface NativeDisplayEvent {
-	name: string;
-	mcpServer?: string;
-	toolCallId?: string;
-	status: "started" | "completed" | "failed";
-	callId?: string;
-	path?: string;
-	detail?: string;
-	command?: string;
-	output?: string;
-	diff?: string;
 }
 
 export interface StreamSimpleDeps {
@@ -473,433 +122,6 @@ export interface StreamSimpleDeps {
 	log?: (event: string, data?: unknown, level?: "debug" | "info" | "warn" | "error") => void;
 }
 
-const BRIDGE_TIMEOUT_MS = 480_000;
-const MAX_PARK_TOMBSTONES = 64;
-
-export interface BridgeContentBlock {
-	type: string;
-	text?: string;
-	data?: string;
-	mimeType?: string;
-}
-
-export interface BridgeCallResultShape {
-	content: BridgeContentBlock[];
-	isError: boolean;
-}
-
-export interface BridgeEscalation {
-	escalated: true;
-	callId: string;
-	name: string;
-}
-
-export const POLL_TOOL_NAME = "bridge_poll_result";
-export const ESCALATE_AFTER_MS = 20_000;
-export const DELEGATION_ESCALATE_MS = 120_000;
-export const ESCALATED_TIMEOUT_MS = 1_800_000;
-
-const DELEGATION_NAME_RE = /subagent|delegate|^agent(_|$)|^codemode$|^bash$|^powershell$/i;
-
-export function defaultEscalateAfterMs(
-	name: string,
-	extraLongNames: readonly string[] = [],
-): number {
-	return DELEGATION_NAME_RE.test(name) || extraLongNames.includes(name)
-		? DELEGATION_ESCALATE_MS
-		: ESCALATE_AFTER_MS;
-}
-
-export interface PollView {
-	state: "running" | "done" | "failed";
-	name: string;
-	text?: string;
-	isError?: boolean;
-	reason?: string;
-	images?: Array<{ data: string; mimeType: string }>;
-	delivered?: boolean;
-	conversationId?: string;
-}
-
-export class EscalationRegistry {
-	#calls = new Map<string, PollView>();
-
-	#trim(): void {
-		while (this.#calls.size > MAX_PARK_TOMBSTONES) {
-			const settled = [...this.#calls.entries()].filter(([, e]) => e.state !== "running");
-			const victim = (settled.find(([, e]) => e.delivered) ?? settled[0])?.[0];
-			if (victim === undefined) break;
-			this.#calls.delete(victim);
-		}
-	}
-
-	escalate(callId: string, name: string): void {
-		this.#calls.set(callId, { name, state: "running" });
-		this.#trim();
-	}
-
-	settleDone(
-		callId: string,
-		text: string,
-		isError: boolean,
-		images: Array<{ data: string; mimeType: string }> = [],
-	): void {
-		const e = this.#calls.get(callId);
-		if (!e) return;
-		e.state = "done";
-		e.text = text;
-		e.isError = isError;
-		if (images.length > 0) e.images = images;
-		this.#trim();
-	}
-
-	settleFailed(callId: string, reason: string): void {
-		const e = this.#calls.get(callId);
-		if (!e) return;
-		e.state = "failed";
-		e.reason = reason;
-		this.#trim();
-	}
-
-	poll(callId: string): PollView | undefined {
-		const e = this.#calls.get(callId);
-		return e ? { ...e } : undefined;
-	}
-
-	markDelivered(callId: string): boolean {
-		const e = this.#calls.get(callId);
-		if (!e || e.state === "running") return false;
-		e.delivered = true;
-		return true;
-	}
-
-	claimUndelivered(callId: string): (PollView & { callId: string }) | undefined {
-		const e = this.#calls.get(callId);
-		if (!e || e.state !== "done" || e.delivered) return undefined;
-		e.delivered = true;
-		return { ...e, callId };
-	}
-
-	claimAllUndelivered(): Array<PollView & { callId: string }> {
-		const out: Array<PollView & { callId: string }> = [];
-		for (const [callId, e] of this.#calls) {
-			if (e.state === "done" && !e.delivered) {
-				e.delivered = true;
-				out.push({ ...e, callId });
-			}
-		}
-		return out;
-	}
-
-	unclaim(callId: string): void {
-		const e = this.#calls.get(callId);
-		if (e && e.state === "done") e.delivered = false;
-	}
-
-	stampConversation(conversationId: string): void {
-		for (const e of this.#calls.values()) {
-			if (e.state === "running") e.conversationId ??= conversationId;
-		}
-	}
-}
-
-export function formatEscalatedAck(e: BridgeEscalation): BridgeCallResultShape {
-	return {
-		content: [
-			{
-				type: "text",
-				text: [
-					`STILL RUNNING: the pi tool "${e.name}" has not finished yet.`,
-					`Call ${POLL_TOOL_NAME} with callId "${e.callId}" to get the result. Poll again if it still reports running; you may do other work between polls.`,
-					"Do NOT end your turn while this call is unresolved: keep polling until it reports done or failed. Ending the turn strands the result.",
-				].join("\n"),
-			},
-		],
-		isError: false,
-	};
-}
-
-export function formatPollAnswer(
-	callId: string,
-	view: PollView | undefined,
-): BridgeCallResultShape {
-	if (!view) {
-		return {
-			content: [
-				{
-					type: "text",
-					text: `Error: no escalated bridge call "${callId}". It either finished within the first seconds (its result is in your original tool result) or the callId is wrong.`,
-				},
-			],
-			isError: true,
-		};
-	}
-	if (view.state === "running") {
-		return {
-			content: [
-				{
-					type: "text",
-					text: `STILL RUNNING: "${view.name}" (callId ${callId}) has not finished. Poll again later.`,
-				},
-			],
-			isError: false,
-		};
-	}
-	if (view.state === "failed") {
-		return {
-			content: [
-				{
-					type: "text",
-					text: `Error: bridge call "${view.name}" (callId ${callId}) failed: ${view.reason}`,
-				},
-			],
-			isError: true,
-		};
-	}
-	return {
-		content: [
-			...(view.images ?? []).map((i) => ({ type: "image", data: i.data, mimeType: i.mimeType })),
-			{ type: "text", text: view.text || "(no output)" },
-		],
-		isError: view.isError ?? false,
-	};
-}
-
-interface PendingRoundTrip {
-	name: string;
-	resolve: (r: BridgeCallResultShape | BridgeEscalation) => void;
-	reject: (e: Error) => void;
-	timer: NodeJS.Timeout;
-	escalated?: boolean;
-	escalateTimer?: NodeJS.Timeout;
-	onAbort: () => void;
-	signal: AbortSignal;
-}
-
-export class ToolRoundTrips {
-	#pending = new Map<string, PendingRoundTrip>();
-	#dead = new Map<string, { name: string; reason: string }>();
-	#escalations = new EscalationRegistry();
-	#escalateAfterMs: number | ((name: string) => number);
-	#getDriver: () => TurnDriver;
-	#log: (s: string, d?: unknown, level?: "debug" | "info" | "warn" | "error") => void;
-
-	constructor(
-		driver: TurnDriver | (() => TurnDriver),
-		log?: (s: string, d?: unknown, level?: "debug" | "info" | "warn" | "error") => void,
-		opts: { escalateAfterMs?: number | ((name: string) => number) } = {},
-	) {
-		this.#getDriver = typeof driver === "function" ? driver : () => driver;
-		this.#log = log ?? (() => {});
-		this.#escalateAfterMs = opts.escalateAfterMs ?? defaultEscalateAfterMs;
-	}
-
-	get pendingIds(): string[] {
-		return [...this.#pending.keys()];
-	}
-
-	get deadIds(): string[] {
-		return [...this.#dead.keys()];
-	}
-
-	consumeDead(toolCallId: string): { name: string; reason: string } | undefined {
-		const dead = this.#dead.get(toolCallId);
-		if (!dead) return undefined;
-		this.#dead.delete(toolCallId);
-		return dead;
-	}
-
-	poll(callId: string): PollView | undefined {
-		return this.#escalations.poll(callId);
-	}
-
-	markDelivered(callId: string): boolean {
-		return this.#escalations.markDelivered(callId);
-	}
-
-	claimUndelivered(callId: string): (PollView & { callId: string }) | undefined {
-		return this.#escalations.claimUndelivered(callId);
-	}
-
-	claimAllUndelivered(): Array<PollView & { callId: string }> {
-		return this.#escalations.claimAllUndelivered();
-	}
-
-	unclaim(callId: string): void {
-		this.#escalations.unclaim(callId);
-	}
-
-	stampConversation(conversationId: string): void {
-		this.#escalations.stampConversation(conversationId);
-	}
-
-	failAll(reason: string): void {
-		for (const id of [...this.#pending.keys()]) {
-			const entry = this.#pending.get(id);
-			if (entry?.escalated) continue;
-			this.#fail(id, reason);
-		}
-	}
-
-	#fail(callId: string, reason: string): void {
-		const entry = this.#pending.get(callId);
-		if (!entry) return;
-		this.#pending.delete(callId);
-		clearTimeout(entry.timer);
-		if (entry.escalateTimer) clearTimeout(entry.escalateTimer);
-		entry.signal.removeEventListener("abort", entry.onAbort);
-		this.#dead.set(callId, { name: entry.name, reason });
-		while (this.#dead.size > MAX_PARK_TOMBSTONES) {
-			const oldest = this.#dead.keys().next().value;
-			if (oldest === undefined) break;
-			this.#dead.delete(oldest);
-		}
-		if (entry.escalated) this.#escalations.settleFailed(callId, reason);
-		entry.reject(new Error(reason));
-		this.#getDriver().kickIdle();
-		this.#log("round-trip-fail", { callId, name: entry.name, reason });
-	}
-
-	onToolCall = (
-		callId: string,
-		name: string,
-		args: Record<string, unknown>,
-		signal: AbortSignal,
-	): Promise<BridgeCallResultShape | BridgeEscalation> => {
-		const handle = this.#getDriver().activeHandle;
-		if (!handle) {
-			return Promise.reject(
-				new Error(
-					"no active antigravity turn; the pi tool bridge only works while an antigravity model is streaming " +
-						"(parent turn already ended; background native agy subagents cannot call pi-bridge* tools)",
-				),
-			);
-		}
-		return new Promise<BridgeCallResultShape | BridgeEscalation>((resolve, reject) => {
-			const timer = setTimeout(() => {
-				this.#fail(callId, `pi tool round-trip timed out after ${BRIDGE_TIMEOUT_MS / 1000}s`);
-			}, BRIDGE_TIMEOUT_MS);
-			const onAbort = () => this.#fail(callId, "agy disconnected before the tool result arrived");
-			signal.addEventListener("abort", onAbort, { once: true });
-			const entry: PendingRoundTrip = { name, resolve, reject, timer, onAbort, signal };
-			const escalateAfterMs =
-				typeof this.#escalateAfterMs === "function"
-					? this.#escalateAfterMs(name)
-					: this.#escalateAfterMs;
-			if (escalateAfterMs > 0) {
-				entry.escalateTimer = setTimeout(() => {
-					const e = this.#pending.get(callId);
-					if (!e) return;
-					e.escalated = true;
-					clearTimeout(e.timer);
-					e.timer = setTimeout(() => {
-						this.#fail(
-							callId,
-							`escalated bridge call timed out after ${ESCALATED_TIMEOUT_MS / 60_000} minutes`,
-						);
-					}, ESCALATED_TIMEOUT_MS);
-					this.#escalations.escalate(callId, e.name);
-					resolve({ escalated: true, callId, name: e.name });
-				}, escalateAfterMs);
-			}
-			this.#pending.set(callId, entry);
-			handle.pushExternal({ type: "bridge_call", callId, name, args });
-		});
-	};
-
-	resolve(
-		toolCallId: string,
-		text: string,
-		isError: boolean,
-		images: Array<{ data: string; mimeType: string }> = [],
-	): boolean {
-		const entry = this.#pending.get(toolCallId);
-		if (!entry) return false;
-		this.#pending.delete(toolCallId);
-		clearTimeout(entry.timer);
-		if (entry.escalateTimer) clearTimeout(entry.escalateTimer);
-		entry.signal.removeEventListener("abort", entry.onAbort);
-		if (entry.escalated) {
-			this.#escalations.settleDone(toolCallId, text, isError, images);
-		} else {
-			entry.resolve({
-				content: [
-					...images.map((i) => ({ type: "image", data: i.data, mimeType: i.mimeType })),
-					{ type: "text", text },
-				],
-				isError,
-			});
-		}
-		this.#getDriver().kickIdle();
-		this.#log("round-trip-resolved", { callId: toolCallId, name: entry.name, isError });
-		return true;
-	}
-}
-
-function extractResultImages(content: unknown): Array<{ data: string; mimeType: string }> {
-	if (!Array.isArray(content)) return [];
-	return content
-		.filter(
-			(b): b is { type: "image"; data: string; mimeType: string } =>
-				typeof b === "object" && b !== null && (b as { type?: string }).type === "image",
-		)
-		.map((b) => ({ data: b.data, mimeType: b.mimeType }))
-		.filter((i) => typeof i.mimeType === "string" && typeof i.data === "string" && i.data.length > 0);
-}
-
-export function collectToolResults(
-	messages: Message[],
-	pendingIds: readonly string[],
-): Array<{
-	toolCallId: string;
-	text: string;
-	isError: boolean;
-	images: Array<{ data: string; mimeType: string }>;
-}> {
-	if (pendingIds.length === 0) return [];
-	const pending = new Set(pendingIds);
-	const out: Array<{
-		toolCallId: string;
-		text: string;
-		isError: boolean;
-		images: Array<{ data: string; mimeType: string }>;
-	}> = [];
-	for (const m of messages) {
-		if (m.role !== "toolResult") continue;
-		const id = (m as { toolCallId?: string }).toolCallId;
-		if (!id || !pending.has(id)) continue;
-		out.push({
-			toolCallId: id,
-			text: blocksToText(m.content).trim(),
-			isError: m.isError === true,
-			images: extractResultImages(m.content),
-		});
-	}
-	return out;
-}
-
-export interface LateToolResult {
-	callId?: string;
-	name: string;
-	reason: string;
-	text: string;
-	isError: boolean;
-	images?: Array<{ data: string; mimeType: string }>;
-}
-
-export function buildLateResultPrompt(late: LateToolResult[], userPrompt?: string): string {
-	const blocks = late.map((r) =>
-		[
-			`pi tool "${r.name}": ${r.reason}.`,
-			r.isError ? "The tool reported an error:" : "Result:",
-			r.text.trim() || "(no output)",
-		].join("\n"),
-	);
-	const header = "Late tool delivery: treat the following as the results of your earlier tool calls.";
-	const body = [header, ...blocks].join("\n\n");
-	return userPrompt ? `${body}\n\n${userPrompt}` : body;
-}
-
 export interface DriverDeps {
 	driver: TurnDriver;
 	roundTrips: ToolRoundTrips;
@@ -911,317 +133,7 @@ export interface DriverDeps {
 	log?: (event: string, data?: unknown, level?: "debug" | "info" | "warn" | "error") => void;
 }
 
-export interface ActivityFeatures {
-	roundTrips?: ToolRoundTrips;
-	onNativeEvent?: (event: NativeDisplayEvent) => void;
-	onBackgroundArg?: (args: Record<string, unknown>) => void;
-	roster?: SubagentRoster;
-	log?: (event: string, data?: unknown, level?: "debug" | "info" | "warn" | "error") => void;
-}
-
 const parkedTurnBgState = new Map<string, { turnStartMs: number; nativeBackgroundSeen: boolean }>();
-
-function emitToolUse(
-	stream: AssistantMessageEventStream,
-	blocks: BlockState,
-	id: string,
-	name: string,
-	args: Record<string, JsonValue>,
-): void {
-	const partial = blocks.partial;
-	closeThinking(stream, blocks);
-	closeText(stream, blocks);
-	const toolCall = { type: "toolCall" as const, id, name, arguments: args };
-	partial.content.push(toolCall);
-	const contentIndex = partial.content.length - 1;
-	stream.push({ type: "toolcall_start", contentIndex, partial });
-	stream.push({ type: "toolcall_end", contentIndex, toolCall, partial });
-	partial.stopReason = "toolUse";
-	stream.push({ type: "done", reason: "toolUse", message: partial });
-	stream.end();
-}
-
-const ACP_EDIT_TOOLS = new Set(["edit_file", "create_file", "write_to_file", "write_file"]);
-
-const NON_EDIT_PATH_KEYS = [
-	"Path",
-	"path",
-	"file_path",
-	"FilePath",
-	"AbsolutePath",
-	"absolute_path",
-	"TargetFile",
-	"target_file",
-	"DirectoryPath",
-	"directory_path",
-	"SearchPath",
-	"search_path",
-	"SearchDirectory",
-	"search_directory",
-	"TargetDirectory",
-	"target_directory",
-	"Directory",
-	"directory",
-] as const;
-
-const START_LINE_KEYS = ["StartLine", "start_line", "startLine", "offset"] as const;
-const END_LINE_KEYS = ["EndLine", "end_line", "endLine"] as const;
-const LIMIT_LINE_KEYS = ["limit", "Limit"] as const;
-
-const QUERY_KEYS = [
-	"Query",
-	"query",
-	"Pattern",
-	"pattern",
-	"SearchQuery",
-	"search_query",
-	"glob",
-	"Glob",
-	"Url",
-	"url",
-] as const;
-
-function callIdArg(args: Record<string, unknown>): string | undefined {
-	const v = args.callId;
-	return typeof v === "string" && v.length > 0 ? v : undefined;
-}
-
-function acpEditFileArg(args: Record<string, unknown>): string | undefined {
-	for (const [k, v] of Object.entries(args)) {
-		if (typeof v === "string" && v.trim() && /file|path/i.test(k)) return v;
-	}
-	return undefined;
-}
-
-function firstStringArg(args: Record<string, unknown>, keys: readonly string[]): string | undefined {
-	for (const k of keys) {
-		const v = args[k];
-		if (typeof v === "string" && v.trim()) return v.trim();
-	}
-	return undefined;
-}
-
-function firstPositiveIntArg(
-	args: Record<string, unknown>,
-	keys: readonly string[],
-): number | undefined {
-	for (const k of keys) {
-		const v = args[k];
-		if (typeof v === "number" && Number.isInteger(v) && v > 0) return v;
-	}
-	return undefined;
-}
-
-function resolveToolPath(rawPath: string | undefined, cwd: string): string | undefined {
-	if (!rawPath) return undefined;
-	let cleaned = rawPath.trim();
-	if (!cleaned) return undefined;
-	if (cleaned.startsWith("file://")) {
-		try {
-			cleaned = fileURLToPath(cleaned);
-		} catch {
-			cleaned = cleaned.replace(/^file:\/\//, "");
-		}
-	}
-	if (path.isAbsolute(cleaned) || !cwd) return cleaned;
-	return path.resolve(cwd, cleaned);
-}
-
-function extractCommandArg(args: Record<string, unknown>): string | undefined {
-	return ["CommandLine", "command_line", "command"]
-		.map((k) => args[k])
-		.find((v): v is string => typeof v === "string" && v.length > 0);
-}
-
-function extractLineRangeSuffix(
-	args: Record<string, unknown>,
-	location: DriverToolLocation | undefined,
-	includeLocationLine: boolean,
-): string | undefined {
-	const start = firstPositiveIntArg(args, START_LINE_KEYS);
-	const end = firstPositiveIntArg(args, END_LINE_KEYS);
-	const limit = firstPositiveIntArg(args, LIMIT_LINE_KEYS);
-	if (start !== undefined && end !== undefined) {
-		return start === end ? `:${start}` : `:${start}-${end}`;
-	}
-	if (start !== undefined && limit !== undefined) {
-		return limit <= 1 ? `:${start}` : `:${start}-${start + limit - 1}`;
-	}
-	if (start !== undefined) return `:${start}-`;
-	if (end !== undefined) return `:1-${end}`;
-	if (includeLocationLine && location?.line !== undefined && location.line > 0) {
-		return `:${location.line}`;
-	}
-	return undefined;
-}
-
-function extractToolDetail(
-	name: string,
-	args: Record<string, unknown>,
-	targetPath: string | undefined,
-	location: DriverToolLocation | undefined,
-): string | undefined {
-	const isEditTool = ACP_EDIT_TOOLS.has(name);
-	const base = targetPath ? path.basename(targetPath) || targetPath : undefined;
-	const lineSuffix = extractLineRangeSuffix(args, location, !isEditTool);
-	if (lineSuffix) return base ? `${base}${lineSuffix}` : lineSuffix;
-	if (isEditTool) return undefined;
-	const query = firstStringArg(args, QUERY_KEYS);
-	if (query) {
-		const singleLineQuery = query.split(/\r?\n/, 1)[0]!.trim();
-		const domain = firstStringArg(args, ["domain", "Domain"]);
-		if (base) return `${singleLineQuery} (${base})`;
-		if (domain) return `${singleLineQuery} (${domain})`;
-		return singleLineQuery;
-	}
-	return undefined;
-}
-
-export function consumeActivity(
-	stream: AssistantMessageEventStream,
-	blocks: BlockState,
-	activity: DriverActivity,
-	diffCtx: TurnDiffContext,
-	cwd: string,
-	feats: ActivityFeatures,
-): "parked" | "continue" {
-	const partial = blocks.partial;
-	feats.roster?.fold(activity);
-	switch (activity.type) {
-		case "text":
-			appendText(stream, blocks, activity.delta);
-			return "continue";
-		case "thought":
-			if (typeof activity.delta === "string" && activity.delta.length > 0) {
-				appendThinking(stream, blocks, activity.delta);
-			}
-			return "continue";
-		case "usage":
-			toPiUsage(activity.usage, partial.usage);
-			return "continue";
-		case "tool_start": {
-			const isEditTool = ACP_EDIT_TOOLS.has(activity.name);
-			const rawPath = isEditTool
-				? (acpEditFileArg(activity.args) ?? activity.location?.path)
-				: (firstStringArg(activity.args, NON_EDIT_PATH_KEYS) ?? activity.location?.path);
-			const targetPath = resolveToolPath(rawPath, cwd);
-			const detail = extractToolDetail(
-				activity.name,
-				activity.args,
-				targetPath,
-				activity.location,
-			);
-			const command = extractCommandArg(activity.args);
-			if (feats.onNativeEvent) {
-				try {
-					feats.onNativeEvent({
-						name: activity.name,
-						mcpServer: activity.mcpServer,
-						...(activity.toolCallId ? { toolCallId: activity.toolCallId } : {}),
-						status: "started",
-						...(targetPath ? { path: targetPath } : {}),
-						...(detail ? { detail } : {}),
-						...(command ? { command } : {}),
-						callId: callIdArg(activity.args),
-					});
-				} catch {
-					// UI failure must not fail generation.
-				}
-			}
-			if (looksBackgroundNativeCall(activity.args)) feats.onBackgroundArg?.(activity.args);
-			return "continue";
-		}
-		case "tool_done": {
-			const d = activity.diff;
-			const isEditTool = ACP_EDIT_TOOLS.has(activity.name);
-			const rawEditFile = isEditTool
-				? (acpEditFileArg(activity.args) ?? activity.location?.path)
-				: undefined;
-			const rawTargetPath = isEditTool
-				? rawEditFile
-				: (firstStringArg(activity.args, NON_EDIT_PATH_KEYS) ?? activity.location?.path);
-			const file = d?.path ?? resolveToolPath(rawTargetPath, cwd);
-			let diffText = d ? formatInlineDiff(d.oldText ?? "", d.newText) : undefined;
-			if (!d && isEditTool && file) {
-				let disk = "";
-				try {
-					disk = fs.readFileSync(file, "utf8");
-				} catch {
-					// Deleted or unreadable file degrades to summary.
-				}
-				diffText = diffCtx.diffEdit(file, disk).text;
-			}
-			const detail = extractToolDetail(activity.name, activity.args, file, activity.location);
-			const command = extractCommandArg(activity.args);
-			let displayed = false;
-			try {
-				if (feats.onNativeEvent) {
-					feats.onNativeEvent({
-						name: activity.name,
-						mcpServer: activity.mcpServer,
-						...(activity.toolCallId ? { toolCallId: activity.toolCallId } : {}),
-						status: "completed",
-						path: file,
-						...(detail ? { detail } : {}),
-						command,
-						output: activity.output,
-						diff: diffText,
-						callId: callIdArg(activity.args),
-					});
-					displayed = true;
-				}
-			} catch {
-				// Renderer failure must not fail the turn.
-			}
-			if (displayed) return "continue";
-			if ((isEditTool || d) && file) {
-				appendThinking(stream, blocks, `[agy edit: ${path.basename(file)}]\n`);
-				if (diffText) appendThinking(stream, blocks, `${diffText}\n`);
-			} else {
-				appendThinking(stream, blocks, `[agy tool: ${activity.name}]\n`);
-			}
-			return "continue";
-		}
-		case "tool_error": {
-			const args = activity.args ?? {};
-			const isEditTool = ACP_EDIT_TOOLS.has(activity.name);
-			const rawPath = isEditTool
-				? (acpEditFileArg(args) ?? activity.location?.path)
-				: (firstStringArg(args, NON_EDIT_PATH_KEYS) ?? activity.location?.path);
-			const targetPath = resolveToolPath(rawPath, cwd);
-			const detail = extractToolDetail(activity.name, args, targetPath, activity.location);
-			const command = extractCommandArg(args);
-			if (feats.onNativeEvent) {
-				try {
-					feats.onNativeEvent({
-						name: activity.name,
-						mcpServer: activity.mcpServer,
-						...(activity.toolCallId ? { toolCallId: activity.toolCallId } : {}),
-						status: "failed",
-						...(targetPath ? { path: targetPath } : {}),
-						...(detail ? { detail } : {}),
-						...(command ? { command } : {}),
-						output: activity.message,
-					});
-					return "continue";
-				} catch {
-					// Fall back to thinking label.
-				}
-			}
-			appendThinking(stream, blocks, `[agy tool: ${activity.name} failed: ${activity.message}]\n`);
-			return "continue";
-		}
-		case "bridge_call":
-			emitToolUse(
-				stream,
-				blocks,
-				activity.callId,
-				activity.name,
-				activity.args as Record<string, JsonValue>,
-			);
-			return "parked";
-	}
-}
 
 async function runTurnDriver(
 	stream: AssistantMessageEventStream,
@@ -1242,6 +154,17 @@ async function runTurnDriver(
 	const agyModel = entry?.full ?? model.id;
 	const effort = entry?.efforts?.length ? toAgyEffort(options?.reasoning, entry.efforts) : undefined;
 
+	const baseRunOpts = {
+		cwd,
+		model: agyModel,
+		effort,
+		mode: config.mode,
+		skipPermissions: config.skipPermissions,
+		timeoutMin: config.turnTimeoutMin,
+		inactivityMin: config.inactivityTimeoutMin,
+		signal: options?.signal,
+	};
+
 	if (isStandaloneSummarizationTurn(context, options)) {
 		const userPrompt = extractUserPrompt(context, 0);
 		if (!userPrompt) {
@@ -1260,16 +183,9 @@ async function runTurnDriver(
 		let summaryHandle: TurnHandle;
 		try {
 			summaryHandle = await deps.driver.run({
-				cwd,
-				model: agyModel,
-				effort,
-				mode: config.mode,
-				skipPermissions: config.skipPermissions,
-				timeoutMin: config.turnTimeoutMin,
-				inactivityMin: config.inactivityTimeoutMin,
+				...baseRunOpts,
 				conversationId: null,
 				prompt: promptParts.join("\n\n---\n\n"),
-				signal: options?.signal,
 			});
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -1488,13 +404,7 @@ async function runTurnDriver(
 		try {
 			await deps.beforeTurn?.();
 			handle = await deps.driver.run({
-				cwd,
-				model: agyModel,
-				effort,
-				mode: config.mode,
-				skipPermissions: config.skipPermissions,
-				timeoutMin: config.turnTimeoutMin,
-				inactivityMin: config.inactivityTimeoutMin,
+				...baseRunOpts,
 				conversationId: redeliveryConversation ?? existing?.conversationId ?? null,
 				prompt: fullPrompt,
 				images: runImages.length > 0 ? runImages : undefined,
@@ -1504,7 +414,6 @@ async function runTurnDriver(
 							text: `${digestPreamble}\n\n${digest}`,
 						}
 					: undefined,
-				signal: options?.signal,
 			});
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -1578,17 +487,10 @@ async function runTurnDriver(
 			const moreImages = more.flatMap((s) => s.images ?? []);
 			try {
 				const lateHandle = await deps.driver.run({
-					cwd,
-					model: agyModel,
-					effort,
-					mode: config.mode,
-					skipPermissions: config.skipPermissions,
-					timeoutMin: config.turnTimeoutMin,
-					inactivityMin: config.inactivityTimeoutMin,
+					...baseRunOpts,
 					conversationId: conv,
 					prompt: buildLateResultPrompt(more),
 					images: moreImages.length > 0 ? moreImages : undefined,
-					signal: options?.signal,
 				});
 				if ((await drainTurn(lateHandle)) === "parked") {
 					parkedTurnBgState.set(key, { turnStartMs, nativeBackgroundSeen });
@@ -1734,86 +636,4 @@ export function createStreamSimple(
 		}
 		return stream;
 	};
-}
-
-function ensureStarted(stream: AssistantMessageEventStream, b: BlockState): void {
-	if (b.started) return;
-	b.started = true;
-	stream.push({ type: "start", partial: b.partial });
-}
-
-function appendText(stream: AssistantMessageEventStream, b: BlockState, delta: string): void {
-	ensureTextOpen(stream, b);
-	textAt(b.partial, b.textIdx!).text += delta;
-	stream.push({ type: "text_delta", contentIndex: b.textIdx!, delta, partial: b.partial });
-}
-
-function appendThinking(stream: AssistantMessageEventStream, b: BlockState, delta: string): void {
-	ensureThinkingOpen(stream, b);
-	thinkingAt(b.partial, b.thinkingIdx!).thinking += delta;
-	stream.push({ type: "thinking_delta", contentIndex: b.thinkingIdx!, delta, partial: b.partial });
-}
-
-function ensureTextOpen(stream: AssistantMessageEventStream, b: BlockState): void {
-	if (b.textIdx !== null) return;
-	closeThinking(stream, b);
-	ensureStarted(stream, b);
-	b.partial.content.push({ type: "text", text: "" });
-	b.textIdx = b.partial.content.length - 1;
-	stream.push({ type: "text_start", contentIndex: b.textIdx, partial: b.partial });
-}
-
-function ensureThinkingOpen(stream: AssistantMessageEventStream, b: BlockState): void {
-	if (b.thinkingIdx !== null) return;
-	closeText(stream, b);
-	ensureStarted(stream, b);
-	b.partial.content.push({ type: "thinking", thinking: "" });
-	b.thinkingIdx = b.partial.content.length - 1;
-	stream.push({ type: "thinking_start", contentIndex: b.thinkingIdx, partial: b.partial });
-}
-
-function closeText(stream: AssistantMessageEventStream, b: BlockState): void {
-	if (b.textIdx === null) return;
-	const idx = b.textIdx;
-	b.textIdx = null;
-	stream.push({ type: "text_end", contentIndex: idx, content: textAt(b.partial, idx).text, partial: b.partial });
-}
-
-function closeThinking(stream: AssistantMessageEventStream, b: BlockState): void {
-	if (b.thinkingIdx === null) return;
-	const idx = b.thinkingIdx;
-	b.thinkingIdx = null;
-	stream.push({
-		type: "thinking_end",
-		contentIndex: idx,
-		content: thinkingAt(b.partial, idx).thinking,
-		partial: b.partial,
-	});
-}
-
-function textAt(p: AssistantMessage, idx: number): { type: "text"; text: string } {
-	return p.content[idx] as { type: "text"; text: string };
-}
-
-function thinkingAt(p: AssistantMessage, idx: number): { type: "thinking"; thinking: string } {
-	return p.content[idx] as { type: "thinking"; thinking: string };
-}
-
-function finalize(
-	stream: AssistantMessageEventStream,
-	b: BlockState,
-	reason: "stop" | "error" | "aborted",
-	message?: string,
-): void {
-	closeText(stream, b);
-	closeThinking(stream, b);
-	if (reason === "stop") {
-		b.partial.stopReason = "stop";
-		stream.push({ type: "done", reason: "stop", message: b.partial });
-	} else {
-		b.partial.stopReason = reason;
-		if (message) b.partial.errorMessage = message;
-		stream.push({ type: "error", reason, error: b.partial });
-	}
-	stream.end();
 }

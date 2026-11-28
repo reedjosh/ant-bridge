@@ -24,6 +24,15 @@ export function sanitizeSystemMessage(text: string): string {
 	return text.replace(SYSTEM_MESSAGE_RE, "");
 }
 
+/** Longest suffix of `buf` that is a strict prefix of `marker`. */
+function findPrefixOverlap(buf: string, marker: string): number {
+	const maxOverlap = Math.min(buf.length, marker.length - 1);
+	for (let len = maxOverlap; len > 0; len--) {
+		if (marker.startsWith(buf.slice(-len))) return len;
+	}
+	return 0;
+}
+
 /** Stateful streaming sanitizer that inspects and suppresses <SYSTEM_MESSAGE> blocks across chunks. */
 export class StreamSanitizer {
 	#buffer = "";
@@ -66,14 +75,7 @@ export class StreamSanitizer {
 
 				// START_MARKER is not yet in the buffer.
 				// Check if the tail of buffer matches a prefix of START_MARKER.
-				const maxOverlap = Math.min(this.#buffer.length, START_MARKER.length - 1);
-				let overlapLen = 0;
-				for (let len = maxOverlap; len > 0; len--) {
-					if (START_MARKER.startsWith(this.#buffer.slice(-len))) {
-						overlapLen = len;
-						break;
-					}
-				}
+				const overlapLen = findPrefixOverlap(this.#buffer, START_MARKER);
 
 				if (overlapLen > 0) {
 					const safeLen = this.#buffer.length - overlapLen;
@@ -122,14 +124,7 @@ export class StreamSanitizer {
 				}
 
 				// END_MARKER not yet encountered. Check if tail matches prefix of END_MARKER.
-				const maxOverlap = Math.min(this.#buffer.length, END_MARKER.length - 1);
-				let overlapLen = 0;
-				for (let len = maxOverlap; len > 0; len--) {
-					if (END_MARKER.startsWith(this.#buffer.slice(-len))) {
-						overlapLen = len;
-						break;
-					}
-				}
+				const overlapLen = findPrefixOverlap(this.#buffer, END_MARKER);
 
 				if (overlapLen > 0) {
 					this.#suppressedAcc += this.#buffer.slice(0, -overlapLen);

@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -10,17 +9,37 @@ function findPiCodingAgentDist() {
   if (process.env.PI_CODING_AGENT_DIST) {
     return path.resolve(process.env.PI_CODING_AGENT_DIST);
   }
-  const piBin = execFileSync("sh", ["-c", "command -v pi"], { encoding: "utf8" }).trim();
-  let dir = path.dirname(fs.realpathSync(piBin));
-  for (let i = 0; i < 6; i++) {
-    if (fs.existsSync(path.join(dir, "core/extensions/jiti-loader.js"))) {
-      return dir;
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
+  const candidates = [];
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (!dir) continue;
+    const bin = path.join(dir, "pi");
+    if (fs.existsSync(bin)) candidates.push(bin);
   }
-  throw new Error(`Could not locate Pi coding-agent dist from ${piBin}`);
+  for (const candidate of candidates) {
+    let dir;
+    try {
+      dir = path.dirname(fs.realpathSync(candidate));
+    } catch {
+      continue;
+    }
+    for (let i = 0; i < 6; i++) {
+      if (fs.existsSync(path.join(dir, "core/extensions/jiti-loader.js"))) {
+        return dir;
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  for (const fallback of [
+    "/usr/lib/node_modules/pi/packages/coding-agent/dist",
+    "/usr/local/lib/node_modules/pi/packages/coding-agent/dist",
+  ]) {
+    if (fs.existsSync(path.join(fallback, "core/extensions/jiti-loader.js"))) {
+      return fallback;
+    }
+  }
+  throw new Error(`Could not locate Pi coding-agent dist from PATH (${candidates.join(", ") || "none"})`);
 }
 
 function resolvePackageEntry(startDir, workspaceRelPath, pkgName) {

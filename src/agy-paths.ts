@@ -30,3 +30,8 @@ export function agyConversationDir(
 ): string {
 	return path.join(agyBrainRoot(home), conversationId);
 }
+
+/** Resolve the `agy` CLI binary path (honoring AGY_BIN override). */
+export function resolveAgyBinary(env: NodeJS.ProcessEnv = process.env): string {
+	return env.AGY_BIN || "agy";
+}

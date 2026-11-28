@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.5.1 - 2026-11-27
+
+- Keep native `read_file` enabled in `pi-only` mode so real images and large `.system_generated/` MCP outputs that `agy`
+  offloads to disk remain readable, while all native write, edit, shell, subagent, schedule, and question tools stay
+  disabled (#12).
+- Persist `toolMode` per bound session and automatically start a fresh seeded `agy` conversation on the next turn when
+  switching between `hybrid` and `pi-only`, removing the need for `/agy clear` (#12).
+
 ## 2.5.0 - 2026-11-27
 
 - Add opt-in `pi-only` tool mode (`/agy tool-mode pi-only`, `/agy` settings picker, or `AGY_TOOL_MODE=pi-only`) to

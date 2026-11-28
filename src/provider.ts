@@ -60,51 +60,9 @@ import { SubagentRoster } from "./subagent-roster.js";
 import { collectToolResults, POLL_TOOL_NAME, ToolRoundTrips } from "./tool-roundtrips.js";
 
 export { CALL_PI_TOOL_NAME };
-export {
-	consumeActivity,
-	type ActivityFeatures,
-	type BlockState,
-	type NativeDisplayEvent,
-} from "./activity-consumer.js";
-export {
-	buildContextDigest,
-	buildFullPrompt,
-	buildLateResultPrompt,
-	DIGEST_PREAMBLE,
-	extractImages,
-	extractUserPrompt,
-	isObservationalMemoryContext,
-	isStandaloneSummarizationTurn,
-	latestCompactionHash,
-	OM_WORKER_TOOL_NAMES,
-	PI_BRIDGE_INSTRUCTIONS,
-	PI_ONLY_TOOL_PRIORITY_NOTE,
-	RESUME_PROMPT,
-	SEED_DIGEST_PREAMBLE,
-	SUMMARIZATION_NO_TOOLS_NOTE,
-	SYSTEM_PROMPT_END,
-	SYSTEM_PROMPT_PREAMBLE,
-	TOOL_PRIORITY_NOTE,
-	trailingUserTurnStart,
-	type DigestOptions,
-	type LateToolResult,
-} from "./prompt-builder.js";
-export {
-	collectToolResults,
-	defaultEscalateAfterMs,
-	DELEGATION_ESCALATE_MS,
-	ESCALATE_AFTER_MS,
-	ESCALATED_TIMEOUT_MS,
-	EscalationRegistry,
-	formatEscalatedAck,
-	formatPollAnswer,
-	POLL_TOOL_NAME,
-	ToolRoundTrips,
-	type BridgeCallResultShape,
-	type BridgeContentBlock,
-	type BridgeEscalation,
-	type PollView,
-} from "./tool-roundtrips.js";
+export * from "./activity-consumer.js";
+export * from "./prompt-builder.js";
+export * from "./tool-roundtrips.js";
 
 let warnedObservationalMemoryMismatch = false;
 
@@ -196,6 +154,17 @@ async function runTurnDriver(
 	const agyModel = entry?.full ?? model.id;
 	const effort = entry?.efforts?.length ? toAgyEffort(options?.reasoning, entry.efforts) : undefined;
 
+	const baseRunOpts = {
+		cwd,
+		model: agyModel,
+		effort,
+		mode: config.mode,
+		skipPermissions: config.skipPermissions,
+		timeoutMin: config.turnTimeoutMin,
+		inactivityMin: config.inactivityTimeoutMin,
+		signal: options?.signal,
+	};
+
 	if (isStandaloneSummarizationTurn(context, options)) {
 		const userPrompt = extractUserPrompt(context, 0);
 		if (!userPrompt) {
@@ -214,16 +183,9 @@ async function runTurnDriver(
 		let summaryHandle: TurnHandle;
 		try {
 			summaryHandle = await deps.driver.run({
-				cwd,
-				model: agyModel,
-				effort,
-				mode: config.mode,
-				skipPermissions: config.skipPermissions,
-				timeoutMin: config.turnTimeoutMin,
-				inactivityMin: config.inactivityTimeoutMin,
+				...baseRunOpts,
 				conversationId: null,
 				prompt: promptParts.join("\n\n---\n\n"),
-				signal: options?.signal,
 			});
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -442,13 +404,7 @@ async function runTurnDriver(
 		try {
 			await deps.beforeTurn?.();
 			handle = await deps.driver.run({
-				cwd,
-				model: agyModel,
-				effort,
-				mode: config.mode,
-				skipPermissions: config.skipPermissions,
-				timeoutMin: config.turnTimeoutMin,
-				inactivityMin: config.inactivityTimeoutMin,
+				...baseRunOpts,
 				conversationId: redeliveryConversation ?? existing?.conversationId ?? null,
 				prompt: fullPrompt,
 				images: runImages.length > 0 ? runImages : undefined,
@@ -458,7 +414,6 @@ async function runTurnDriver(
 							text: `${digestPreamble}\n\n${digest}`,
 						}
 					: undefined,
-				signal: options?.signal,
 			});
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -532,17 +487,10 @@ async function runTurnDriver(
 			const moreImages = more.flatMap((s) => s.images ?? []);
 			try {
 				const lateHandle = await deps.driver.run({
-					cwd,
-					model: agyModel,
-					effort,
-					mode: config.mode,
-					skipPermissions: config.skipPermissions,
-					timeoutMin: config.turnTimeoutMin,
-					inactivityMin: config.inactivityTimeoutMin,
+					...baseRunOpts,
 					conversationId: conv,
 					prompt: buildLateResultPrompt(more),
 					images: moreImages.length > 0 ? moreImages : undefined,
-					signal: options?.signal,
 				});
 				if ((await drainTurn(lateHandle)) === "parked") {
 					parkedTurnBgState.set(key, { turnStartMs, nativeBackgroundSeen });

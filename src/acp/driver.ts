@@ -359,13 +359,7 @@ export class AcpDriver implements TurnDriver {
 			}
 		} catch (err) {
 			if (turn.aborted) {
-				this.#settle(turn, {
-					conversationId: turn.sessionId,
-					status: "OK",
-					response: turn.response.text,
-					finished: true,
-					aborted: true,
-				});
+				this.#settle(turn, { status: "OK", aborted: true });
 				return;
 			}
 			if (request.conversationId) {
@@ -390,13 +384,9 @@ export class AcpDriver implements TurnDriver {
 		if (conn.nativeQuestionSeen) {
 			this.#log("session-blocked-native-question", { sessionId: turn.sessionId });
 			this.#settle(turn, {
-				conversationId: turn.sessionId,
 				status: "ERROR",
-				response: "",
 				error: "Native ask_question blocked this ACP conversation; a fresh session is required.",
 				retryInFreshSession: true,
-				finished: true,
-				aborted: false,
 			});
 			return;
 		}
@@ -450,70 +440,32 @@ export class AcpDriver implements TurnDriver {
 				this.#emit(turn, { type: "usage", usage: settleUsage });
 			}
 			if (turn.aborted) {
-				this.#settle(turn, {
-					conversationId: turn.sessionId,
-					status: "OK",
-					response: turn.response.text,
-					usage: settleUsage,
-					finished: true,
-					aborted: true,
-				});
+				this.#settle(turn, { status: "OK", usage: settleUsage, aborted: true });
 				return;
 			}
 			if (turn.steered && (result.stopReason === "cancelled" || result.stopReason === "end_turn")) {
-				this.#settle(turn, {
-					conversationId: turn.sessionId,
-					status: "OK",
-					response: turn.response.text,
-					usage: settleUsage,
-					finished: true,
-					aborted: false,
-					steered: true,
-				});
+				this.#settle(turn, { status: "OK", usage: settleUsage, steered: true });
 				return;
 			}
 			const mapped = mapStopReason(result.stopReason);
 			this.#settle(turn, {
-				conversationId: turn.sessionId,
 				status: mapped.status,
-				response: turn.response.text,
 				usage: settleUsage,
 				error: mapped.error,
-				finished: true,
 				aborted: mapped.aborted,
 				...(turn.steered && mapped.status === "OK" && !mapped.aborted ? { steered: true } : {}),
 			});
 		} catch (err) {
 			if (turn.closed) return;
 			if (turn.aborted) {
-				this.#settle(turn, {
-					conversationId: turn.sessionId,
-					status: "OK",
-					response: turn.response.text,
-					finished: true,
-					aborted: true,
-				});
+				this.#settle(turn, { status: "OK", aborted: true });
 				return;
 			}
 			if (turn.steered && !(err instanceof AcpAuthError)) {
-				this.#settle(turn, {
-					conversationId: turn.sessionId,
-					status: "OK",
-					response: turn.response.text,
-					finished: true,
-					aborted: false,
-					steered: true,
-				});
+				this.#settle(turn, { status: "OK", steered: true });
 				return;
 			}
-			this.#settle(turn, {
-				conversationId: turn.sessionId,
-				status: "ERROR",
-				response: turn.response.text,
-				error: `ACP prompt failed: ${describe(err)}`,
-				finished: true,
-				aborted: false,
-			});
+			this.#settle(turn, { status: "ERROR", error: `ACP prompt failed: ${describe(err)}` });
 		}
 	}
 
@@ -618,86 +570,78 @@ export class AcpDriver implements TurnDriver {
 				}
 				return;
 			}
-			case "tool_done": {
-				let entry = turn.toolCalls.get(mapped.toolCallId);
-				if (!entry && turn.toolCalls.size === 1) {
-					// The server can finish an approved tool under a different id.
-					// Adopt only when exactly one call is pending: with concurrent
-					// tools, guessing would attach an edit diff to the wrong file.
-					// Residual: an unrelated done with an unknown id still pairs
-					// with the pending entry; strictly better than guessing ANY id.
-					entry = turn.toolCalls.values().next().value;
-					turn.toolCalls.clear();
-				}
-				turn.toolCalls.delete(mapped.toolCallId);
-				this.#syncIdle(turn);
-				const name = entry?.name ?? "tool";
-				const args = mapped.args
-					? { ...(entry?.args ?? {}), ...mapped.args }
-					: (entry?.args ?? {});
-				const location = mapped.location ?? entry?.location;
-				const mcpServer =
-					mapped.mcpServer ??
-					entry?.mcpServer ??
-					(name === "call_mcp_tool" && args ? callMcpServerArg(args) : undefined);
-				// Native diff from the stored tool_call frame; the update's own
-				// diff (future builds) wins when present.
-				this.#emit(turn, {
-					type: "tool_done",
-					name,
-					args,
-					...(location ? { location } : {}),
-					output: mapped.output,
-					diff: mapped.diff ?? entry?.diff,
-					mcpServer,
-					toolCallId: mapped.toolCallId,
-				});
-				if (turn.steered && !turn.steerCancelSent && turn.promptStarted && turn.toolCalls.size === 0) {
-					this.#sendSteerCancel(turn);
-				}
-				return;
-			}
+			case "tool_done":
 			case "tool_error": {
-				let entry = turn.toolCalls.get(mapped.toolCallId);
-				if (!entry && turn.toolCalls.size === 1) {
-					entry = turn.toolCalls.values().next().value;
-					turn.toolCalls.clear();
+				const { entry, name, args, location, mcpServer } = this.#consumeToolCall(turn, mapped);
+				if (mapped.kind === "tool_done") {
+					// Native diff from the stored tool_call frame; the update's own
+					// diff (future builds) wins when present.
+					this.#emit(turn, {
+						type: "tool_done",
+						name,
+						args: args ?? {},
+						...(location ? { location } : {}),
+						output: mapped.output,
+						diff: mapped.diff ?? entry?.diff,
+						mcpServer,
+						toolCallId: mapped.toolCallId,
+					});
+				} else {
+					this.#emit(turn, {
+						type: "tool_error",
+						name,
+						message: mapped.message,
+						...(args ? { args } : {}),
+						...(location ? { location } : {}),
+						mcpServer,
+						toolCallId: mapped.toolCallId,
+					});
 				}
-				turn.toolCalls.delete(mapped.toolCallId);
-				this.#syncIdle(turn);
-				const name = entry?.name ?? "tool";
-				const args = mapped.args
-					? { ...(entry?.args ?? {}), ...mapped.args }
-					: entry?.args;
-				const location = mapped.location ?? entry?.location;
-				const mcpServer =
-					mapped.mcpServer ??
-					entry?.mcpServer ??
-					(name === "call_mcp_tool" && args ? callMcpServerArg(args) : undefined);
-				this.#emit(turn, {
-					type: "tool_error",
-					name,
-					message: mapped.message,
-					...(args ? { args } : {}),
-					...(location ? { location } : {}),
-					mcpServer,
-					toolCallId: mapped.toolCallId,
-				});
-				if (turn.steered && !turn.steerCancelSent && turn.promptStarted && turn.toolCalls.size === 0) {
-					this.#sendSteerCancel(turn);
-				}
+				this.#maybeSteerCancel(turn);
 				return;
 			}
 			case "tool_discard": {
 				turn.toolCalls.delete(mapped.toolCallId);
 				this.#syncIdle(turn);
-				if (turn.steered && !turn.steerCancelSent && turn.promptStarted && turn.toolCalls.size === 0) {
-					this.#sendSteerCancel(turn);
-				}
+				this.#maybeSteerCancel(turn);
 				return;
 			}
 			case "replay_user":
 				return; // load replay: history, never live text
+		}
+	}
+
+	#consumeToolCall(
+		turn: ActiveTurn,
+		mapped: {
+			toolCallId: string;
+			args?: Record<string, unknown>;
+			location?: { path: string; line?: number };
+			mcpServer?: string;
+		},
+	) {
+		let entry = turn.toolCalls.get(mapped.toolCallId);
+		if (!entry && turn.toolCalls.size === 1) {
+			// The server can finish an approved tool under a different id; adopt
+			// only when one call is pending so concurrent edits don't cross-wire.
+			entry = turn.toolCalls.values().next().value;
+			turn.toolCalls.clear();
+		}
+		turn.toolCalls.delete(mapped.toolCallId);
+		this.#syncIdle(turn);
+		const name = entry?.name ?? "tool";
+		const args = mapped.args ? { ...(entry?.args ?? {}), ...mapped.args } : entry?.args;
+		const location = mapped.location ?? entry?.location;
+		const mcpServer =
+			mapped.mcpServer ??
+			entry?.mcpServer ??
+			(name === "call_mcp_tool" && args ? callMcpServerArg(args) : undefined);
+		return { entry, name, args, location, mcpServer };
+	}
+
+	#maybeSteerCancel(turn: ActiveTurn): void {
+		if (turn.steered && !turn.steerCancelSent && turn.promptStarted && turn.toolCalls.size === 0) {
+			this.#sendSteerCancel(turn);
 		}
 	}
 
@@ -729,23 +673,13 @@ export class AcpDriver implements TurnDriver {
 		if (!turn || turn.closed) return;
 		if (turn.aborted || turn.sawResult) {
 			this.#settle(turn, {
-				conversationId: turn.sessionId,
 				status: turn.response.text.length > 0 || turn.sawResult ? "OK" : "UNKNOWN",
-				response: turn.response.text,
-				finished: true,
 				aborted: turn.aborted,
 			});
 			return;
 		}
 		if (steeredActive) {
-			this.#settle(turn, {
-				conversationId: turn.sessionId,
-				status: "OK",
-				response: turn.response.text,
-				finished: true,
-				aborted: false,
-				steered: true,
-			});
+			this.#settle(turn, { status: "OK", steered: true });
 			return;
 		}
 		// A silent death (no stderr) leaves only the exit code/signal as a
@@ -899,14 +833,7 @@ export class AcpDriver implements TurnDriver {
 		this.#state = "dead";
 		conn?.abortAll("steer: connection torn down");
 		conn?.kill();
-		this.#settle(turn, {
-			conversationId: turn.sessionId,
-			status: "OK",
-			response: turn.response.text,
-			finished: true,
-			aborted: false,
-			steered: true,
-		});
+		this.#settle(turn, { status: "OK", steered: true });
 	}
 
 	#clearSteerTimers(turn: ActiveTurn): void {
@@ -1092,8 +1019,19 @@ export class AcpDriver implements TurnDriver {
 
 	// --- settling ----------------------------------------------------------------
 
-	#settle(turn: ActiveTurn, outcome: TurnOutcome): void {
+	#settle(
+		turn: ActiveTurn,
+		partial: Omit<TurnOutcome, "conversationId" | "response" | "finished" | "aborted"> &
+			Partial<Pick<TurnOutcome, "conversationId" | "response" | "finished" | "aborted">>,
+	): void {
 		if (turn.closed) return;
+		const outcome: TurnOutcome = {
+			conversationId: turn.sessionId,
+			response: turn.response.text,
+			finished: true,
+			aborted: false,
+			...partial,
+		};
 		const flushed = turn.response.flush();
 		if (flushed) {
 			turn.textDeltas += 1;
@@ -1137,14 +1075,7 @@ export class AcpDriver implements TurnDriver {
 	}
 
 	#failTurn(turn: ActiveTurn, message: string): void {
-		this.#settle(turn, {
-			conversationId: turn.sessionId,
-			status: "ERROR",
-			response: turn.response.text,
-			error: message,
-			finished: true,
-			aborted: turn.aborted,
-		});
+		this.#settle(turn, { status: "ERROR", error: message, aborted: turn.aborted });
 	}
 
 	/** Usage synthesis mode, resolved per turn (follows live config). */
@@ -1239,12 +1170,8 @@ export class AcpDriver implements TurnDriver {
 		const turn = this.#active;
 		if (turn && !turn.closed) {
 			this.#settle(turn, {
-				conversationId: turn.sessionId,
 				status: "ERROR",
-				response: turn.response.text,
 				error: `ACP driver ${reason === "recycle" ? "recycled" : "shut down"} mid-turn${cause ? ` (${cause})` : ""}`,
-				finished: true,
-				aborted: false,
 			});
 		}
 		this.#conn?.abortAll(`driver ${reason}`);

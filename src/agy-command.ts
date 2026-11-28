@@ -302,18 +302,22 @@ function getAgyArgumentCompletions(
 		}
 	}
 
+	const completePrefix = (
+		prefix: string,
+		entries: string[],
+		cmdPrefix: string,
+	): AgyCompletionItem[] | null => {
+		const lower = prefix.toLowerCase();
+		const matches = entries
+			.filter((name) => name.toLowerCase().startsWith(lower))
+			.map((name) => ({ value: `${cmdPrefix} ${name}`, label: name }));
+		return matches.length > 0 ? matches : null;
+	};
+
 	if (sub === "tasks" && parts[1]?.toLowerCase() === "tail") {
 		if ((parts.length === 2 && hasTrailingSpace) || (parts.length === 3 && !hasTrailingSpace)) {
 			const dir = getActiveConversationDir?.();
-			if (!dir) return null;
-			const idPrefix = parts.length === 3 ? parts[2].toLowerCase() : "";
-			const matches = listConversationTaskIds(dir)
-				.filter((id) => id.startsWith(idPrefix))
-				.map((id) => ({
-					value: `tasks tail ${id}`,
-					label: id,
-				}));
-			return matches.length > 0 ? matches : null;
+			return dir ? completePrefix(parts[2] ?? "", listConversationTaskIds(dir), "tasks tail") : null;
 		}
 	}
 
@@ -321,15 +325,9 @@ function getAgyArgumentCompletions(
 		const openMatch = /^artifacts\s+open\s+(.*)$/i.exec(trimmedStart);
 		if (openMatch) {
 			const dir = getActiveConversationDir?.();
-			if (!dir) return null;
-			const namePrefix = openMatch[1].toLowerCase();
-			const matches = listConversationArtifactNames(dir)
-				.filter((name) => name.toLowerCase().startsWith(namePrefix))
-				.map((name) => ({
-					value: `artifacts open ${name}`,
-					label: name,
-				}));
-			return matches.length > 0 ? matches : null;
+			return dir
+				? completePrefix(openMatch[1], listConversationArtifactNames(dir), "artifacts open")
+				: null;
 		}
 	}
 
@@ -523,36 +521,38 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 				}
 				return;
 			}
-			if (sub === "readonly") {
+			const setBool = (
+				key: "readOnly" | "skipPermissions" | "digest" | "systemPrompt",
+				usage: string,
+				formatSet: (next: AgyConfig) => string,
+				formatCurrent: (cur: AgyConfig) => string,
+			): void => {
 				if (val === "on" || val === "off") {
-					const next = saveConfig({ readOnly: val === "on" });
-					ui?.notify(
-						next.readOnly
+					ui?.notify(formatSet(saveConfig({ [key]: val === "on" })), "info");
+				} else {
+					ui?.notify(`${formatCurrent(loadConfig())}\nusage: /agy ${usage} on|off`, "info");
+				}
+			};
+			if (sub === "readonly") {
+				setBool(
+					"readOnly",
+					"readonly",
+					(n) =>
+						n.readOnly
 							? "readOnly is on: provider turns are REFUSED until /agy readonly off."
 							: "readOnly off: provider turns enabled.",
-						"info",
-					);
-				} else {
-					ui?.notify(
-						`readOnly is ${loadConfig().readOnly ? "on" : "off"}\nusage: /agy readonly on|off`,
-						"info",
-					);
-				}
+					(c) => `readOnly is ${c.readOnly ? "on" : "off"}`,
+				);
 				return;
 			}
 			if (sub === "permissions") {
-				if (val === "on" || val === "off") {
-					const next = saveConfig({ skipPermissions: val === "on" });
-					ui?.notify(
-						`permissions: ${next.skipPermissions ? "auto-approved" : `prompt (${next.permissionMode})`}`,
-						"info",
-					);
-				} else {
-					ui?.notify(
-						`permissions: ${loadConfig().skipPermissions ? "auto-approved" : "prompt"}\nusage: /agy permissions on|off`,
-						"info",
-					);
-				}
+				setBool(
+					"skipPermissions",
+					"permissions",
+					(n) =>
+						`permissions: ${n.skipPermissions ? "auto-approved" : `prompt (${n.permissionMode})`}`,
+					(c) => `permissions: ${c.skipPermissions ? "auto-approved" : "prompt"}`,
+				);
 				return;
 			}
 			if (sub === "permission-mode") {
@@ -659,27 +659,21 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 				return;
 			}
 			if (sub === "digest") {
-				if (val === "on" || val === "off") {
-					const next = saveConfig({ digest: val === "on" });
-					ui?.notify(`digest ${next.digest ? "on" : "off"}`, "info");
-				} else {
-					ui?.notify(
-						`digest: ${loadConfig().digest ? "on" : "off"}\nusage: /agy digest on|off`,
-						"info",
-					);
-				}
+				setBool(
+					"digest",
+					"digest",
+					(n) => `digest ${n.digest ? "on" : "off"}`,
+					(c) => `digest: ${c.digest ? "on" : "off"}`,
+				);
 				return;
 			}
 			if (sub === "system-prompt") {
-				if (val === "on" || val === "off") {
-					const next = saveConfig({ systemPrompt: val === "on" });
-					ui?.notify(`system-prompt ${next.systemPrompt ? "on" : "off"}`, "info");
-				} else {
-					ui?.notify(
-						`system-prompt: ${loadConfig().systemPrompt ? "on" : "off"}\nusage: /agy system-prompt on|off`,
-						"info",
-					);
-				}
+				setBool(
+					"systemPrompt",
+					"system-prompt",
+					(n) => `system-prompt ${n.systemPrompt ? "on" : "off"}`,
+					(c) => `system-prompt: ${c.systemPrompt ? "on" : "off"}`,
+				);
 				return;
 			}
 			if (sub === "quota") {
@@ -857,104 +851,121 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 	});
 }
 
+interface PickerSpec {
+	id: string;
+	label: string;
+	description: string;
+	values: string[];
+	get: (cfg: AgyConfig) => string;
+	apply: (pending: Partial<AgyConfig>, val: string) => void;
+	summary: (next: AgyConfig) => string;
+}
+
+const boolSpec = (
+	id: string,
+	label: string,
+	description: string,
+	key: "readOnly" | "skipPermissions" | "digest" | "systemPrompt",
+	values: [string, string],
+	summaryKey = id,
+): PickerSpec => ({
+	id,
+	label,
+	description,
+	values,
+	get: (c) => (c[key] ? "on" : "off"),
+	apply: (p, v) => { p[key] = v === "on"; },
+	summary: (n) => `${summaryKey}=${n[key] ? "on" : "off"}`,
+});
+
+const capSpec = (
+	id: string,
+	label: string,
+	description: string,
+	key: "turnTimeoutMin" | "inactivityTimeoutMin",
+	values: string[],
+): PickerSpec => ({
+	id,
+	label,
+	description,
+	values,
+	get: (c) => String(c[key]),
+	apply: (p, v) => { p[key] = Number(v); },
+	summary: (n) => `${id}=${n[key] === 0 ? "off" : `${n[key]}m`}`,
+});
+
+const PICKER_SPECS: readonly PickerSpec[] = [
+	boolSpec("readonly", "Read-only kill switch", "Refuse provider turns when set to on.", "readOnly", ["off", "on"], "readOnly"),
+	boolSpec("permissions", "Auto-approve permissions", "Auto-approve ACP tool permission requests (default on).", "skipPermissions", ["on", "off"]),
+	{
+		id: "permission-mode",
+		label: "Permission fallback",
+		description: "Policy for ACP permission prompts when auto-approve is off.",
+		values: ["ask", "allow", "deny"],
+		get: (c) => c.permissionMode,
+		apply: (p, v) => { p.permissionMode = v as PermissionMode; },
+		summary: (n) => `permission-mode=${n.permissionMode}`,
+	},
+	{
+		id: "bridge",
+		label: "Bridge tools",
+		description: "Which active Pi tools are bridged over MCP: all (default), mcp (MCP + codemode + skills), or none.",
+		values: ["all", "mcp", "none"],
+		get: (c) => c.bridgeTools,
+		apply: (p, v) => { p.bridgeTools = v as BridgeTools; },
+		summary: (n) => `bridge=${n.bridgeTools}`,
+	},
+	{
+		id: "tool-mode",
+		label: "Tool execution mode",
+		description: "hybrid (agy native file/shell + Pi MCP, default) or pi-only (disable agy native tools, route all tools through Pi).",
+		values: ["hybrid", "pi-only"],
+		get: (c) => c.toolMode,
+		apply: (p, v) => { p.toolMode = v as ToolMode; },
+		summary: (n) => `tool-mode=${n.toolMode}`,
+	},
+	{
+		id: "usage",
+		label: "Token usage estimate",
+		description: "Client-side token estimate mode until ACP emits native usage.",
+		values: ["estimate", "direct", "off"],
+		get: (c) => c.acp.usageEstimate,
+		apply: (p, v) => { p.acp = { usageEstimate: v as UsageEstimate }; },
+		summary: (n) => `usage=${n.acp.usageEstimate}`,
+	},
+	capSpec("turn-cap", "Turn time cap (min)", "Maximum minutes for one turn (0 disables).", "turnTimeoutMin", ["0", "5", "10", "15", "30", "60", "120", "360", "720", "1440"]),
+	capSpec("inactivity-cap", "Inactivity stall cap (min)", "Silence cap when no tool is running (0 disables).", "inactivityTimeoutMin", ["0", "5", "10", "15", "30", "60"]),
+	boolSpec("digest", "Context digest", "Inject non-Antigravity Pi context delta each turn (defeats server cache).", "digest", ["off", "on"]),
+	boolSpec("system-prompt", "System prompt", "Prepend Pi's system prompt and AGENTS.md files on fresh conversations.", "systemPrompt", ["on", "off"]),
+];
+
 async function openAgyPicker(ui: ExtensionUIContext, ctx?: AgyCommandCtx): Promise<void> {
 	const config = loadConfig();
 	const pending: Partial<AgyConfig> = {};
+	const touchedIds = new Set<string>();
+	const specById = new Map(PICKER_SPECS.map((s) => [s.id, s]));
 
-	const items: SettingItem[] = [
-		{
-			id: "readonly",
-			label: "Read-only kill switch",
-			description: "Refuse provider turns when set to on.",
-			currentValue: config.readOnly ? "on" : "off",
-			values: ["off", "on"],
-		},
-		{
-			id: "permissions",
-			label: "Auto-approve permissions",
-			description: "Auto-approve ACP tool permission requests (default on).",
-			currentValue: config.skipPermissions ? "on" : "off",
-			values: ["on", "off"],
-		},
-		{
-			id: "permission-mode",
-			label: "Permission fallback",
-			description: "Policy for ACP permission prompts when auto-approve is off.",
-			currentValue: config.permissionMode,
-			values: ["ask", "allow", "deny"],
-		},
-		{
-			id: "bridge",
-			label: "Bridge tools",
-			description:
-				"Which active Pi tools are bridged over MCP: all (default), mcp (MCP + codemode + skills), or none.",
-			currentValue: config.bridgeTools,
-			values: ["all", "mcp", "none"],
-		},
-		{
-			id: "tool-mode",
-			label: "Tool execution mode",
-			description:
-				"hybrid (agy native file/shell + Pi MCP, default) or pi-only (disable agy native tools, route all tools through Pi).",
-			currentValue: config.toolMode,
-			values: ["hybrid", "pi-only"],
-		},
-		{
-			id: "usage",
-			label: "Token usage estimate",
-			description: "Client-side token estimate mode until ACP emits native usage.",
-			currentValue: config.acp.usageEstimate,
-			values: ["estimate", "direct", "off"],
-		},
-		{
-			id: "turn-cap",
-			label: "Turn time cap (min)",
-			description: "Maximum minutes for one turn (0 disables).",
-			currentValue: String(config.turnTimeoutMin),
-			values: ["0", "5", "10", "15", "30", "60", "120", "360", "720", "1440"],
-		},
-		{
-			id: "inactivity-cap",
-			label: "Inactivity stall cap (min)",
-			description: "Silence cap when no tool is running (0 disables).",
-			currentValue: String(config.inactivityTimeoutMin),
-			values: ["0", "5", "10", "15", "30", "60"],
-		},
-		{
-			id: "digest",
-			label: "Context digest",
-			description: "Inject non-Antigravity Pi context delta each turn (defeats server cache).",
-			currentValue: config.digest ? "on" : "off",
-			values: ["off", "on"],
-		},
-		{
-			id: "system-prompt",
-			label: "System prompt",
-			description: "Prepend Pi's system prompt and AGENTS.md files on fresh conversations.",
-			currentValue: config.systemPrompt ? "on" : "off",
-			values: ["on", "off"],
-		},
-	];
+	const items: SettingItem[] = PICKER_SPECS.map((s) => ({
+		id: s.id,
+		label: s.label,
+		description: s.description,
+		currentValue: s.get(config),
+		values: s.values,
+	}));
 
 	await showSettingsDialog(ui, {
 		title: "Antigravity ACP provider",
 		subtitle: `${configPath()} - Esc saves and closes`,
 		items,
 		onChange: (id, newValue) => {
-			if (id === "readonly") pending.readOnly = newValue === "on";
-			else if (id === "permissions") pending.skipPermissions = newValue === "on";
-			else if (id === "permission-mode") pending.permissionMode = newValue as PermissionMode;
-			else if (id === "bridge") pending.bridgeTools = newValue as BridgeTools;
-			else if (id === "tool-mode") pending.toolMode = newValue as ToolMode;
-			else if (id === "usage") pending.acp = { usageEstimate: newValue as UsageEstimate };
-			else if (id === "turn-cap") pending.turnTimeoutMin = Number(newValue);
-			else if (id === "inactivity-cap") pending.inactivityTimeoutMin = Number(newValue);
-			else if (id === "digest") pending.digest = newValue === "on";
-			else if (id === "system-prompt") pending.systemPrompt = newValue === "on";
+			const spec = specById.get(id);
+			if (!spec) return;
+			spec.apply(pending, newValue);
+			touchedIds.add(id);
 		},
 	});
 
-	if (Object.keys(pending).length === 0) return;
+	if (touchedIds.size === 0) return;
 
 	try {
 		const next = saveConfig(pending);
@@ -976,27 +987,8 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx?: AgyCommandCtx): Promi
 					.join(" ")}`,
 			);
 		}
-		const changed = [
-			pending.readOnly !== undefined ? `readOnly=${next.readOnly ? "on" : "off"}` : null,
-			pending.skipPermissions !== undefined
-				? `permissions=${next.skipPermissions ? "on" : "off"}`
-				: null,
-			pending.permissionMode !== undefined ? `permission-mode=${next.permissionMode}` : null,
-			pending.bridgeTools !== undefined ? `bridge=${next.bridgeTools}` : null,
-			pending.toolMode !== undefined ? `tool-mode=${next.toolMode}` : null,
-			pending.acp !== undefined ? `usage=${next.acp.usageEstimate}` : null,
-			pending.turnTimeoutMin !== undefined
-				? `turn-cap=${next.turnTimeoutMin === 0 ? "off" : `${next.turnTimeoutMin}m`}`
-				: null,
-			pending.inactivityTimeoutMin !== undefined
-				? `inactivity-cap=${next.inactivityTimeoutMin === 0 ? "off" : `${next.inactivityTimeoutMin}m`}`
-				: null,
-			pending.digest !== undefined ? `digest=${next.digest ? "on" : "off"}` : null,
-			pending.systemPrompt !== undefined
-				? `system-prompt=${next.systemPrompt ? "on" : "off"}`
-				: null,
-		]
-			.filter(Boolean)
+		const changed = PICKER_SPECS.filter((s) => touchedIds.has(s.id))
+			.map((s) => s.summary(next))
 			.join(", ");
 		ui.notify(`Saved: ${changed}`, "info");
 	} catch (err) {

@@ -303,59 +303,98 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		});
 	};
 
-	const acpDriver = new AcpDriver({
-		bin: binary,
-		binArgs: ["acp"],
-		isolateHome: () => resolveIsolateHome(mcpHandle, getBridgeTools(), primaryServerPrefix()),
-		agent: () => resolveCustomAgent(mcpHandle),
-		usageEstimate: () => loadConfig().acp.usageEstimate,
-		permissionPolicy: resolvePermissionPolicy,
-		onPermissionRequest: handlePermissionRequest,
-		log: acpLog,
-		mcpServers: () => {
-			const cfg = loadConfig();
-			if (cfg.bridgeTools === "none") {
-				if (lastSyncedCatalogFingerprint === null) lastSyncedCatalogFingerprint = "none";
-				return [];
-			}
-			const handle = mcpHandle;
-			if (!handle) return [];
-			const serverPrefix = primaryServerPrefix();
-			const tools = getBridgeTools();
-			const { namespaces } = partitionBridgeTools(tools, serverPrefix);
-			if (lastSyncedCatalogFingerprint === null) {
-				lastSyncedCatalogFingerprint = bridgeCatalogFingerprint(
-					tools,
-					[...resolveSkills().map((s) => `skill:${s.name}`), `toolMode:${cfg.toolMode}`],
-					serverPrefix,
-				);
-			}
-			// In pi-only mode, bridged MCP servers are registered via staged config/mcp_config.json
-			// so the custom agent can dispatch them via call_mcp_tool (session/new.mcpServers must be empty).
-			if (cfg.toolMode === "pi-only") return [];
-			return [
+	const createAcpPair = (opts: {
+		getServerPrefix: () => string;
+		getHandle: () => McpServerHandle | null;
+		getTools: () => BridgeToolInfo[];
+		getSkills: () => SkillLite[];
+		getLastFp: () => string | null;
+		setLastFp: (fp: string) => void;
+		childPrefix?: string;
+	}): { driver: AcpDriver; roundTrips: ToolRoundTrips } => {
+		const driver = new AcpDriver({
+			bin: binary,
+			binArgs: ["acp"],
+			isolateHome: () =>
+				resolveIsolateHome(opts.getHandle(), opts.getTools(), opts.getServerPrefix()),
+			agent: () => resolveCustomAgent(opts.getHandle()),
+			usageEstimate: () => loadConfig().acp.usageEstimate,
+			permissionPolicy: resolvePermissionPolicy,
+			onPermissionRequest: handlePermissionRequest,
+			log: acpLog,
+			mcpServers: () => {
+				const cfg = loadConfig();
+				if (cfg.bridgeTools === "none") {
+					if (opts.getLastFp() === null) opts.setLastFp("none");
+					return [];
+				}
+				const handle = opts.getHandle();
+				if (!handle) return [];
+				const serverPrefix = opts.getServerPrefix();
+				const tools = opts.getTools();
+				const { namespaces } = partitionBridgeTools(tools, serverPrefix);
+				if (opts.getLastFp() === null) {
+					opts.setLastFp(
+						bridgeCatalogFingerprint(
+							tools,
+							[...opts.getSkills().map((s) => `skill:${s.name}`), `toolMode:${cfg.toolMode}`],
+							serverPrefix,
+						),
+					);
+				}
+				// In pi-only mode, bridged MCP servers are registered via staged config/mcp_config.json
+				// so the custom agent can dispatch them via call_mcp_tool (session/new.mcpServers must be empty).
+				if (cfg.toolMode === "pi-only") return [];
+				return [
+					{
+						name: serverPrefix,
+						type: "http",
+						url: `http://127.0.0.1:${handle.port}/mcp`,
+						headers: [{ name: TOKEN_HEADER, value: handle.token }],
+					},
+					...namespaces.map((ns) => ({
+						name: ns.serverName,
+						type: "http" as const,
+						url: `http://127.0.0.1:${handle.port}/mcp/ns/${ns.routeName}`,
+						headers: [{ name: TOKEN_HEADER, value: handle.token }],
+					})),
+				];
+			},
+		});
+		const rt = new ToolRoundTrips(
+			driver,
+			(s, d, level) =>
+				fileLog.log(s, d, level ?? (s === "round-trip-fail" ? "warn" : "debug")),
+			{ escalateAfterMs: (name) => defaultEscalateAfterMs(name, loadConfig().escalateLongTools) },
+		);
+		driver.onTurnEnd = (outcome: TurnOutcome) => {
+			fileLog.log(
+				"turn-end",
 				{
-					name: serverPrefix,
-					type: "http",
-					url: `http://127.0.0.1:${handle.port}/mcp`,
-					headers: [{ name: TOKEN_HEADER, value: handle.token }],
+					status: outcome.status,
+					error: outcome.error?.slice(0, 500),
+					aborted: outcome.aborted,
+					...(opts.childPrefix ? { childPrefix: opts.childPrefix } : {}),
+					...(outcome.steered ? { steered: true } : {}),
 				},
-				...namespaces.map((ns) => ({
-					name: ns.serverName,
-					type: "http" as const,
-					url: `http://127.0.0.1:${handle.port}/mcp/ns/${ns.routeName}`,
-					headers: [{ name: TOKEN_HEADER, value: handle.token }],
-				})),
-			];
+				outcome.status === "OK" ? "info" : "warn",
+			);
+			rt.failAll(FAIL_REASON_TURN_END);
+			if (outcome.conversationId) rt.stampConversation(outcome.conversationId);
+		};
+		return { driver, roundTrips: rt };
+	};
+
+	const { driver: acpDriver, roundTrips } = createAcpPair({
+		getServerPrefix: primaryServerPrefix,
+		getHandle: () => mcpHandle,
+		getTools: getBridgeTools,
+		getSkills: resolveSkills,
+		getLastFp: () => lastSyncedCatalogFingerprint,
+		setLastFp: (fp) => {
+			lastSyncedCatalogFingerprint = fp;
 		},
 	});
-
-	const roundTrips = new ToolRoundTrips(
-		acpDriver,
-		(s, d, level) =>
-			fileLog.log(s, d, level ?? (s === "round-trip-fail" ? "warn" : "debug")),
-		{ escalateAfterMs: (name) => defaultEscalateAfterMs(name, loadConfig().escalateLongTools) },
-	);
 	const roster = new SubagentRoster();
 
 	pi.registerEntryRenderer<NativeDisplayEvent>(
@@ -428,21 +467,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			diff: event.diff?.slice(0, 12000),
 			command: event.command?.slice(0, 500),
 		});
-	};
-
-	acpDriver.onTurnEnd = (outcome: TurnOutcome) => {
-		fileLog.log(
-			"turn-end",
-			{
-				status: outcome.status,
-				error: outcome.error?.slice(0, 500),
-				aborted: outcome.aborted,
-				...(outcome.steered ? { steered: true } : {}),
-			},
-			outcome.status === "OK" ? "info" : "warn",
-		);
-		roundTrips.failAll(FAIL_REASON_TURN_END);
-		if (outcome.conversationId) roundTrips.stampConversation(outcome.conversationId);
 	};
 
 	pi.on("input", (event, ctx) => {
@@ -957,76 +981,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			idleTimer = undefined;
 		};
 
-		const childDriver = new AcpDriver({
-			bin: binary,
-			binArgs: ["acp"],
-			isolateHome: () => resolveIsolateHome(childMcpHandle, latestTools, serverPrefix),
-			agent: () => resolveCustomAgent(childMcpHandle),
-			usageEstimate: () => loadConfig().acp.usageEstimate,
-			permissionPolicy: resolvePermissionPolicy,
-			onPermissionRequest: handlePermissionRequest,
-			log: acpLog,
-			mcpServers: () => {
-				const cfg = loadConfig();
-				if (cfg.bridgeTools === "none") {
-					if (lastChildFp === null) lastChildFp = "none";
-					return [];
-				}
-				const handle = childMcpHandle;
-				if (!handle) return [];
-				const { namespaces } = partitionBridgeTools(latestTools, serverPrefix);
-				if (lastChildFp === null) {
-					lastChildFp = bridgeCatalogFingerprint(
-						latestTools,
-						[...latestSkills.map((s) => `skill:${s.name}`), `toolMode:${cfg.toolMode}`],
-						serverPrefix,
-					);
-				}
-				if (cfg.toolMode === "pi-only") return [];
-				return [
-					{
-						name: serverPrefix,
-						type: "http",
-						url: `http://127.0.0.1:${handle.port}/mcp`,
-						headers: [{ name: TOKEN_HEADER, value: handle.token }],
-					},
-					...namespaces.map((ns) => ({
-						name: ns.serverName,
-						type: "http" as const,
-						url: `http://127.0.0.1:${handle.port}/mcp/ns/${ns.routeName}`,
-						headers: [{ name: TOKEN_HEADER, value: handle.token }],
-					})),
-				];
+		const { driver: childDriver, roundTrips: childRoundTrips } = createAcpPair({
+			getServerPrefix: () => serverPrefix,
+			getHandle: () => childMcpHandle,
+			getTools: () => latestTools,
+			getSkills: () => latestSkills,
+			getLastFp: () => lastChildFp,
+			setLastFp: (fp) => {
+				lastChildFp = fp;
 			},
+			childPrefix: serverPrefix,
 		});
-
-		const childRoundTrips = new ToolRoundTrips(
-			childDriver,
-			(s, d, level) =>
-				fileLog.log(s, d, level ?? (s === "round-trip-fail" ? "warn" : "debug")),
-			{
-				escalateAfterMs: (name) =>
-					defaultEscalateAfterMs(name, loadConfig().escalateLongTools),
-			},
-		);
-
-		childDriver.onTurnEnd = (outcome: TurnOutcome) => {
-			fileLog.log(
-				"turn-end",
-				{
-					status: outcome.status,
-					error: outcome.error?.slice(0, 500),
-					aborted: outcome.aborted,
-					childPrefix: serverPrefix,
-					...(outcome.steered ? { steered: true } : {}),
-				},
-				outcome.status === "OK" ? "info" : "warn",
-			);
-			childRoundTrips.failAll(FAIL_REASON_TURN_END);
-			if (outcome.conversationId) {
-				childRoundTrips.stampConversation(outcome.conversationId);
-			}
-		};
 
 		const childHandlers = createBridgeMcpHandlers({
 			getBridgeTools: () => latestTools,

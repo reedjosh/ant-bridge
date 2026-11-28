@@ -77,9 +77,10 @@ If you want every tool call to run through Pi instead, switch to `pi-only` mode:
 ```
 
 You can also toggle it in the `/agy` settings picker or set `AGY_TOOL_MODE=pi-only`. In `pi-only` mode, `ant-bridge`
-starts `agy acp` with a zero-native-tool custom agent and a per-session staged MCP config, injects compact parameter
-schemas for active Pi tools, and gives `bash` and `powershell` a 120s foreground window. Run `/agy clear` (or start a
-new session) after switching so `agy` creates a conversation with the new toolset.
+starts `agy acp` with a custom agent that disables native write, edit, shell, subagent, schedule, and question tools
+(keeping only native `read_file` for image vision and offloaded MCP outputs), stages a per-session MCP config, injects
+compact parameter schemas for active Pi tools, and gives `bash` and `powershell` a 120s foreground window. Switching
+modes automatically starts a fresh seeded `agy` conversation on the next turn.
 
 ## MCP server exposure
 

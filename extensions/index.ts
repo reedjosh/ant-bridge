@@ -1996,8 +1996,8 @@ export function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 					await ctx.syncBridgeCatalog?.(`/agy tool-mode ${val}`);
 					ui?.notify(
 						next.toolMode === "pi-only"
-							? "tool-mode set to pi-only. Fresh sessions will run with agy native tools disabled (run /agy clear to reset an already-bound conversation)."
-							: "tool-mode set to hybrid. Fresh sessions will use agy native workspace tools plus Pi MCP bridge (run /agy clear to reset an already-bound conversation).",
+							? "tool-mode set to pi-only. Next turn will start a fresh seeded agy session using Pi tools (native read_file kept for images/offloaded outputs)."
+							: "tool-mode set to hybrid. Next turn will start a fresh seeded agy session using agy native workspace tools plus Pi MCP bridge.",
 						"info",
 					);
 				} else {

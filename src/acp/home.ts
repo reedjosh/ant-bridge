@@ -117,20 +117,23 @@ export function acpHomeStagingDir(baseDir: string = bridgeStateDir()): string {
 
 export const PI_ONLY_AGENT_NAME = "pi-bridge";
 
-/** Build the custom agent definition used in `pi-only` tool mode (`tools: []`, `inheritMcp: true`).
- *  MCP servers registered in the staged `config/mcp_config.json` are exposed via `call_mcp_tool`
- *  while all native `agy` file/shell/subagent/schedule/question tools are withheld. */
+/** Build the custom agent definition used in `pi-only` tool mode (`tools: [read_file]`,
+ *  `inheritMcp: true`). MCP servers registered in the staged `config/mcp_config.json` are
+ *  exposed via `call_mcp_tool`, while all native `agy` write/edit/shell/subagent/schedule/
+ *  question tools are withheld. Native `read_file` stays enabled solely so the model can view
+ *  images and `.system_generated/` files when `agy` offloads large MCP responses or media. */
 export function buildPiOnlyAgentMarkdown(schemaSummary?: string): string {
 	const lines = [
 		"---",
 		`name: ${PI_ONLY_AGENT_NAME}`,
-		"description: Calls only the tools Pi serves over MCP",
+		"description: Calls Pi tools over MCP (native read_file kept for images and offloaded MCP outputs)",
 		"mainAgent: true",
 		"subagent: false",
-		"tools: []",
+		"tools: [read_file]",
 		"inheritMcp: true",
 		"---",
-		"Use call_mcp_tool to run every workspace, shell, extension, MCP, subagent, and skill action through Pi.",
+		"Use call_mcp_tool to run workspace text/code reads, edits, writes, shell commands, extensions, MCP tools, subagents, and skills through Pi.",
+		"Use native read_file ONLY to view image files (PNG, JPEG, WebP, GIF, screenshots) or .system_generated/ files that agy offloaded from a call_mcp_tool response (such as media_0.* or output.txt).",
 		"Never call manage_task. If a bridged call returns STILL RUNNING with a callId, poll bridge_poll_result until it settles.",
 	];
 	if (schemaSummary && schemaSummary.trim().length > 0) {

@@ -1,13 +1,10 @@
 // /agy tasks overlay: SelectList over one conversation's background tasks.
-//
-// UI mirrors the artifacts browser (engine-picker pattern). Watch-only:
-// enter tails the selected task's log, r rescans, esc closes.
+// Watch-only: enter tails the selected task's log, r rescans, esc closes.
 
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder } from "@earendil-works/pi-coding-agent";
-import { Container, type SelectItem, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
-import { dialogBlocked } from "./ui-helpers.js";
+import type { SelectItem } from "@earendil-works/pi-tui";
 import type { AgyTask } from "./tasks.js";
+import { humanBytes, showListBrowser } from "./ui-helpers.js";
 
 export type TasksBrowserAction = { type: "tail"; task: AgyTask } | { type: "rescan" } | { type: "close" };
 
@@ -24,12 +21,6 @@ export function taskItems(tasks: AgyTask[]): SelectItem[] {
 	});
 }
 
-function humanBytes(n: number): string {
-	if (n < 1024) return `${n}B`;
-	if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
-	return `${(n / (1024 * 1024)).toFixed(1)}MB`;
-}
-
 /** Render the overlay. Resolves tail (for the selected task), rescan (caller
  *  re-lists and reopens), or close. */
 export async function showTasksBrowser(
@@ -37,59 +28,19 @@ export async function showTasksBrowser(
 	tasks: AgyTask[],
 	livenessKnown: boolean,
 ): Promise<TasksBrowserAction> {
-	const items = taskItems(tasks);
-	return ctx.custom<TasksBrowserAction>((tui, theme, _keybindings, done) => {
-		const container = new Container();
-		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-		container.addChild(
-			new Text(theme.fg("accent", theme.bold(`Antigravity tasks (${tasks.length})`)), 1, 0),
-		);
-		if (!livenessKnown) {
-			container.addChild(
-				new Text(
-					theme.fg("warning", "lsof not found; liveness unknown (install lsof for ACTIVE/idle)"),
-					1,
-					0,
-				),
-			);
-		}
-		container.addChild(new Spacer(1));
-
-		const list = new SelectList(items, Math.min(items.length, 12), {
-			selectedPrefix: (t: string) => theme.fg("accent", t),
-			selectedText: (t: string) => theme.fg("accent", t),
-			description: (t: string) => theme.fg("muted", t),
-			scrollInfo: (t: string) => theme.fg("dim", t),
-			noMatch: (t: string) => theme.fg("warning", t),
-		});
-		list.onSelect = (item) => {
+	return showListBrowser<TasksBrowserAction>(ctx, {
+		title: `Antigravity tasks (${tasks.length})`,
+		warning: livenessKnown
+			? undefined
+			: "lsof not found; liveness unknown (install lsof for ACTIVE/idle)",
+		items: taskItems(tasks),
+		footerHint: "up/down navigate - enter tail - r rescan - esc close",
+		width: 72,
+		onSelect: (item) => {
 			const task = tasks.find((t) => String(t.id) === item.value);
-			done(task ? { type: "tail", task } : { type: "close" });
-		};
-		list.onCancel = () => done({ type: "close" });
-		container.addChild(list);
-
-		container.addChild(new Spacer(1));
-		container.addChild(
-			new Text(theme.fg("dim", "up/down navigate - enter tail - r rescan - esc close"), 1, 0),
-		);
-		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-
-		return {
-			render: (width: number) => container.render(width),
-			invalidate: () => container.invalidate(),
-			handleInput: (data: string) => {
-				if (data.trim().toLowerCase() === "r") {
-					done({ type: "rescan" });
-					return;
-				}
-				list.handleInput(data);
-				tui.requestRender();
-			},
-		};
-	}, {
-		overlay: true,
-		overlayOptions: { anchor: "center" as const, width: 72, maxHeight: "85%" as const, margin: 1 },
-		blocked: dialogBlocked(`Antigravity tasks (${tasks.length})`),
+			return task ? { type: "tail", task } : { type: "close" };
+		},
+		onRescan: () => ({ type: "rescan" }),
+		onCancel: () => ({ type: "close" }),
 	});
 }
